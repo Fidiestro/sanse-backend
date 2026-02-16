@@ -5,6 +5,7 @@ const helmet = require('helmet');
 const { testConnection } = require('./config/database');
 const { generalLimiter } = require('./middleware/rateLimit');
 const authRoutes = require('./routes/auth');
+const dashboardRoutes = require('./routes/dashboard');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -28,6 +29,7 @@ app.set('trust proxy', 1);
 
 // ====== RUTAS ======
 app.use('/api/auth', authRoutes);
+app.use('/api/dashboard', dashboardRoutes);
 
 // ====== HEALTH CHECK ======
 app.get('/api/health', (req, res) => {
@@ -54,7 +56,7 @@ async function start() {
     await testConnection();
     app.listen(PORT, '0.0.0.0', () => {
         console.log(`🚀 Sanse Capital API corriendo en puerto ${PORT}`);
-        console.log(`📍 Entorno: ${process.env.NODE_ENV || 'development'}`);
+        console.log(`🔑 Entorno: ${process.env.NODE_ENV || 'development'}`);
     });
 }
 
