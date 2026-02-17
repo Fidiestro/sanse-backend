@@ -7,6 +7,8 @@ const generalLimiter = rateLimit({
     message: { error: 'Demasiadas solicitudes. Intenta de nuevo en 15 minutos.' },
     standardHeaders: true,
     legacyHeaders: false,
+    // IMPORTANTE: No limitar las peticiones preflight (OPTIONS)
+    skip: (req) => req.method === 'OPTIONS',
 });
 
 const loginLimiter = rateLimit({
