@@ -12,12 +12,7 @@ const PORT = process.env.PORT || 3000;
 
 // ====== SEGURIDAD ======
 app.use(helmet());
-app.use(cors({
-    origin: process.env.FRONTEND_URL || 'https://sansecapital.co',
-    methods: ['GET', 'POST', 'PUT', 'DELETE'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
-    credentials: true,
-}));
+app.use(cors());
 app.use(generalLimiter);
 
 // ====== PARSEO ======
@@ -53,11 +48,18 @@ app.use((err, req, res, next) => {
 
 // ====== INICIAR ======
 async function start() {
-    await testConnection();
+    try {
+        await testConnection();
+        console.log('✅ Base de datos conectada');
+    } catch (error) {
+        console.error('❌ Error conectando a la base de datos:', error);
+    }
+
     app.listen(PORT, '0.0.0.0', () => {
         console.log(`🚀 Sanse Capital API corriendo en puerto ${PORT}`);
         console.log(`🔑 Entorno: ${process.env.NODE_ENV || 'development'}`);
     });
 }
+
 
 start();
