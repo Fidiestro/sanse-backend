@@ -11,15 +11,15 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // ====== SEGURIDAD ======
-app.use(helmet({
-    crossOriginResourcePolicy: { policy: "cross-origin" }
-}));
 app.use(cors({
     origin: ['https://sansecapital.co', 'http://localhost:3000'], // Agrega localhost para pruebas
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'], // Asegúrate de incluir OPTIONS
     allowedHeaders: ['Content-Type', 'Authorization'],
     credentials: true,
     optionsSuccessStatus: 200 // Algunas versiones de navegadores antiguos fallan con 204
+}));
+app.use(helmet({
+    crossOriginResourcePolicy: { policy: "cross-origin" }
 }));
 app.use(generalLimiter);
 
