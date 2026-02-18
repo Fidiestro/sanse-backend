@@ -1,17 +1,16 @@
 const { pool } = require('../config/database');
 
-// GET /api/dashboard/summary — Resumen completo para el dashboard del usuario
 exports.getSummary = async (req, res) => {
     try {
         const userId = req.user.id;
 
         // 1. Balance actual (último registro de balance_history)
         const [balanceRows] = await pool.execute(
-            `SELECT balance, recorded_at FROM balance_history 
-             WHERE user_id = ? ORDER BY recorded_at DESC LIMIT 1`,
+            `SELECT amount, snapshot_date FROM balance_history 
+             WHERE user_id = ? ORDER BY snapshot_date DESC LIMIT 1`,
             [userId]
         );
-        const currentBalance = balanceRows.length > 0 ? parseFloat(balanceRows[0].balance) : 0;
+        const currentBalance = balanceRows.length > 0 ? parseFloat(balanceRows[0].amount) : 0;
 
         // 2. Inversiones activas
         const [investments] = await pool.execute(
@@ -23,38 +22,44 @@ exports.getSummary = async (req, res) => {
 
         // 3. Últimas transacciones (últimas 20)
         const [transactions] = await pool.execute(
-            `SELECT id, type, amount, description, created_at 
+            `SELECT id, type, amount, description, ref_id, created_at 
              FROM transactions WHERE user_id = ? 
              ORDER BY created_at DESC LIMIT 20`,
             [userId]
         );
 
-        // 4. Historial de balance (últimos 6 meses)
+        // 4. Historial de balance
         const [balanceHistory] = await pool.execute(
-            `SELECT balance, recorded_at FROM balance_history 
-             WHERE user_id = ? ORDER BY recorded_at ASC`,
+            `SELECT amount, snapshot_date FROM balance_history 
+             WHERE user_id = ? ORDER BY snapshot_date ASC`,
             [userId]
         );
 
-        // 5. Préstamos activos
-        const [loans] = await pool.execute(
-            `SELECT id, amount, monthly_rate, start_date, status 
-             FROM loans WHERE user_id = ? AND status = 'active'`,
-            [userId]
-        );
+        // 5. Préstamos activos (puede que la tabla no exista)
+        let loans = [];
+        try {
+            const [loanRows] = await pool.execute(
+                `SELECT id, amount, monthly_rate, start_date, status 
+                 FROM loans WHERE user_id = ? AND status = 'active'`,
+                [userId]
+            );
+            loans = loanRows;
+        } catch (e) {
+            // tabla loans puede no existir
+        }
 
         // Cálculos
         const totalInvested = investments.reduce((sum, i) => sum + parseFloat(i.amount), 0);
         const totalProfit = transactions
-            .filter(t => t.type === 'profit')
+            .filter(t => t.type === 'profit' || t.type === 'interest')
             .reduce((sum, t) => sum + parseFloat(t.amount), 0);
         const activeInvestments = investments.filter(i => i.status === 'active').length;
         const rates = investments.map(i => parseFloat(i.annual_rate));
         const avgRate = rates.length > 0 ? rates.reduce((a, b) => a + b, 0) / rates.length : 0;
-        const lastProfit = transactions.find(t => t.type === 'profit');
+        const lastProfit = transactions.find(t => t.type === 'profit' || t.type === 'interest');
         const monthlyGoal = parseFloat(req.user.monthly_goal) || 20000000;
 
-        // Primera transacción para calcular meses
+        // Meses invirtiendo
         const [firstTx] = await pool.execute(
             `SELECT created_at FROM transactions WHERE user_id = ? ORDER BY created_at ASC LIMIT 1`,
             [userId]
@@ -73,30 +78,19 @@ exports.getSummary = async (req, res) => {
             monthsInvesting,
             lastProfit: lastProfit ? parseFloat(lastProfit.amount) : 0,
             investments: investments.map(i => ({
-                id: i.id,
-                type: i.type,
-                amount: parseFloat(i.amount),
-                rate: parseFloat(i.annual_rate),
-                date: i.start_date,
-                status: i.status,
+                id: i.id, type: i.type, amount: parseFloat(i.amount),
+                rate: parseFloat(i.annual_rate), date: i.start_date, status: i.status,
             })),
             transactions: transactions.map(t => ({
-                id: t.id,
-                type: t.type,
-                amount: parseFloat(t.amount),
-                description: t.description,
-                date: t.created_at,
+                id: t.id, type: t.type, amount: parseFloat(t.amount),
+                description: t.description, refId: t.ref_id, date: t.created_at,
             })),
             balanceHistory: balanceHistory.map(b => ({
-                amount: parseFloat(b.balance),
-                date: b.recorded_at,
+                amount: parseFloat(b.amount), date: b.snapshot_date,
             })),
             loans: loans.map(l => ({
-                id: l.id,
-                amount: parseFloat(l.amount),
-                monthlyRate: parseFloat(l.monthly_rate),
-                date: l.start_date,
-                status: l.status,
+                id: l.id, amount: parseFloat(l.amount),
+                monthlyRate: parseFloat(l.monthly_rate), date: l.start_date, status: l.status,
             })),
         });
     } catch (error) {

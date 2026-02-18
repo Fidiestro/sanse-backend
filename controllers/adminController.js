@@ -91,8 +91,8 @@ exports.recordBalance = async (req, res) => {
             return res.status(400).json({ error: 'userId y balance son requeridos' });
         }
         const [result] = await pool.execute(
-            `INSERT INTO balance_history (user_id, balance, recorded_at) VALUES (?, ?, ?)`,
-            [userId, balance, (() => { const d = date ? new Date(date) : new Date(); return d.toISOString().slice(0,19).replace('T',' '); })()]
+            `INSERT INTO balance_history (user_id, amount, snapshot_date) VALUES (?, ?, ?)`,
+            [userId, balance, (() => { const d = date ? new Date(date) : new Date(); return d.toISOString().slice(0,10); })()]
         );
         res.status(201).json({ message: 'Balance registrado', id: result.insertId });
     } catch (error) {
@@ -112,7 +112,7 @@ exports.getUserDetails = async (req, res) => {
 
         const [investments] = await pool.execute(`SELECT * FROM investments WHERE user_id = ? ORDER BY start_date DESC`, [userId]);
         const [transactions] = await pool.execute(`SELECT * FROM transactions WHERE user_id = ? ORDER BY created_at DESC LIMIT 50`, [userId]);
-        const [balanceHistory] = await pool.execute(`SELECT * FROM balance_history WHERE user_id = ? ORDER BY recorded_at ASC`, [userId]);
+        const [balanceHistory] = await pool.execute(`SELECT * FROM balance_history WHERE user_id = ? ORDER BY snapshot_date ASC`, [userId]);
 
         res.json({ user: user[0], investments, transactions, balanceHistory });
     } catch (error) {
