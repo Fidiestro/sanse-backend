@@ -69,7 +69,9 @@ exports.createTransaction = async (req, res) => {
         const [countRows] = await pool.execute('SELECT COUNT(*) as c FROM transactions');
         const refId = 'TX-' + String(countRows[0].c + 1).padStart(5, '0');
 
-        const createdAt = date || new Date().toISOString();
+        // Formatear fecha para MySQL (YYYY-MM-DD HH:MM:SS)
+        const dateObj = date ? new Date(date) : new Date();
+        const createdAt = dateObj.toISOString().slice(0, 19).replace('T', ' ');
         const [result] = await pool.execute(
             `INSERT INTO transactions (user_id, type, amount, description, ref_id, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
             [userId, type, amount, description || '', refId, createdAt]
@@ -90,7 +92,7 @@ exports.recordBalance = async (req, res) => {
         }
         const [result] = await pool.execute(
             `INSERT INTO balance_history (user_id, balance, recorded_at) VALUES (?, ?, ?)`,
-            [userId, balance, date || new Date().toISOString()]
+            [userId, balance, (() => { const d = date ? new Date(date) : new Date(); return d.toISOString().slice(0,19).replace('T',' '); })()]
         );
         res.status(201).json({ message: 'Balance registrado', id: result.insertId });
     } catch (error) {
