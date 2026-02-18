@@ -64,13 +64,14 @@ class User {
         let query = `SELECT id, email, full_name, phone, role, is_active, created_at FROM users WHERE is_active = 1`;
         const params = [];
         if (role) { query += ' AND role = ?'; params.push(role); }
-        query += ' ORDER BY created_at DESC LIMIT ? OFFSET ?';
-        params.push(limit, offset);
+        query += ` ORDER BY created_at DESC LIMIT ${parseInt(limit)} OFFSET ${parseInt(offset)}`;
         const [rows] = await pool.execute(query, params);
+
         let countQuery = 'SELECT COUNT(*) as total FROM users WHERE is_active = 1';
         const countParams = [];
         if (role) { countQuery += ' AND role = ?'; countParams.push(role); }
         const [countRows] = await pool.execute(countQuery, countParams);
+
         return { users: rows, total: countRows[0].total, page, totalPages: Math.ceil(countRows[0].total / limit) };
     }
 
