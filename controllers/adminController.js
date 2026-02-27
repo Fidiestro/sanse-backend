@@ -58,32 +58,101 @@ exports.createInvestment = async (req, res) => {
     }
 };
 
-// POST /api/admin/transactions — Crear transacción
+// ══════════════════════════════════════════════════
+// Función auxiliar: Recalcular balance de un usuario
+// sumando depósitos/pagos/intereses/ganancias y restando retiros
+// ══════════════════════════════════════════════════
+async function recalculateAndSaveBalance(connection, userId) {
+    // Tipos que SUMAN al balance
+    const [inRows] = await connection.execute(
+        `SELECT COALESCE(SUM(amount), 0) as total 
+         FROM transactions 
+         WHERE user_id = ? AND type IN ('deposit', 'payment', 'interest', 'profit')`,
+        [userId]
+    );
+    // Tipos que RESTAN del balance
+    const [outRows] = await connection.execute(
+        `SELECT COALESCE(SUM(amount), 0) as total 
+         FROM transactions 
+         WHERE user_id = ? AND type IN ('withdraw')`,
+        [userId]
+    );
+
+    const totalIn = parseFloat(inRows[0].total);
+    const totalOut = parseFloat(outRows[0].total);
+    const newBalance = Math.max(0, totalIn - totalOut);
+
+    const today = new Date().toISOString().slice(0, 10);
+
+    // Verificar si ya existe un snapshot de hoy
+    const [existing] = await connection.execute(
+        `SELECT id FROM balance_history WHERE user_id = ? AND snapshot_date = ?`,
+        [userId, today]
+    );
+
+    if (existing.length > 0) {
+        // Actualizar el de hoy
+        await connection.execute(
+            `UPDATE balance_history SET amount = ? WHERE user_id = ? AND snapshot_date = ?`,
+            [newBalance, userId, today]
+        );
+    } else {
+        // Crear nuevo snapshot
+        await connection.execute(
+            `INSERT INTO balance_history (user_id, amount, snapshot_date) VALUES (?, ?, ?)`,
+            [userId, newBalance, today]
+        );
+    }
+
+    return newBalance;
+}
+
+// POST /api/admin/transactions — Crear transacción (+ auto actualiza balance_history)
 exports.createTransaction = async (req, res) => {
+    const connection = await pool.getConnection();
     try {
+        await connection.beginTransaction();
+
         const { userId, type, amount, description, date } = req.body;
         if (!userId || !type || !amount) {
             return res.status(400).json({ error: 'userId, type y amount son requeridos' });
         }
+
         // Generar ref_id automático
-        const [countRows] = await pool.execute('SELECT COUNT(*) as c FROM transactions');
+        const [countRows] = await connection.execute('SELECT COUNT(*) as c FROM transactions');
         const refId = 'TX-' + String(countRows[0].c + 1).padStart(5, '0');
 
         // Formatear fecha para MySQL (YYYY-MM-DD HH:MM:SS)
         const dateObj = date ? new Date(date) : new Date();
         const createdAt = dateObj.toISOString().slice(0, 19).replace('T', ' ');
-        const [result] = await pool.execute(
+
+        // 1. Insertar transacción
+        const [result] = await connection.execute(
             `INSERT INTO transactions (user_id, type, amount, description, ref_id, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
             [userId, type, amount, description || '', refId, createdAt]
         );
-        res.status(201).json({ message: 'Transacción creada', id: result.insertId, refId });
+
+        // 2. Recalcular y guardar balance automáticamente
+        const newBalance = await recalculateAndSaveBalance(connection, userId);
+
+        await connection.commit();
+
+        res.status(201).json({
+            message: 'Transacción creada',
+            id: result.insertId,
+            refId,
+            newBalance,
+        });
     } catch (error) {
+        await connection.rollback();
         console.error('Error creando transacción:', error);
         res.status(500).json({ error: 'Error interno del servidor' });
+    } finally {
+        connection.release();
     }
 };
 
-// POST /api/admin/balance — Registrar balance
+// POST /api/admin/balance — Registrar balance (manual, sigue funcionando)
 exports.recordBalance = async (req, res) => {
     try {
         const { userId, balance, date } = req.body;
@@ -98,6 +167,51 @@ exports.recordBalance = async (req, res) => {
     } catch (error) {
         console.error('Error registrando balance:', error);
         res.status(500).json({ error: 'Error interno del servidor' });
+    }
+};
+
+// POST /api/admin/recalculate-balance/:userId — Recalcular balance de un usuario manualmente
+exports.recalculateBalance = async (req, res) => {
+    const connection = await pool.getConnection();
+    try {
+        await connection.beginTransaction();
+        const userId = req.params.userId;
+        const newBalance = await recalculateAndSaveBalance(connection, userId);
+        await connection.commit();
+        res.json({ message: 'Balance recalculado', userId, newBalance });
+    } catch (error) {
+        await connection.rollback();
+        console.error('Error recalculando balance:', error);
+        res.status(500).json({ error: 'Error interno del servidor' });
+    } finally {
+        connection.release();
+    }
+};
+
+// POST /api/admin/recalculate-all-balances — Recalcular balance de TODOS los usuarios
+exports.recalculateAllBalances = async (req, res) => {
+    const connection = await pool.getConnection();
+    try {
+        await connection.beginTransaction();
+
+        const [users] = await connection.execute(
+            `SELECT DISTINCT user_id FROM transactions`
+        );
+
+        const results = [];
+        for (const row of users) {
+            const newBalance = await recalculateAndSaveBalance(connection, row.user_id);
+            results.push({ userId: row.user_id, balance: newBalance });
+        }
+
+        await connection.commit();
+        res.json({ message: `Balances recalculados para ${results.length} usuarios`, results });
+    } catch (error) {
+        await connection.rollback();
+        console.error('Error recalculando todos los balances:', error);
+        res.status(500).json({ error: 'Error interno del servidor' });
+    } finally {
+        connection.release();
     }
 };
 
@@ -129,10 +243,30 @@ exports.deleteInvestment = async (req, res) => {
     } catch (error) { res.status(500).json({ error: 'Error interno' }); }
 };
 
-// DELETE /api/admin/transactions/:id
+// DELETE /api/admin/transactions/:id — Eliminar transacción (+ recalcular balance)
 exports.deleteTransaction = async (req, res) => {
+    const connection = await pool.getConnection();
     try {
-        await pool.execute('DELETE FROM transactions WHERE id = ?', [req.params.id]);
-        res.json({ message: 'Transacción eliminada' });
-    } catch (error) { res.status(500).json({ error: 'Error interno' }); }
+        await connection.beginTransaction();
+
+        // Obtener user_id antes de borrar
+        const [txRows] = await connection.execute(
+            'SELECT user_id FROM transactions WHERE id = ?', [req.params.id]
+        );
+
+        await connection.execute('DELETE FROM transactions WHERE id = ?', [req.params.id]);
+
+        // Recalcular balance si encontramos el usuario
+        if (txRows.length > 0) {
+            await recalculateAndSaveBalance(connection, txRows[0].user_id);
+        }
+
+        await connection.commit();
+        res.json({ message: 'Transacción eliminada y balance actualizado' });
+    } catch (error) {
+        await connection.rollback();
+        res.status(500).json({ error: 'Error interno' });
+    } finally {
+        connection.release();
+    }
 };

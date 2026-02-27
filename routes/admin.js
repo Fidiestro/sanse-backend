@@ -20,6 +20,8 @@ router.delete('/investments/:id', adminController.deleteInvestment);
 
 // Balance
 router.post('/balance', adminController.recordBalance);
+router.post('/recalculate-balance/:userId', adminController.recalculateBalance);
+router.post('/recalculate-all-balances', adminController.recalculateAllBalances);
 
 // Detalles usuario
 router.get('/users/:id/details', adminController.getUserDetails);
