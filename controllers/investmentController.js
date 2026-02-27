@@ -142,6 +142,200 @@ exports.createUserInvestment = async (req, res) => {
     }
 };
 
+// ══════════════════════════════════════════════════════════════
+// POST /api/investments/:id/add-capital — Agregar capital a inversión existente
+// La fecha de vencimiento NO cambia, solo aumenta el monto invertido
+// ══════════════════════════════════════════════════════════════
+exports.addCapitalToInvestment = async (req, res) => {
+    const connection = await pool.getConnection();
+    try {
+        await connection.beginTransaction();
+
+        const userId = req.user.id;
+        const investmentId = req.params.id;
+        const { amount } = req.body;
+
+        if (!amount || amount < 50000) {
+            return res.status(400).json({ error: 'Monto mínimo para agregar: $50.000 COP' });
+        }
+
+        // 1. Verificar que la inversión existe, es del usuario, y está activa
+        const [invRows] = await connection.execute(
+            `SELECT * FROM investments WHERE id = ? AND user_id = ? AND status = 'active'`,
+            [investmentId, userId]
+        );
+        if (!invRows.length) {
+            return res.status(404).json({ error: 'Inversión no encontrada o no está activa' });
+        }
+        const inv = invRows[0];
+
+        // 2. Verificar que no haya vencido
+        const now = new Date();
+        const lockEnd = new Date(inv.lock_end_date || inv.end_date);
+        if (now >= lockEnd) {
+            return res.status(400).json({ error: 'No se puede agregar capital a una inversión vencida. Retírala y crea una nueva.' });
+        }
+
+        // 3. Verificar balance disponible
+        const [balanceRows] = await connection.execute(
+            `SELECT amount FROM balance_history WHERE user_id = ? ORDER BY snapshot_date DESC LIMIT 1`,
+            [userId]
+        );
+        const currentBalance = balanceRows.length > 0 ? parseFloat(balanceRows[0].amount) : 0;
+
+        const [investedRows] = await connection.execute(
+            `SELECT COALESCE(SUM(amount), 0) as total FROM investments WHERE user_id = ? AND status = 'active'`,
+            [userId]
+        );
+        const totalInvested = parseFloat(investedRows[0].total);
+        const availableBalance = currentBalance - totalInvested;
+
+        if (amount > availableBalance) {
+            return res.status(400).json({
+                error: `Saldo disponible insuficiente. Disponible: $${Math.round(availableBalance).toLocaleString('es-CO')} COP`,
+                available: availableBalance,
+            });
+        }
+
+        // 4. Actualizar monto (NO cambia lock_end_date ni end_date)
+        const previousAmount = parseFloat(inv.amount);
+        const newAmount = previousAmount + amount;
+        const addedDate = now.toISOString().slice(0, 10);
+
+        await connection.execute(
+            `UPDATE investments SET amount = ? WHERE id = ?`,
+            [newAmount, investmentId]
+        );
+
+        // 5. Registrar transacción
+        const [countRows] = await connection.execute('SELECT COUNT(*) as c FROM transactions');
+        const refId = 'ADD-' + String(countRows[0].c + 1).padStart(5, '0');
+
+        const lockDateStr = (inv.lock_end_date || inv.end_date).toString().slice(0, 10);
+
+        await connection.execute(
+            `INSERT INTO transactions (user_id, investment_id, type, amount, description, ref_id, created_at) 
+             VALUES (?, ?, 'investment', ?, ?, ?, NOW())`,
+            [userId, investmentId, amount, `Capital adicional SDTC #${investmentId} — Mismo vencimiento: ${lockDateStr}`, refId]
+        );
+
+        // 6. Audit log
+        await auditLog({
+            userId,
+            action: 'add_capital',
+            entityType: 'investment',
+            entityId: parseInt(investmentId),
+            details: { previousAmount, addedAmount: amount, newAmount, lockEndDate: lockDateStr },
+            ipAddress: req.ip,
+        });
+
+        await connection.commit();
+
+        res.json({
+            message: 'Capital agregado exitosamente',
+            investment: {
+                id: parseInt(investmentId),
+                previousAmount,
+                addedAmount: amount,
+                newAmount,
+                lockEndDate: lockDateStr,
+                refId,
+            },
+        });
+    } catch (error) {
+        await connection.rollback();
+        console.error('Error agregando capital:', error);
+        res.status(500).json({ error: 'Error interno del servidor' });
+    } finally {
+        connection.release();
+    }
+};
+
+// ══════════════════════════════════════════════════════════════
+// POST /api/investments/:id/withdraw — Retirar inversión vencida
+// Solo funciona si lock_end_date ya pasó
+// Cambia status a 'completed' y el capital vuelve al disponible
+// ══════════════════════════════════════════════════════════════
+exports.withdrawInvestment = async (req, res) => {
+    const connection = await pool.getConnection();
+    try {
+        await connection.beginTransaction();
+
+        const userId = req.user.id;
+        const investmentId = req.params.id;
+
+        // 1. Verificar inversión
+        const [invRows] = await connection.execute(
+            `SELECT * FROM investments WHERE id = ? AND user_id = ? AND status = 'active'`,
+            [investmentId, userId]
+        );
+        if (!invRows.length) {
+            return res.status(404).json({ error: 'Inversión no encontrada o no está activa' });
+        }
+        const inv = invRows[0];
+
+        // 2. Verificar que ya venció
+        const now = new Date();
+        const lockEnd = new Date(inv.lock_end_date || inv.end_date);
+        if (now < lockEnd) {
+            const daysLeft = Math.ceil((lockEnd - now) / (1000 * 60 * 60 * 24));
+            return res.status(400).json({
+                error: `La inversión aún no ha vencido. Faltan ${daysLeft} días para el desbloqueo.`,
+                daysRemaining: daysLeft,
+                lockEndDate: lockEnd.toISOString().slice(0, 10),
+            });
+        }
+
+        // 3. Capital a devolver
+        const capitalAmount = parseFloat(inv.amount);
+
+        // 4. Marcar inversión como completada
+        await connection.execute(
+            `UPDATE investments SET status = 'completed' WHERE id = ?`,
+            [investmentId]
+        );
+
+        // 5. NO necesita transacción extra: al cambiar a completed, el amount
+        // ya no se cuenta como "invertido", así que automáticamente vuelve al disponible
+        // Pero registramos una transacción informativa
+        const [countRows] = await connection.execute('SELECT COUNT(*) as c FROM transactions');
+        const refId = 'WDR-' + String(countRows[0].c + 1).padStart(5, '0');
+
+        await connection.execute(
+            `INSERT INTO transactions (user_id, investment_id, type, amount, description, ref_id, created_at) 
+             VALUES (?, ?, 'investment_withdrawal', ?, ?, ?, NOW())`,
+            [userId, investmentId, capitalAmount, `Retiro inversión SDTC #${investmentId} — Capital liberado`, refId]
+        );
+
+        // 6. Audit log
+        await auditLog({
+            userId,
+            action: 'withdraw_investment',
+            entityType: 'investment',
+            entityId: parseInt(investmentId),
+            details: { capitalReturned: capitalAmount },
+            ipAddress: req.ip,
+        });
+
+        await connection.commit();
+
+        res.json({
+            message: 'Inversión retirada exitosamente. El capital ha vuelto a tu saldo disponible.',
+            investment: {
+                id: parseInt(investmentId),
+                capitalReturned: capitalAmount,
+                refId,
+            },
+        });
+    } catch (error) {
+        await connection.rollback();
+        console.error('Error retirando inversión:', error);
+        res.status(500).json({ error: 'Error interno del servidor' });
+    } finally {
+        connection.release();
+    }
+};
+
 // GET /api/investments/my — Inversiones del usuario con detalle
 exports.getMyInvestments = async (req, res) => {
     try {
@@ -170,6 +364,7 @@ exports.getMyInvestments = async (req, res) => {
                 const elapsedDays = Math.max(0, (now - start) / (1000 * 60 * 60 * 24));
                 const progressPct = Math.min(100, Math.round((elapsedDays / totalDays) * 100));
                 const daysRemaining = Math.max(0, Math.ceil((end - now) / (1000 * 60 * 60 * 24)));
+                const isMatured = now >= end;
 
                 return {
                     id: inv.id,
@@ -187,6 +382,7 @@ exports.getMyInvestments = async (req, res) => {
                     progressPct,
                     daysRemaining,
                     totalEarned,
+                    isMatured,
                     returns: returns.map((r) => ({
                         month: r.period_month,
                         rate: parseFloat(r.rate_applied),
@@ -217,6 +413,9 @@ exports.getInvestmentDetail = async (req, res) => {
         if (!rows.length) return res.status(404).json({ error: 'Inversión no encontrada' });
 
         const inv = rows[0];
+        const now = new Date();
+        const end = new Date(inv.lock_end_date || inv.end_date);
+        const isMatured = now >= end;
 
         const [returns] = await pool.execute(
             `SELECT period_month, rate_applied, amount_earned, status, notes 
@@ -243,6 +442,7 @@ exports.getInvestmentDetail = async (req, res) => {
                 lockEndDate: inv.lock_end_date,
                 status: inv.status,
                 notes: inv.notes,
+                isMatured,
             },
             returns: returns.map((r) => ({
                 month: r.period_month,

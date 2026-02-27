@@ -21,4 +21,10 @@ router.get('/:id', investmentController.getInvestmentDetail);
 // Crear inversión SDTC desde balance
 router.post('/create', investmentController.createUserInvestment);
 
+// Agregar capital a una inversión existente (sin cambiar fecha de vencimiento)
+router.post('/:id/add-capital', investmentController.addCapitalToInvestment);
+
+// Retirar inversión vencida (devuelve capital al disponible)
+router.post('/:id/withdraw', investmentController.withdrawInvestment);
+
 module.exports = router;
