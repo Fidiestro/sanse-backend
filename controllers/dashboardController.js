@@ -35,7 +35,7 @@ exports.getSummary = async (req, res) => {
             [userId]
         );
 
-        // 5. Préstamos activos (puede que la tabla no exista)
+        // 5. Préstamos activos
         let loans = [];
         try {
             const [loanRows] = await pool.execute(
@@ -44,19 +44,17 @@ exports.getSummary = async (req, res) => {
                 [userId]
             );
             loans = loanRows;
-        } catch (e) {
-            // tabla loans puede no existir
-        }
+        } catch (e) {}
 
-        // Cálculos
+        // Cálculos — AHORA incluye investment_return como ganancia
         const totalInvested = investments.reduce((sum, i) => sum + parseFloat(i.amount), 0);
         const totalProfit = transactions
-            .filter(t => t.type === 'profit' || t.type === 'interest')
+            .filter(t => t.type === 'profit' || t.type === 'interest' || t.type === 'investment_return')
             .reduce((sum, t) => sum + parseFloat(t.amount), 0);
         const activeInvestments = investments.filter(i => i.status === 'active').length;
         const rates = investments.map(i => parseFloat(i.annual_rate));
         const avgRate = rates.length > 0 ? rates.reduce((a, b) => a + b, 0) / rates.length : 0;
-        const lastProfit = transactions.find(t => t.type === 'profit' || t.type === 'interest');
+        const lastProfit = transactions.find(t => t.type === 'profit' || t.type === 'interest' || t.type === 'investment_return');
         const monthlyGoal = parseFloat(req.user.monthly_goal) || 20000000;
 
         // Meses invirtiendo

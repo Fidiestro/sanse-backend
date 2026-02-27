@@ -18,6 +18,12 @@ router.delete('/transactions/:id', adminController.deleteTransaction);
 router.post('/investments', adminController.createInvestment);
 router.delete('/investments/:id', adminController.deleteInvestment);
 
+// === NUEVAS RUTAS PARA RENDIMIENTOS SDTC ===
+// Listar inversiones activas (para el selector en admin)
+router.get('/investments/active', adminController.getActiveInvestments);
+// Registrar rendimiento mensual a una inversión
+router.post('/investments/:investmentId/return', adminController.registerInvestmentReturn);
+
 // Balance
 router.post('/balance', adminController.recordBalance);
 router.post('/recalculate-balance/:userId', adminController.recalculateBalance);
