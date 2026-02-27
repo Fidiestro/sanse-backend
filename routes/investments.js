@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const investmentController = require('./controllers/investmentController');
+const investmentController = require('../controllers/investmentController');
 const { authenticate } = require('../middleware/auth');
 
 // Todas requieren autenticación
