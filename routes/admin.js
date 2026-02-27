@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const adminController = require('../controllers/adminController');
+const withdrawalController = require('../controllers/withdrawalController');
 const { authenticate, requireAdmin } = require('../middleware/auth');
 
 // Todas las rutas requieren autenticación + admin
@@ -18,10 +19,8 @@ router.delete('/transactions/:id', adminController.deleteTransaction);
 router.post('/investments', adminController.createInvestment);
 router.delete('/investments/:id', adminController.deleteInvestment);
 
-// === NUEVAS RUTAS PARA RENDIMIENTOS SDTC ===
-// Listar inversiones activas (para el selector en admin)
+// Rendimientos SDTC
 router.get('/investments/active', adminController.getActiveInvestments);
-// Registrar rendimiento mensual a una inversión
 router.post('/investments/:investmentId/return', adminController.registerInvestmentReturn);
 
 // Balance
@@ -31,5 +30,9 @@ router.post('/recalculate-all-balances', adminController.recalculateAllBalances)
 
 // Detalles usuario
 router.get('/users/:id/details', adminController.getUserDetails);
+
+// === SOLICITUDES DE RETIRO (ADMIN) ===
+router.get('/withdrawals', withdrawalController.adminGetWithdrawals);
+router.post('/withdrawals/:id/process', withdrawalController.adminProcessWithdrawal);
 
 module.exports = router;
