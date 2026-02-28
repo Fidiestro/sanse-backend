@@ -15,7 +15,7 @@ exports.getSummary = async (req, res) => {
         // 2. Inversiones activas
         const [investments] = await pool.execute(
             `SELECT id, type, amount, annual_rate, start_date, status 
-             FROM investments WHERE user_id = ? AND status = 'active' 
+             FROM investments WHERE user_id = ? AND status IN ('active', 'pending_deposit') 
              ORDER BY start_date DESC`,
             [userId]
         );

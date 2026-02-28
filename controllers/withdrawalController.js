@@ -149,10 +149,14 @@ exports.createWithdrawalRequest = async (req, res) => {
         await connection.beginTransaction();
 
         const userId = req.user.id;
-        const { amount, paymentMethodId } = req.body;
+        const amount = parseFloat(req.body.amount);
+        const { paymentMethodId } = req.body;
 
-        if (!amount || amount <= 0) {
+        if (!amount || isNaN(amount) || !isFinite(amount) || amount <= 0) {
             return res.status(400).json({ error: 'Monto inválido' });
+        }
+        if (amount < 10000) {
+            return res.status(400).json({ error: 'Monto mínimo de retiro: $10.000 COP' });
         }
         if (!paymentMethodId) {
             return res.status(400).json({ error: 'Selecciona un método de pago' });
@@ -175,7 +179,7 @@ exports.createWithdrawalRequest = async (req, res) => {
         const currentBalance = balanceRows.length > 0 ? parseFloat(balanceRows[0].amount) : 0;
 
         const [investedRows] = await connection.execute(
-            `SELECT COALESCE(SUM(amount), 0) as total FROM investments WHERE user_id = ? AND status = 'active'`,
+            `SELECT COALESCE(SUM(amount), 0) as total FROM investments WHERE user_id = ? AND status IN ('active', 'pending_deposit')`,
             [userId]
         );
         const totalInvested = parseFloat(investedRows[0].total);
@@ -221,8 +225,8 @@ exports.createWithdrawalRequest = async (req, res) => {
         }
 
         // 5. Crear solicitud
-        const [countRows] = await connection.execute('SELECT COUNT(*) as c FROM withdrawal_requests');
-        const refId = 'RET-' + String(countRows[0].c + 1).padStart(5, '0');
+        // Unique ref_id
+        const refId = 'RET-' + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2,5).toUpperCase();
 
         const [result] = await connection.execute(
             `INSERT INTO withdrawal_requests (user_id, payment_method_id, amount, status, estimated_completion, ref_id)
@@ -345,8 +349,8 @@ exports.adminProcessWithdrawal = async (req, res) => {
 
         // Si se completa, crear transacción de retiro y recalcular balance
         if (action === 'complete') {
-            const [countRows] = await connection.execute('SELECT COUNT(*) as c FROM transactions');
-            const refId = 'WTX-' + String(countRows[0].c + 1).padStart(5, '0');
+            // Unique ref_id
+            const refId = 'WTX-' + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2,5).toUpperCase();
 
             await connection.execute(
                 `INSERT INTO transactions (user_id, type, amount, description, ref_id, created_at)

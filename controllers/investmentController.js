@@ -36,15 +36,16 @@ exports.createUserInvestment = async (req, res) => {
         await connection.beginTransaction();
 
         const userId = req.user.id;
-        const { productId, amount } = req.body;
+        const { productId } = req.body;
+        const amount = parseFloat(req.body.amount);
 
-        if (!productId || !amount) {
+        if (!productId || !amount || isNaN(amount)) {
             return res.status(400).json({ error: 'productId y amount son requeridos' });
         }
         if (productId !== 'sdtc_6m') {
             return res.status(400).json({ error: 'Producto no disponible' });
         }
-        if (amount < 100000) {
+        if (amount < 100000 || !isFinite(amount)) {
             return res.status(400).json({ error: 'Monto mínimo de inversión: $100.000 COP' });
         }
 
@@ -64,18 +65,26 @@ exports.createUserInvestment = async (req, res) => {
         );
         const currentBalance = balanceRows.length > 0 ? parseFloat(balanceRows[0].amount) : 0;
 
-        // 2. Calcular total invertido activamente
+        // 2. Calcular total invertido activamente (incluye pending_deposit)
         const [investedRows] = await connection.execute(
-            `SELECT COALESCE(SUM(amount), 0) as total FROM investments WHERE user_id = ? AND status = 'active'`,
+            `SELECT COALESCE(SUM(amount), 0) as total FROM investments WHERE user_id = ? AND status IN ('active', 'pending_deposit')`,
             [userId]
         );
         const totalInvested = parseFloat(investedRows[0].total);
-        const availableBalance = currentBalance - totalInvested;
+
+        // 3. Restar retiros pendientes/aprobados (dinero comprometido)
+        const [pendingWR] = await connection.execute(
+            `SELECT COALESCE(SUM(amount), 0) as total FROM withdrawal_requests WHERE user_id = ? AND status IN ('pending', 'approved')`,
+            [userId]
+        );
+        const pendingWithdrawals = parseFloat(pendingWR[0].total);
+
+        const availableBalance = currentBalance - totalInvested - pendingWithdrawals;
 
         if (amount > availableBalance) {
             return res.status(400).json({
-                error: `Saldo disponible insuficiente. Disponible: $${Math.round(availableBalance).toLocaleString('es-CO')} COP`,
-                available: availableBalance,
+                error: `Saldo disponible insuficiente. Disponible: $${Math.round(Math.max(0, availableBalance)).toLocaleString('es-CO')} COP`,
+                available: Math.max(0, availableBalance),
             });
         }
 
@@ -109,8 +118,8 @@ exports.createUserInvestment = async (req, res) => {
         const investmentId = result.insertId;
 
         // 5. Registrar transacción
-        const [countRows] = await connection.execute('SELECT COUNT(*) as c FROM transactions');
-        const refId = 'INV-' + String(countRows[0].c + 1).padStart(5, '0');
+        // Unique ref_id using timestamp + random
+        const refId = 'INV-' + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2,5).toUpperCase();
 
         await connection.execute(
             `INSERT INTO transactions (user_id, investment_id, type, amount, description, ref_id, created_at) 
@@ -186,9 +195,11 @@ exports.cancelInvestment = async (req, res) => {
             return res.status(400).json({ error: 'El período de cancelación de 12 horas ya expiró. La inversión ahora está activa.' });
         }
 
-        // Cancelar: eliminar inversión y transacción asociada
-        await connection.execute(`DELETE FROM transactions WHERE investment_id = ? AND user_id = ?`, [investmentId, userId]);
-        await connection.execute(`DELETE FROM investments WHERE id = ? AND user_id = ?`, [investmentId, userId]);
+        // Cancelar: cambiar status a cancelled (no eliminar para mantener audit trail)
+        await connection.execute(`UPDATE investments SET status = 'cancelled' WHERE id = ? AND user_id = ?`, [investmentId, userId]);
+        
+        // Eliminar la transacción de inversión asociada (para que no cuente en balance)
+        await connection.execute(`DELETE FROM transactions WHERE investment_id = ? AND user_id = ? AND type = 'investment'`, [investmentId, userId]);
 
         await auditLog({
             userId,
@@ -250,9 +261,10 @@ exports.addCapitalToInvestment = async (req, res) => {
 
         const userId = req.user.id;
         const investmentId = req.params.id;
-        const { amount } = req.body;
+        const { amount: rawAmount } = req.body;
+        const amount = parseFloat(rawAmount);
 
-        if (!amount || amount < 50000) {
+        if (!amount || isNaN(amount) || !isFinite(amount) || amount < 50000) {
             return res.status(400).json({ error: 'Monto mínimo para agregar: $50.000 COP' });
         }
 
@@ -281,16 +293,23 @@ exports.addCapitalToInvestment = async (req, res) => {
         const currentBalance = balanceRows.length > 0 ? parseFloat(balanceRows[0].amount) : 0;
 
         const [investedRows] = await connection.execute(
-            `SELECT COALESCE(SUM(amount), 0) as total FROM investments WHERE user_id = ? AND status = 'active'`,
+            `SELECT COALESCE(SUM(amount), 0) as total FROM investments WHERE user_id = ? AND status IN ('active', 'pending_deposit')`,
             [userId]
         );
         const totalInvested = parseFloat(investedRows[0].total);
-        const availableBalance = currentBalance - totalInvested;
+
+        const [pendingWR] = await connection.execute(
+            `SELECT COALESCE(SUM(amount), 0) as total FROM withdrawal_requests WHERE user_id = ? AND status IN ('pending', 'approved')`,
+            [userId]
+        );
+        const pendingWithdrawals = parseFloat(pendingWR[0].total);
+
+        const availableBalance = currentBalance - totalInvested - pendingWithdrawals;
 
         if (amount > availableBalance) {
             return res.status(400).json({
-                error: `Saldo disponible insuficiente. Disponible: $${Math.round(availableBalance).toLocaleString('es-CO')} COP`,
-                available: availableBalance,
+                error: `Saldo disponible insuficiente. Disponible: $${Math.round(Math.max(0, availableBalance)).toLocaleString('es-CO')} COP`,
+                available: Math.max(0, availableBalance),
             });
         }
 
@@ -305,8 +324,8 @@ exports.addCapitalToInvestment = async (req, res) => {
         );
 
         // 5. Registrar transacción
-        const [countRows] = await connection.execute('SELECT COUNT(*) as c FROM transactions');
-        const refId = 'ADD-' + String(countRows[0].c + 1).padStart(5, '0');
+        // Unique ref_id using timestamp + random
+        const refId = 'ADD-' + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2,5).toUpperCase();
 
         const lockDateStr = (inv.lock_end_date || inv.end_date).toString().slice(0, 10);
 
@@ -395,8 +414,8 @@ exports.withdrawInvestment = async (req, res) => {
         // 5. NO necesita transacción extra: al cambiar a completed, el amount
         // ya no se cuenta como "invertido", así que automáticamente vuelve al disponible
         // Pero registramos una transacción informativa
-        const [countRows] = await connection.execute('SELECT COUNT(*) as c FROM transactions');
-        const refId = 'WDR-' + String(countRows[0].c + 1).padStart(5, '0');
+        // Unique ref_id using timestamp + random
+        const refId = 'WDR-' + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2,5).toUpperCase();
 
         await connection.execute(
             `INSERT INTO transactions (user_id, investment_id, type, amount, description, ref_id, created_at) 
@@ -587,10 +606,17 @@ exports.getBalanceSummary = async (req, res) => {
         const totalBalance = balanceRows.length > 0 ? parseFloat(balanceRows[0].amount) : 0;
 
         const [investedRows] = await pool.execute(
-            `SELECT COALESCE(SUM(amount), 0) as total FROM investments WHERE user_id = ? AND status = 'active'`,
+            `SELECT COALESCE(SUM(amount), 0) as total FROM investments WHERE user_id = ? AND status IN ('active', 'pending_deposit')`,
             [userId]
         );
         const totalInvested = parseFloat(investedRows[0].total);
+
+        // Restar retiros pendientes y aprobados (dinero ya comprometido)
+        const [pendingWithdrawals] = await pool.execute(
+            `SELECT COALESCE(SUM(amount), 0) as total FROM withdrawal_requests WHERE user_id = ? AND status IN ('pending', 'approved')`,
+            [userId]
+        );
+        const pendingWithdrawalAmount = parseFloat(pendingWithdrawals[0].total);
 
         const [earningsRows] = await pool.execute(
             `SELECT COALESCE(SUM(amount_earned), 0) as total FROM investment_returns WHERE user_id = ?`,
@@ -598,13 +624,14 @@ exports.getBalanceSummary = async (req, res) => {
         );
         const totalEarnings = parseFloat(earningsRows[0].total);
 
-        const availableBalance = totalBalance - totalInvested;
+        const availableBalance = totalBalance - totalInvested - pendingWithdrawalAmount;
 
         res.json({
             totalBalance,
             totalInvested,
             availableBalance: Math.max(0, availableBalance),
             totalEarnings,
+            pendingWithdrawals: pendingWithdrawalAmount,
         });
     } catch (error) {
         console.error('Error balance summary:', error);

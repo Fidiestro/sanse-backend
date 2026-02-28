@@ -65,7 +65,7 @@ async function recalculateAndSaveBalance(connection, userId) {
     const [inRows] = await connection.execute(
         `SELECT COALESCE(SUM(amount), 0) as total 
          FROM transactions 
-         WHERE user_id = ? AND type IN ('deposit', 'payment', 'interest', 'profit', 'investment_return')`,
+         WHERE user_id = ? AND type IN ('deposit', 'payment', 'interest', 'profit', 'investment_return', 'investment_withdrawal')`,
         [userId]
     );
     const [outRows] = await connection.execute(
