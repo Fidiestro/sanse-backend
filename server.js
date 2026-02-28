@@ -44,6 +44,7 @@ try { app.use('/api/dashboard', require('./routes/dashboard')); console.log('�
 try { app.use('/api/admin', require('./routes/admin')); console.log('🔧 Admin routes loaded'); } catch(e) {}
 try { app.use('/api/investments', require('./routes/investments')); console.log('💰 Investment routes loaded'); } catch(e) { console.error('❌ Investment routes error:', e.message); }
 try { app.use('/api/withdrawals', require('./routes/withdrawals')); console.log('💸 Withdrawal routes loaded'); } catch(e) { console.error('❌ Withdrawal routes error:', e.message); }
+try { app.use('/api/loans', require('./routes/loans')); console.log('🏦 Loan routes loaded'); } catch(e) { console.error('❌ Loan routes error:', e.message); }
 
 app.use((req, res) => { res.status(404).json({ error: 'Ruta no encontrada' }); });
 app.use((err, req, res, next) => { console.error('Error:', err.message); res.status(500).json({ error: 'Error interno del servidor' }); });
