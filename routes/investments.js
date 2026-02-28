@@ -12,6 +12,9 @@ router.get('/available', investmentController.getAvailableProducts);
 // Resumen de balance (total, invertido, disponible)
 router.get('/balance-summary', investmentController.getBalanceSummary);
 
+// Estadísticas globales SDTC (total bloqueado, APY)
+router.get('/global-stats', investmentController.getGlobalStats);
+
 // Mis inversiones
 router.get('/my', investmentController.getMyInvestments);
 

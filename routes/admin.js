@@ -31,6 +31,12 @@ router.post('/recalculate-all-balances', adminController.recalculateAllBalances)
 // Detalles usuario
 router.get('/users/:id/details', adminController.getUserDetails);
 
+// Bloquear/Desbloquear usuario
+router.post('/users/:id/toggle-block', adminController.toggleBlockUser);
+
+// Cancelar inversión (admin)
+router.post('/investments/:id/cancel', adminController.adminCancelInvestment);
+
 // === SOLICITUDES DE RETIRO (ADMIN) ===
 router.get('/withdrawals', withdrawalController.adminGetWithdrawals);
 router.post('/withdrawals/:id/process', withdrawalController.adminProcessWithdrawal);

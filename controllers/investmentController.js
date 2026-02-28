@@ -638,3 +638,58 @@ exports.getBalanceSummary = async (req, res) => {
         res.status(500).json({ error: 'Error interno del servidor' });
     }
 };
+
+// GET /api/investments/global-stats — Estadísticas globales de SDTC (público para usuarios)
+exports.getGlobalStats = async (req, res) => {
+    try {
+        // 1. Total capital bloqueado en SDTC activas (todos los usuarios)
+        const [lockedRows] = await pool.execute(
+            `SELECT COALESCE(SUM(amount), 0) as total, COUNT(*) as count 
+             FROM investments WHERE status IN ('active', 'pending_deposit')`
+        );
+        const totalLocked = parseFloat(lockedRows[0].total);
+        const totalActiveInvestments = parseInt(lockedRows[0].count);
+
+        // 2. Total usuarios invirtiendo
+        const [usersRows] = await pool.execute(
+            `SELECT COUNT(DISTINCT user_id) as count FROM investments WHERE status IN ('active', 'pending_deposit')`
+        );
+        const totalInvestors = parseInt(usersRows[0].count);
+
+        // 3. Calcular APY real basado en rendimientos pagados
+        // APY = ((1 + tasa_mensual_promedio)^12 - 1) × 100
+        const [returnsRows] = await pool.execute(
+            `SELECT AVG(rate_applied) as avgMonthlyRate, 
+                    SUM(amount_earned) as totalEarned,
+                    COUNT(*) as totalPayments
+             FROM investment_returns WHERE status = 'paid'`
+        );
+        const avgMonthlyRate = parseFloat(returnsRows[0].avgMonthlyRate) || 0;
+        const totalEarnedGlobal = parseFloat(returnsRows[0].totalEarned) || 0;
+        const totalPayments = parseInt(returnsRows[0].totalPayments) || 0;
+
+        // APY compuesto: ((1 + r/100)^12 - 1) × 100
+        const apyReal = avgMonthlyRate > 0 
+            ? ((Math.pow(1 + avgMonthlyRate / 100, 12) - 1) * 100).toFixed(1)
+            : 0;
+
+        // APY rango (basado en min 2% y max 4% mensual)
+        const apyMin = ((Math.pow(1.02, 12) - 1) * 100).toFixed(1); // ~26.8%
+        const apyMax = ((Math.pow(1.04, 12) - 1) * 100).toFixed(1); // ~60.1%
+
+        res.json({
+            totalLocked,
+            totalActiveInvestments,
+            totalInvestors,
+            avgMonthlyRate: parseFloat(avgMonthlyRate.toFixed(2)),
+            apyReal: parseFloat(apyReal),
+            apyMin: parseFloat(apyMin),
+            apyMax: parseFloat(apyMax),
+            totalEarnedGlobal,
+            totalPayments,
+        });
+    } catch (error) {
+        console.error('Error global stats:', error);
+        res.status(500).json({ error: 'Error interno del servidor' });
+    }
+};

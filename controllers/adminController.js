@@ -260,7 +260,7 @@ exports.getActiveInvestments = async (req, res) => {
                     u.full_name as user_name, u.email as user_email
              FROM investments i
              LEFT JOIN users u ON i.user_id = u.id
-             WHERE i.status = 'active'
+             WHERE i.status IN ('active', 'pending_deposit')
              ORDER BY i.created_at DESC`
         );
 
@@ -420,5 +420,79 @@ exports.deleteTransaction = async (req, res) => {
         res.status(500).json({ error: 'Error interno' });
     } finally {
         connection.release();
+    }
+};
+
+// POST /api/admin/investments/:id/cancel — Admin cancela cualquier inversión
+exports.adminCancelInvestment = async (req, res) => {
+    const connection = await pool.getConnection();
+    try {
+        await connection.beginTransaction();
+
+        const invId = req.params.id;
+        const { reason } = req.body;
+
+        const [invRows] = await connection.execute(
+            `SELECT * FROM investments WHERE id = ? AND status IN ('active', 'pending_deposit')`,
+            [invId]
+        );
+        if (!invRows.length) {
+            return res.status(404).json({ error: 'Inversión no encontrada o ya completada/cancelada' });
+        }
+        const inv = invRows[0];
+
+        // Cambiar a cancelled
+        await connection.execute(
+            `UPDATE investments SET status = 'cancelled', notes = CONCAT(IFNULL(notes,''), ' | ADMIN CANCEL: ${(reason || 'Sin motivo').replace(/'/g, "''")}') WHERE id = ?`,
+            [invId]
+        );
+
+        // Eliminar transacciones de inversión asociadas
+        await connection.execute(
+            `DELETE FROM transactions WHERE investment_id = ? AND type = 'investment'`,
+            [invId]
+        );
+
+        // Recalcular balance del usuario
+        await recalculateAndSaveBalance(connection, inv.user_id);
+
+        await connection.commit();
+        res.json({ message: 'Inversión cancelada por admin. Capital devuelto al usuario.', userId: inv.user_id, amount: parseFloat(inv.amount) });
+    } catch (error) {
+        await connection.rollback();
+        console.error('Error admin cancel investment:', error);
+        res.status(500).json({ error: 'Error interno' });
+    } finally {
+        connection.release();
+    }
+};
+
+// POST /api/admin/users/:id/toggle-block — Bloquear/Desbloquear usuario
+exports.toggleBlockUser = async (req, res) => {
+    try {
+        const userId = req.params.id;
+        const { reason } = req.body;
+
+        const [userRows] = await pool.execute(`SELECT id, status, role FROM users WHERE id = ?`, [userId]);
+        if (!userRows.length) return res.status(404).json({ error: 'Usuario no encontrado' });
+        if (userRows[0].role === 'admin') return res.status(400).json({ error: 'No se puede bloquear a un administrador' });
+
+        const currentStatus = userRows[0].status;
+        const newStatus = currentStatus === 'blocked' ? 'active' : 'blocked';
+
+        await pool.execute(`UPDATE users SET status = ? WHERE id = ?`, [newStatus, userId]);
+
+        // Si se bloquea, invalidar sesiones (opcional: se podría agregar columna blocked_at)
+        if (newStatus === 'blocked' && reason) {
+            await pool.execute(
+                `UPDATE users SET notes = CONCAT(IFNULL(notes,''), '\nBLOQUEADO: ${reason.replace(/'/g, "''")} — ${new Date().toISOString().slice(0,16)}') WHERE id = ?`,
+                [userId]
+            );
+        }
+
+        res.json({ message: `Usuario ${newStatus === 'blocked' ? 'bloqueado' : 'desbloqueado'}`, status: newStatus });
+    } catch (error) {
+        console.error('Error toggle block:', error);
+        res.status(500).json({ error: 'Error interno' });
     }
 };
