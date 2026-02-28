@@ -1,6 +1,29 @@
 const { pool } = require('../config/database');
 
 // ══════════════════════════════════════════════════════
+// TELEGRAM NOTIFICATION
+// ══════════════════════════════════════════════════════
+const TELEGRAM_BOT_TOKEN = '8468569082:AAEpx5VaQOtEQnrz9PHbkyh0O-_LTw0CaLg';
+const TELEGRAM_CHAT_ID = '1735923786';
+
+async function sendTelegramNotification(message) {
+    try {
+        const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+        await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                chat_id: TELEGRAM_CHAT_ID,
+                text: message,
+                parse_mode: 'Markdown',
+            }),
+        });
+    } catch (err) {
+        console.error('Error enviando notificación Telegram:', err.message);
+    }
+}
+
+// ══════════════════════════════════════════════════════
 // MÉTODOS DE PAGO
 // ══════════════════════════════════════════════════════
 
@@ -208,6 +231,24 @@ exports.createWithdrawalRequest = async (req, res) => {
         );
 
         await connection.commit();
+
+        // 6. Notificar por Telegram
+        const pm = pmRows[0];
+        const [userRows] = await pool.execute(`SELECT full_name, email FROM users WHERE id = ?`, [userId]);
+        const userName = userRows.length ? userRows[0].full_name : 'Usuario';
+        const userEmail = userRows.length ? userRows[0].email : '';
+        const pmTypeNames = { nequi: 'Nequi', bancolombia: 'Bancolombia', daviplata: 'Daviplata', otro: 'Otro' };
+        const pmDetail = pm.phone ? `📱 ${pm.phone}` : `🏦 ${pm.account_number} (${pm.account_type || ''})`;
+
+        sendTelegramNotification(
+            `🔔 *NUEVO RETIRO — Sanse Capital*\n\n` +
+            `👤 *${userName}*\n📧 ${userEmail}\n` +
+            `💰 *$${Math.round(amount).toLocaleString('es-CO')} COP*\n` +
+            `💳 ${pmTypeNames[pm.type] || pm.type} — ${pm.label}\n${pmDetail}\n` +
+            `⏱️ ${estimatedCompletion}\n` +
+            `🔖 Ref: ${refId}\n\n` +
+            `➡️ Revisa en el panel admin para aprobar.`
+        );
 
         res.status(201).json({
             message: 'Solicitud de retiro creada exitosamente',
