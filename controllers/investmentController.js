@@ -48,6 +48,15 @@ exports.createUserInvestment = async (req, res) => {
             return res.status(400).json({ error: 'Monto mínimo de inversión: $100.000 COP' });
         }
 
+        // Verificar máximo 3 SDTC activas por usuario
+        const [activeCountRows] = await connection.execute(
+            `SELECT COUNT(*) as c FROM investments WHERE user_id = ? AND status IN ('active', 'pending_deposit')`,
+            [userId]
+        );
+        if (activeCountRows[0].c >= 3) {
+            return res.status(400).json({ error: 'Máximo 3 inversiones SDTC activas permitidas. Espera a que una termine o retírala para crear otra.' });
+        }
+
         // 1. Calcular balance disponible del usuario
         const [balanceRows] = await connection.execute(
             `SELECT amount FROM balance_history WHERE user_id = ? ORDER BY snapshot_date DESC LIMIT 1`,
@@ -78,19 +87,22 @@ exports.createUserInvestment = async (req, res) => {
 
         const formatDate = (d) => d.toISOString().slice(0, 10);
 
-        // 4. Crear la inversión
+        // 4. Crear la inversión en estado pending_deposit (12h para confirmar/cancelar)
+        const depositDeadline = new Date();
+        depositDeadline.setHours(depositDeadline.getHours() + 12);
+
         const [result] = await connection.execute(
             `INSERT INTO investments 
              (user_id, type, amount, annual_rate, duration_months, min_monthly_rate, max_monthly_rate, 
               start_date, end_date, lock_end_date, invested_from_balance, status, notes) 
-             VALUES (?, 'SDTC', ?, 0, 6, 2.00, 4.00, ?, ?, ?, 1, 'active', ?)`,
+             VALUES (?, 'SDTC', ?, 0, 6, 2.00, 4.00, ?, ?, ?, 1, 'pending_deposit', ?)`,
             [
                 userId,
                 amount,
                 formatDate(startDate),
                 formatDate(endDate),
                 formatDate(lockEndDate),
-                `Inversión SDTC creada por usuario. Desbloqueo: ${formatDate(lockEndDate)}`,
+                `Inversión SDTC — Período de depósito hasta: ${depositDeadline.toISOString().slice(0,16).replace('T',' ')}. Desbloqueo: ${formatDate(lockEndDate)}`,
             ]
         );
 
@@ -119,7 +131,7 @@ exports.createUserInvestment = async (req, res) => {
         await connection.commit();
 
         res.status(201).json({
-            message: 'Inversión SDTC creada exitosamente',
+            message: 'Inversión SDTC creada. Tienes 12 horas para confirmar o cancelar.',
             investment: {
                 id: investmentId,
                 type: 'SDTC',
@@ -129,7 +141,8 @@ exports.createUserInvestment = async (req, res) => {
                 lockEndDate: formatDate(lockEndDate),
                 minMonthlyRate: 2.0,
                 maxMonthlyRate: 4.0,
-                status: 'active',
+                status: 'pending_deposit',
+                depositDeadline: depositDeadline.toISOString(),
                 refId,
             },
         });
@@ -139,6 +152,90 @@ exports.createUserInvestment = async (req, res) => {
         res.status(500).json({ error: 'Error interno del servidor' });
     } finally {
         connection.release();
+    }
+};
+
+// ══════════════════════════════════════════════════════════════
+// POST /api/investments/:id/cancel — Cancelar inversión en período de depósito (12h)
+// Solo funciona si status es 'pending_deposit'
+// ══════════════════════════════════════════════════════════════
+exports.cancelInvestment = async (req, res) => {
+    const connection = await pool.getConnection();
+    try {
+        await connection.beginTransaction();
+
+        const userId = req.user.id;
+        const investmentId = req.params.id;
+
+        const [invRows] = await connection.execute(
+            `SELECT * FROM investments WHERE id = ? AND user_id = ? AND status = 'pending_deposit'`,
+            [investmentId, userId]
+        );
+        if (!invRows.length) {
+            return res.status(404).json({ error: 'Inversión no encontrada o ya no se puede cancelar (período de 12 horas expirado)' });
+        }
+
+        // Verificar que aún estamos dentro de las 12h
+        const inv = invRows[0];
+        const createdAt = new Date(inv.created_at);
+        const deadline = new Date(createdAt.getTime() + 12 * 60 * 60 * 1000);
+        if (new Date() > deadline) {
+            // Auto-activar si expiró
+            await connection.execute(`UPDATE investments SET status = 'active' WHERE id = ?`, [investmentId]);
+            await connection.commit();
+            return res.status(400).json({ error: 'El período de cancelación de 12 horas ya expiró. La inversión ahora está activa.' });
+        }
+
+        // Cancelar: eliminar inversión y transacción asociada
+        await connection.execute(`DELETE FROM transactions WHERE investment_id = ? AND user_id = ?`, [investmentId, userId]);
+        await connection.execute(`DELETE FROM investments WHERE id = ? AND user_id = ?`, [investmentId, userId]);
+
+        await auditLog({
+            userId,
+            action: 'cancel_investment',
+            entityType: 'investment',
+            entityId: parseInt(investmentId),
+            details: { amount: parseFloat(inv.amount), reason: 'Cancelado dentro de 12h' },
+            ipAddress: req.ip,
+        });
+
+        await connection.commit();
+
+        res.json({
+            message: 'Inversión cancelada exitosamente. El capital vuelve a tu saldo disponible.',
+            refundedAmount: parseFloat(inv.amount),
+        });
+    } catch (error) {
+        await connection.rollback();
+        console.error('Error cancelando inversión:', error);
+        res.status(500).json({ error: 'Error interno del servidor' });
+    } finally {
+        connection.release();
+    }
+};
+
+// ══════════════════════════════════════════════════════════════
+// POST /api/investments/:id/confirm — Confirmar inversión (activa inmediatamente)
+// ══════════════════════════════════════════════════════════════
+exports.confirmInvestment = async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const investmentId = req.params.id;
+
+        const [invRows] = await pool.execute(
+            `SELECT * FROM investments WHERE id = ? AND user_id = ? AND status = 'pending_deposit'`,
+            [investmentId, userId]
+        );
+        if (!invRows.length) {
+            return res.status(404).json({ error: 'Inversión no encontrada o ya está activa' });
+        }
+
+        await pool.execute(`UPDATE investments SET status = 'active' WHERE id = ?`, [investmentId]);
+
+        res.json({ message: 'Inversión confirmada y activada.', investmentId: parseInt(investmentId) });
+    } catch (error) {
+        console.error('Error confirmando inversión:', error);
+        res.status(500).json({ error: 'Error interno del servidor' });
     }
 };
 
@@ -365,6 +462,16 @@ exports.getMyInvestments = async (req, res) => {
                 const progressPct = Math.min(100, Math.round((elapsedDays / totalDays) * 100));
                 const daysRemaining = Math.max(0, Math.ceil((end - now) / (1000 * 60 * 60 * 24)));
                 const isMatured = now >= end;
+                const isPendingDeposit = inv.status === 'pending_deposit';
+                const createdAt = new Date(inv.created_at);
+                const depositDeadline = isPendingDeposit ? new Date(createdAt.getTime() + 12 * 60 * 60 * 1000) : null;
+                const canCancel = isPendingDeposit && now < depositDeadline;
+
+                // Auto-activate if pending_deposit and 12h passed
+                if (isPendingDeposit && !canCancel) {
+                    await pool.execute(`UPDATE investments SET status = 'active' WHERE id = ? AND status = 'pending_deposit'`, [inv.id]);
+                    inv.status = 'active';
+                }
 
                 return {
                     id: inv.id,
@@ -383,6 +490,9 @@ exports.getMyInvestments = async (req, res) => {
                     daysRemaining,
                     totalEarned,
                     isMatured,
+                    isPendingDeposit: inv.status === 'pending_deposit',
+                    canCancel: inv.status === 'pending_deposit',
+                    depositDeadline: depositDeadline ? depositDeadline.toISOString() : null,
                     returns: returns.map((r) => ({
                         month: r.period_month,
                         rate: parseFloat(r.rate_applied),
