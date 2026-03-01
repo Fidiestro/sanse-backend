@@ -219,7 +219,7 @@ exports.createWithdrawalRequest = async (req, res) => {
         }
 
         // 4. Determinar tiempo estimado
-        let estimatedCompletion = '48 horas';
+        let estimatedCompletion = '24 horas o menos';
         if (amount > 2000000) {
             estimatedCompletion = '30 días';
         }

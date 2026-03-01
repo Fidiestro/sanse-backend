@@ -286,7 +286,13 @@ exports.adminProcessLoan = async (req, res) => {
             if (loan.status !== 'pending') return res.status(400).json({ error: 'Solo se pueden aprobar solicitudes pendientes' });
 
             const finalAmount = approvedAmount ? parseFloat(approvedAmount) : parseFloat(loan.amount);
-            const finalRate = approvedRate ? parseFloat(approvedRate) : 3.0; // 3% mensual por defecto
+            // Tasa: 4% si tiene inversiones SDTC (activas o pasadas), 6% si NO tiene
+            let defaultRate = 6.0;
+            const [investorCheck] = await connection.execute(
+                `SELECT COUNT(*) as c FROM investments WHERE user_id = ?`, [loan.user_id]
+            );
+            if (parseInt(investorCheck[0].c) > 0) defaultRate = 4.0;
+            const finalRate = approvedRate ? parseFloat(approvedRate) : defaultRate;
 
             const startDate = new Date();
             const dueDate = new Date();
@@ -364,5 +370,111 @@ exports.adminGetCreditScore = async (req, res) => {
     } catch (error) {
         console.error('Error:', error);
         res.status(500).json({ error: 'Error interno' });
+    }
+};
+
+// ══════════════════════════════════════════════════════════════
+// POST /api/loans/pay — Abonar a un préstamo activo
+// ══════════════════════════════════════════════════════════════
+exports.payLoan = async (req, res) => {
+    const connection = await pool.getConnection();
+    try {
+        await connection.beginTransaction();
+
+        const userId = req.user.id;
+        const { loanId, amount: rawAmount } = req.body;
+        const amount = parseFloat(rawAmount);
+
+        if (!loanId || !amount || isNaN(amount) || amount < 1000) {
+            return res.status(400).json({ error: 'Monto mínimo de abono: $1.000 COP' });
+        }
+
+        // Verificar que el préstamo existe y pertenece al usuario
+        const [loanRows] = await connection.execute(
+            `SELECT * FROM loan_requests WHERE id = ? AND user_id = ? AND status IN ('active', 'overdue')`,
+            [loanId, userId]
+        );
+        if (!loanRows.length) {
+            return res.status(404).json({ error: 'Préstamo no encontrado o no está activo' });
+        }
+        const loan = loanRows[0];
+
+        // Verificar balance disponible
+        const [balanceRows] = await connection.execute(
+            `SELECT amount FROM balance_history WHERE user_id = ? ORDER BY snapshot_date DESC LIMIT 1`, [userId]
+        );
+        const currentBalance = balanceRows.length ? parseFloat(balanceRows[0].amount) : 0;
+
+        const [investedRows] = await connection.execute(
+            `SELECT COALESCE(SUM(amount), 0) as total FROM investments WHERE user_id = ? AND status IN ('active', 'pending_deposit')`, [userId]
+        );
+        const totalInvested = parseFloat(investedRows[0].total);
+
+        const [pendingWR] = await connection.execute(
+            `SELECT COALESCE(SUM(amount), 0) as total FROM withdrawal_requests WHERE user_id = ? AND status IN ('pending', 'approved')`, [userId]
+        );
+        const pendingWithdrawals = parseFloat(pendingWR[0].total);
+        const availableBalance = currentBalance - totalInvested - pendingWithdrawals;
+
+        if (amount > availableBalance) {
+            return res.status(400).json({
+                error: `Saldo disponible insuficiente. Disponible: $${Math.round(Math.max(0, availableBalance)).toLocaleString('es-CO')} COP`,
+                available: Math.max(0, availableBalance),
+            });
+        }
+
+        // Crear transacción de abono (tipo payment, resta del balance)
+        const refId = 'PAY-' + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2,5).toUpperCase();
+        const loanRate = parseFloat(loan.approved_rate || loan.monthly_rate || 3);
+        const capital = parseFloat(loan.approved_amount || loan.amount);
+
+        await connection.execute(
+            `INSERT INTO transactions (user_id, type, amount, description, ref_id, created_at) VALUES (?, 'withdraw', ?, ?, ?, NOW())`,
+            [userId, amount, `Abono préstamo — Ref: ${loan.ref_id} — Capital: $${Math.round(capital).toLocaleString('es-CO')}`, refId]
+        );
+
+        // Registrar abono en notas del préstamo
+        await connection.execute(
+            `UPDATE loan_requests SET admin_notes = CONCAT(IFNULL(admin_notes,''), ' | ABONO $${Math.round(amount).toLocaleString('es-CO')} ${new Date().toISOString().slice(0,10)} ref:${refId}') WHERE id = ?`,
+            [loanId]
+        );
+
+        // Recalcular balance
+        const [inRows] = await connection.execute(
+            `SELECT COALESCE(SUM(amount), 0) as total FROM transactions WHERE user_id = ? AND type IN ('deposit','payment','interest','profit','investment_return','investment_withdrawal','loan')`, [userId]
+        );
+        const [outRows] = await connection.execute(
+            `SELECT COALESCE(SUM(amount), 0) as total FROM transactions WHERE user_id = ? AND type IN ('withdraw')`, [userId]
+        );
+        const newBalance = Math.max(0, parseFloat(inRows[0].total) - parseFloat(outRows[0].total));
+        const today = new Date().toISOString().slice(0,10);
+        const [existing] = await connection.execute(`SELECT id FROM balance_history WHERE user_id = ? AND snapshot_date = ?`, [userId, today]);
+        if (existing.length) await connection.execute(`UPDATE balance_history SET amount = ? WHERE user_id = ? AND snapshot_date = ?`, [newBalance, userId, today]);
+        else await connection.execute(`INSERT INTO balance_history (user_id, amount, snapshot_date) VALUES (?, ?, ?)`, [userId, newBalance, today]);
+
+        await connection.commit();
+
+        // Notificación Telegram
+        const [userRows] = await pool.execute(`SELECT full_name, email FROM users WHERE id = ?`, [userId]);
+        const userName = userRows.length ? userRows[0].full_name : 'Usuario';
+
+        sendTelegramNotification(
+            `💳 *ABONO A PRÉSTAMO — Sanse Capital*\n\n` +
+            `👤 *${userName}*\n` +
+            `💰 Abono: *$${Math.round(amount).toLocaleString('es-CO')} COP*\n` +
+            `🏦 Préstamo: ${loan.ref_id} — Capital: $${Math.round(capital).toLocaleString('es-CO')}\n` +
+            `🔖 Ref abono: ${refId}`
+        );
+
+        res.json({
+            message: 'Abono registrado exitosamente',
+            payment: { amount, refId, newBalance },
+        });
+    } catch (error) {
+        await connection.rollback();
+        console.error('Error abonando préstamo:', error);
+        res.status(500).json({ error: 'Error interno del servidor' });
+    } finally {
+        connection.release();
     }
 };

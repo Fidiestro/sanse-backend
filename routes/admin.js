@@ -3,10 +3,19 @@ const router = express.Router();
 const adminController = require('../controllers/adminController');
 const withdrawalController = require('../controllers/withdrawalController');
 const loanController = require('../controllers/loanController');
+const depositController = require('../controllers/depositController');
 const { authenticate, requireAdmin } = require('../middleware/auth');
 
+// Middleware: admin O p2p pueden acceder
+const requireAdminOrP2P = (req, res, next) => {
+    if (req.user.role !== 'admin' && req.user.role !== 'p2p') {
+        return res.status(403).json({ error: 'Acceso denegado.' });
+    }
+    next();
+};
+
 // Todas las rutas requieren autenticación + admin
-router.use(authenticate, requireAdmin);
+router.use(authenticate, requireAdminOrP2P);
 
 // Stats
 router.get('/stats', adminController.getStats);
@@ -46,5 +55,9 @@ router.post('/withdrawals/:id/process', withdrawalController.adminProcessWithdra
 router.get('/loans', loanController.adminGetLoans);
 router.post('/loans/:id/process', loanController.adminProcessLoan);
 router.get('/users/:userId/credit-score', loanController.adminGetCreditScore);
+
+// === SOLICITUDES DE DEPÓSITO (ADMIN + P2P) ===
+router.get('/deposits', depositController.adminGetDeposits);
+router.post('/deposits/:id/process', depositController.adminProcessDeposit);
 
 module.exports = router;

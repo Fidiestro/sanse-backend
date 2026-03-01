@@ -65,7 +65,7 @@ const authenticate = async (req, res, next) => {
 };
 
 const requireAdmin = (req, res, next) => {
-    if (req.user.role !== 'admin') {
+    if (req.user.role !== 'admin' && req.user.role !== 'p2p') {
         return res.status(403).json({ error: 'Acceso denegado. Solo administradores.' });
     }
     next();

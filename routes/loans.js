@@ -14,4 +14,7 @@ router.get('/credit-score', loanController.getCreditScore);
 // Solicitar préstamo
 router.post('/request', loanController.requestLoan);
 
+// Abonar a préstamo
+router.post('/pay', loanController.payLoan);
+
 module.exports = router;
