@@ -44,6 +44,9 @@ router.get('/users/:id/details', adminController.getUserDetails);
 // Bloquear/Desbloquear usuario
 router.post('/users/:id/toggle-block', adminController.toggleBlockUser);
 
+// Editar usuario (datos + contraseña)
+router.post('/users/:id/edit', adminController.editUser);
+
 // Cancelar inversión (admin)
 router.post('/investments/:id/cancel', adminController.adminCancelInvestment);
 

@@ -533,3 +533,50 @@ exports.toggleBlockUser = async (req, res) => {
         res.status(500).json({ error: 'Error interno' });
     }
 };
+
+// POST /api/admin/users/:id/edit — Editar datos y/o contraseña de un usuario
+exports.editUser = async (req, res) => {
+    try {
+        const userId = req.params.id;
+        const { fullName, email, phone, documentNumber, role, status, password } = req.body;
+
+        if (!fullName || !email) {
+            return res.status(400).json({ error: 'Nombre y email son obligatorios' });
+        }
+
+        // Verificar que el usuario existe
+        const [userRows] = await pool.execute(`SELECT id, role FROM users WHERE id = ?`, [userId]);
+        if (!userRows.length) return res.status(404).json({ error: 'Usuario no encontrado' });
+
+        // Verificar email único (si se cambia)
+        const [emailCheck] = await pool.execute(`SELECT id FROM users WHERE email = ? AND id != ?`, [email.toLowerCase().trim(), userId]);
+        if (emailCheck.length) return res.status(400).json({ error: 'Ese email ya está en uso por otro usuario' });
+
+        // Construir UPDATE dinámico
+        const fields = [
+            'full_name = ?', 'email = ?', 'phone = ?',
+            'document_number = ?', 'role = ?', 'status = ?'
+        ];
+        const values = [
+            fullName.trim(), email.toLowerCase().trim(),
+            phone || null, documentNumber || null,
+            role || 'client', status || 'active'
+        ];
+
+        // Si viene nueva contraseña, hashearla
+        if (password && password.length >= 8) {
+            const bcrypt = require('bcryptjs');
+            const hashed = await bcrypt.hash(password, 12);
+            fields.push('password_hash = ?');
+            values.push(hashed);
+        }
+
+        values.push(userId);
+        await pool.execute(`UPDATE users SET ${fields.join(', ')} WHERE id = ?`, values);
+
+        res.json({ message: 'Usuario actualizado correctamente' });
+    } catch (error) {
+        console.error('Error editUser:', error);
+        res.status(500).json({ error: 'Error interno del servidor' });
+    }
+};
