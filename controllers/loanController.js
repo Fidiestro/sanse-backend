@@ -425,13 +425,48 @@ exports.payLoan = async (req, res) => {
 
         // Crear transacción de abono (tipo payment, resta del balance)
         const refId = 'PAY-' + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2,5).toUpperCase();
-        const loanRate = parseFloat(loan.approved_rate || loan.monthly_rate || 3);
+        const loanRate = parseFloat(loan.approved_rate || loan.monthly_rate || 4);
         const capital = parseFloat(loan.approved_amount || loan.amount);
 
+        // Calcular cuánto del abono corresponde a intereses del mes
+        const monthlyInterest = Math.round(capital * (loanRate / 100));
+        // El interés incluido en este abono es el mínimo entre el monto abonado y el interés mensual
+        const interestPortion = Math.min(amount, monthlyInterest);
+
+        // Comisión de referido: 5% de la porción de intereses
+        let referralCommission = 0;
+        let referrerId = null;
+        const [refCheck] = await connection.execute('SELECT referred_by FROM users WHERE id = ?', [userId]);
+        if (refCheck.length && refCheck[0].referred_by && interestPortion > 0) {
+            referrerId = refCheck[0].referred_by;
+            referralCommission = Math.round(interestPortion * 0.05);
+        }
+
+        // El abono efectivo que se registra como retiro del usuario es el monto completo
+        // (el usuario paga el total, pero de ese pago los intereses van: 95% a Sanse, 5% al referidor)
         await connection.execute(
             `INSERT INTO transactions (user_id, type, amount, description, ref_id, created_at) VALUES (?, 'withdraw', ?, ?, ?, NOW())`,
             [userId, amount, `Abono préstamo — Ref: ${loan.ref_id} — Capital: $${Math.round(capital).toLocaleString('es-CO')}`, refId]
         );
+
+        // Si hay comisión de referido, crear transacción de ganancia para el referidor
+        let referralRefId = null;
+        if (referrerId && referralCommission >= 100) {
+            referralRefId = 'REF-' + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2, 5).toUpperCase();
+
+            try {
+                await connection.execute(
+                    `INSERT INTO referral_commissions (referrer_id, referred_id, source_type, source_id, source_amount, commission_rate, commission_amount, status, ref_id) 
+                     VALUES (?, ?, 'loan_interest', ?, ?, 0.05, ?, 'paid', ?)`,
+                    [referrerId, userId, loanId, interestPortion, referralCommission, referralRefId]
+                );
+            } catch(e) { console.error('Error registrando comisión referido préstamo:', e.message); }
+
+            await connection.execute(
+                `INSERT INTO transactions (user_id, type, amount, description, ref_id, created_at) VALUES (?, 'profit', ?, ?, ?, NOW())`,
+                [referrerId, referralCommission, `Comisión referido — 5% de intereses préstamo`, referralRefId]
+            );
+        }
 
         // Registrar abono en notas del préstamo
         await connection.execute(
@@ -451,6 +486,20 @@ exports.payLoan = async (req, res) => {
         const [existing] = await connection.execute(`SELECT id FROM balance_history WHERE user_id = ? AND snapshot_date = ?`, [userId, today]);
         if (existing.length) await connection.execute(`UPDATE balance_history SET amount = ? WHERE user_id = ? AND snapshot_date = ?`, [newBalance, userId, today]);
         else await connection.execute(`INSERT INTO balance_history (user_id, amount, snapshot_date) VALUES (?, ?, ?)`, [userId, newBalance, today]);
+
+        // Recalcular balance del referidor si hubo comisión
+        if (referrerId && referralCommission >= 100) {
+            const [refIn] = await connection.execute(
+                `SELECT COALESCE(SUM(amount), 0) as total FROM transactions WHERE user_id = ? AND type IN ('deposit','payment','interest','profit','investment_return','investment_withdrawal','loan')`, [referrerId]
+            );
+            const [refOut] = await connection.execute(
+                `SELECT COALESCE(SUM(amount), 0) as total FROM transactions WHERE user_id = ? AND type IN ('withdraw')`, [referrerId]
+            );
+            const refBalance = Math.max(0, parseFloat(refIn[0].total) - parseFloat(refOut[0].total));
+            const [refExisting] = await connection.execute(`SELECT id FROM balance_history WHERE user_id = ? AND snapshot_date = ?`, [referrerId, today]);
+            if (refExisting.length) await connection.execute(`UPDATE balance_history SET amount = ? WHERE user_id = ? AND snapshot_date = ?`, [refBalance, referrerId, today]);
+            else await connection.execute(`INSERT INTO balance_history (user_id, amount, snapshot_date) VALUES (?, ?, ?)`, [referrerId, refBalance, today]);
+        }
 
         await connection.commit();
 

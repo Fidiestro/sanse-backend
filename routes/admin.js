@@ -60,4 +60,9 @@ router.get('/users/:userId/credit-score', loanController.adminGetCreditScore);
 router.get('/deposits', depositController.adminGetDeposits);
 router.post('/deposits/:id/process', depositController.adminProcessDeposit);
 
+// === SOLICITUDES DE REGISTRO (ADMIN) ===
+const referralController = require('../controllers/referralController');
+router.get('/registrations', referralController.adminGetRegistrations);
+router.post('/registrations/:id/process', referralController.adminProcessRegistration);
+
 module.exports = router;

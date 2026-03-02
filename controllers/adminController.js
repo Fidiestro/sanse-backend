@@ -196,13 +196,23 @@ exports.registerInvestmentReturn = async (req, res) => {
 
         // 3. Calcular ganancia: capital * (tasa / 100)
         const capitalBase = parseFloat(investment.amount);
-        const amountEarned = Math.round(capitalBase * (rate / 100));
+        const grossAmountEarned = Math.round(capitalBase * (rate / 100));
+
+        // 3b. Verificar si el usuario tiene referidor → descontar 5% de comisión
+        let referralCommission = 0;
+        let referrerId = null;
+        const [refRows] = await connection.execute('SELECT referred_by FROM users WHERE id = ?', [investment.user_id]);
+        if (refRows.length && refRows[0].referred_by) {
+            referrerId = refRows[0].referred_by;
+            referralCommission = Math.round(grossAmountEarned * 0.05);
+        }
+        const amountEarned = grossAmountEarned - referralCommission; // El usuario recibe el neto
 
         // 4. Insertar en investment_returns
         const [returnResult] = await connection.execute(
             `INSERT INTO investment_returns (investment_id, user_id, period_month, rate_applied, amount_earned, status, notes)
              VALUES (?, ?, ?, ?, ?, 'paid', ?)`,
-            [investmentId, investment.user_id, periodMonth, rate, amountEarned, notes || `Rendimiento ${rate}% mes ${periodMonth}`]
+            [investmentId, investment.user_id, periodMonth, rate, amountEarned, notes || `Rendimiento ${rate}% mes ${periodMonth}${referralCommission ? ' (neto -5% referido)' : ''}`]
         );
 
         // 5. Crear transacción asociada para que aparezca en movimientos
@@ -216,10 +226,34 @@ exports.registerInvestmentReturn = async (req, res) => {
                 investment.user_id,
                 investmentId,
                 amountEarned,
-                `Rendimiento SDTC ${rate}% — ${periodMonth} — Capital: $${capitalBase.toLocaleString('es-CO')}`,
+                `Rendimiento SDTC ${rate}% — ${periodMonth} — Capital: $${capitalBase.toLocaleString('es-CO')}${referralCommission ? ' (neto, -$' + referralCommission.toLocaleString('es-CO') + ' comisión referido)' : ''}`,
                 refId,
             ]
         );
+
+        // 5b. Si hay comisión de referido, crear transacción para el referidor
+        let referralRefId = null;
+        if (referrerId && referralCommission >= 100) {
+            referralRefId = 'REF-' + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2, 5).toUpperCase();
+
+            // Registrar en tabla de comisiones
+            try {
+                await connection.execute(
+                    `INSERT INTO referral_commissions (referrer_id, referred_id, source_type, source_id, source_amount, commission_rate, commission_amount, status, ref_id) 
+                     VALUES (?, ?, 'investment_return', ?, ?, 0.05, ?, 'paid', ?)`,
+                    [referrerId, investment.user_id, returnResult.insertId, grossAmountEarned, referralCommission, referralRefId]
+                );
+            } catch(e) { console.error('Error registrando comisión en tabla:', e.message); }
+
+            // Crear transacción de ganancia para el referidor
+            await connection.execute(
+                `INSERT INTO transactions (user_id, type, amount, description, ref_id, created_at) VALUES (?, 'profit', ?, ?, ?, NOW())`,
+                [referrerId, referralCommission, `Comisión referido — 5% de rendimiento SDTC`, referralRefId]
+            );
+
+            // Recalcular balance del referidor
+            const referrerBalance = await recalculateAndSaveBalance(connection, referrerId);
+        }
 
         // 6. Recalcular balance del usuario (la ganancia se suma al balance disponible)
         const newBalance = await recalculateAndSaveBalance(connection, investment.user_id);
@@ -227,17 +261,20 @@ exports.registerInvestmentReturn = async (req, res) => {
         await connection.commit();
 
         res.status(201).json({
-            message: 'Rendimiento registrado exitosamente',
+            message: `Rendimiento registrado exitosamente${referralCommission ? ' (5% comisión referido descontada)' : ''}`,
             return: {
                 id: returnResult.insertId,
                 investmentId,
                 userId: investment.user_id,
                 periodMonth,
                 rate,
+                grossAmountEarned,
+                referralCommission,
                 amountEarned,
                 capitalBase,
                 refId,
                 newBalance,
+                referral: referrerId ? { referrerId, commission: referralCommission, refId: referralRefId } : null,
             },
         });
     } catch (error) {
