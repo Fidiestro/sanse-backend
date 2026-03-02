@@ -57,7 +57,7 @@ exports.publicRegister = async (req, res) => {
         const userReferralCode = generateReferralCode();
 
         const [result] = await pool.execute(
-            `INSERT INTO users (full_name, email, password, phone, document_number, role, referral_code, referred_by, status, created_at) 
+            `INSERT INTO users (full_name, email, password_hash, phone, document_number, role, referral_code, referred_by, status, created_at) 
              VALUES (?, ?, ?, ?, ?, 'user', ?, ?, 'active', NOW())`,
             [fullName.trim(), email.toLowerCase().trim(), hashedPassword, phone || null, documentNumber || null, userReferralCode, referredBy]
         );
@@ -156,12 +156,12 @@ exports.changePassword = async (req, res) => {
         if (!currentPassword || !newPassword) return res.status(400).json({ error: 'Contraseña actual y nueva son requeridas' });
         if (newPassword.length < 8) return res.status(400).json({ error: 'La nueva contraseña debe tener al menos 8 caracteres' });
 
-        const [rows] = await pool.execute('SELECT password FROM users WHERE id = ?', [req.user.id]);
-        const isValid = await bcrypt.compare(currentPassword, rows[0].password);
+        const [rows] = await pool.execute('SELECT password_hash FROM users WHERE id = ?', [req.user.id]);
+        const isValid = await bcrypt.compare(currentPassword, rows[0].password_hash);
         if (!isValid) return res.status(400).json({ error: 'Contraseña actual incorrecta' });
 
         const hashed = await bcrypt.hash(newPassword, 12);
-        await pool.execute('UPDATE users SET password = ? WHERE id = ?', [hashed, req.user.id]);
+        await pool.execute('UPDATE users SET password_hash = ? WHERE id = ?', [hashed, req.user.id]);
 
         res.json({ message: 'Contraseña actualizada exitosamente' });
     } catch (error) {
