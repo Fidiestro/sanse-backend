@@ -38,11 +38,11 @@ app.get('/api/health', (req, res) => {
 const { generalLimiter } = require('./middleware/rateLimit');
 app.use(generalLimiter);
 
-app.use('/api/auth', require('./routes/auth'));
-
-// Registro público (sin auth)
+// Registro público (sin auth) — DEBE ir ANTES del router de auth
 const referralController = require('./controllers/referralController');
 app.post('/api/auth/register', referralController.publicRegister);
+
+app.use('/api/auth', require('./routes/auth'));
 
 try { app.use('/api/dashboard', require('./routes/dashboard')); console.log('📊 Dashboard routes loaded'); } catch(e) {}
 try { app.use('/api/admin', require('./routes/admin')); console.log('🔧 Admin routes loaded'); } catch(e) {}
