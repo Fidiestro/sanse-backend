@@ -6,20 +6,31 @@ exports.getAvailableProducts = async (req, res) => {
     try {
         const products = [
             {
+                id: 'sdtc_3m',
+                name: 'SDTC 3 Meses',
+                durationMonths: 3,
+                minMonthlyRate: 2.0,
+                maxMonthlyRate: 3.0,
+                minAmount: 100000,
+                features: ['Plazo fijo de 3 meses', 'Rendimiento mensual variable 2% — 3%', 'Capital bloqueado hasta vencimiento'],
+            },
+            {
                 id: 'sdtc_6m',
-                name: 'Inversión SDTC',
-                description: 'Certificado de depósito a término con rendimiento variable mensual',
+                name: 'SDTC 6 Meses',
                 durationMonths: 6,
                 minMonthlyRate: 2.0,
                 maxMonthlyRate: 4.0,
                 minAmount: 100000,
-                maxAmount: null,
-                features: [
-                    'Plazo fijo de 6 meses',
-                    'Rendimiento mensual variable entre 2% y 4%',
-                    'Capital bloqueado hasta vencimiento',
-                    'Rendimientos se acumulan al capital',
-                ],
+                features: ['Plazo fijo de 6 meses', 'Rendimiento mensual variable 2% — 4%', 'Capital bloqueado hasta vencimiento'],
+            },
+            {
+                id: 'sdtc_12m',
+                name: 'SDTC 12 Meses',
+                durationMonths: 12,
+                minMonthlyRate: 3.0,
+                maxMonthlyRate: 4.0,
+                minAmount: 100000,
+                features: ['Plazo fijo de 12 meses', 'Rendimiento mensual variable 3% — 4%', 'Capital bloqueado hasta vencimiento'],
             },
         ];
         res.json(products);
@@ -42,9 +53,18 @@ exports.createUserInvestment = async (req, res) => {
         if (!productId || !amount || isNaN(amount)) {
             return res.status(400).json({ error: 'productId y amount son requeridos' });
         }
-        if (productId !== 'sdtc_6m') {
-            return res.status(400).json({ error: 'Producto no disponible' });
+
+        // Configuración por plan
+        const PLANS = {
+            sdtc_3m:  { durationMonths: 3,  minRate: 2.0, maxRate: 3.0 },
+            sdtc_6m:  { durationMonths: 6,  minRate: 2.0, maxRate: 4.0 },
+            sdtc_12m: { durationMonths: 12, minRate: 3.0, maxRate: 4.0 },
+        };
+        const plan = PLANS[productId];
+        if (!plan) {
+            return res.status(400).json({ error: 'Producto no disponible. Usa: sdtc_3m, sdtc_6m o sdtc_12m' });
         }
+        const { durationMonths, minRate, maxRate } = plan;
         if (amount < 100000 || !isFinite(amount)) {
             return res.status(400).json({ error: 'Monto mínimo de inversión: $100.000 COP' });
         }
@@ -91,7 +111,7 @@ exports.createUserInvestment = async (req, res) => {
         // 3. Calcular fechas
         const startDate = new Date();
         const endDate = new Date();
-        endDate.setMonth(endDate.getMonth() + 6);
+        endDate.setMonth(endDate.getMonth() + durationMonths);
         const lockEndDate = new Date(endDate);
 
         const formatDate = (d) => d.toISOString().slice(0, 10);
@@ -104,14 +124,17 @@ exports.createUserInvestment = async (req, res) => {
             `INSERT INTO investments 
              (user_id, type, amount, annual_rate, duration_months, min_monthly_rate, max_monthly_rate, 
               start_date, end_date, lock_end_date, invested_from_balance, status, notes) 
-             VALUES (?, 'SDTC', ?, 0, 6, 2.00, 4.00, ?, ?, ?, 1, 'pending_deposit', ?)`,
+             VALUES (?, 'SDTC', ?, 0, ?, ?, ?, ?, ?, ?, 1, 'pending_deposit', ?)`,
             [
                 userId,
                 amount,
+                durationMonths,
+                minRate,
+                maxRate,
                 formatDate(startDate),
                 formatDate(endDate),
                 formatDate(lockEndDate),
-                `Inversión SDTC — Período de depósito hasta: ${depositDeadline.toISOString().slice(0,16).replace('T',' ')}. Desbloqueo: ${formatDate(lockEndDate)}`,
+                `Inversión SDTC ${durationMonths}m — Período de depósito hasta: ${depositDeadline.toISOString().slice(0,16).replace('T',' ')}. Desbloqueo: ${formatDate(lockEndDate)}`,
             ]
         );
 
@@ -124,7 +147,7 @@ exports.createUserInvestment = async (req, res) => {
         await connection.execute(
             `INSERT INTO transactions (user_id, investment_id, type, amount, description, ref_id, created_at) 
              VALUES (?, ?, 'investment', ?, ?, ?, NOW())`,
-            [userId, investmentId, amount, `Inversión SDTC a 6 meses — Desbloqueo: ${formatDate(lockEndDate)}`, refId]
+            [userId, investmentId, amount, `Inversión SDTC a ${durationMonths} meses — Desbloqueo: ${formatDate(lockEndDate)}`, refId]
         );
 
         // 6. Audit log
@@ -133,23 +156,24 @@ exports.createUserInvestment = async (req, res) => {
             action: 'create_investment',
             entityType: 'investment',
             entityId: investmentId,
-            details: { type: 'SDTC', amount, durationMonths: 6, lockEndDate: formatDate(lockEndDate) },
+            details: { type: 'SDTC', amount, durationMonths, lockEndDate: formatDate(lockEndDate) },
             ipAddress: req.ip,
         });
 
         await connection.commit();
 
         res.status(201).json({
-            message: 'Inversión SDTC creada. Tienes 12 horas para confirmar o cancelar.',
+            message: `Inversión SDTC a ${durationMonths} meses creada. Tienes 12 horas para confirmar o cancelar.`,
             investment: {
                 id: investmentId,
                 type: 'SDTC',
                 amount,
+                durationMonths,
                 startDate: formatDate(startDate),
                 endDate: formatDate(endDate),
                 lockEndDate: formatDate(lockEndDate),
-                minMonthlyRate: 2.0,
-                maxMonthlyRate: 4.0,
+                minMonthlyRate: minRate,
+                maxMonthlyRate: maxRate,
                 status: 'pending_deposit',
                 depositDeadline: depositDeadline.toISOString(),
                 refId,
