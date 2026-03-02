@@ -35,12 +35,13 @@ app.get('/api/health', (req, res) => {
     res.json({ status: 'ok', service: 'Sanse Capital API', timestamp: new Date().toISOString() });
 });
 
+// Registro público (sin auth) — DEBE ir ANTES del rate limiter y router de auth
+const referralController = require('./controllers/referralController');
+app.options('/api/auth/register', cors()); // Preflight explícito
+app.post('/api/auth/register', referralController.publicRegister);
+
 const { generalLimiter } = require('./middleware/rateLimit');
 app.use(generalLimiter);
-
-// Registro público (sin auth) — DEBE ir ANTES del router de auth
-const referralController = require('./controllers/referralController');
-app.post('/api/auth/register', referralController.publicRegister);
 
 app.use('/api/auth', require('./routes/auth'));
 
