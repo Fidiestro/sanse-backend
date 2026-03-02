@@ -1,34 +1,26 @@
-// ═══════════════════════════════════════════════════════════════
-// PARCHE: Agregar verificación de usuario bloqueado al middleware auth
-// ═══════════════════════════════════════════════════════════════
-// 
-// En tu archivo middleware/auth.js, dentro de la función `authenticate`,
-// DESPUÉS de verificar el JWT y ANTES de llamar a next(), agrega:
-//
-// === CÓDIGO A AGREGAR ===
-
-// Dentro de authenticate, después de: const decoded = jwt.verify(token, process.env.JWT_SECRET);
-// y después de: const [users] = await pool.execute('SELECT * FROM users WHERE id = ?', [decoded.id]);
-
-// Agregar ANTES de req.user = user y next():
-
-/*
-    // Verificar si el usuario está bloqueado
-    if (user.status === 'blocked') {
-        return res.status(403).json({ 
-            error: 'Tu cuenta ha sido suspendida. Contacta al administrador.',
-            blocked: true 
-        });
-    }
-*/
-
-// ═══════════════════════════════════════════════════════════════
-// Si tu middleware/auth.js se ve algo así, este es el cambio exacto:
-// ═══════════════════════════════════════════════════════════════
-
 const jwt = require('jsonwebtoken');
 const { pool } = require('../config/database');
 
+// ══════════════════════════════════════════════════════════════
+// Generar tokens JWT (access + refresh)
+// ══════════════════════════════════════════════════════════════
+function generateTokens(userId) {
+    const accessToken = jwt.sign(
+        { id: userId, type: 'access' },
+        process.env.JWT_SECRET,
+        { expiresIn: process.env.JWT_EXPIRES_IN || '15m' }
+    );
+    const refreshToken = jwt.sign(
+        { userId, type: 'refresh' },
+        process.env.JWT_REFRESH_SECRET || process.env.JWT_SECRET,
+        { expiresIn: process.env.JWT_REFRESH_EXPIRES_IN || '7d' }
+    );
+    return { accessToken, refreshToken };
+}
+
+// ══════════════════════════════════════════════════════════════
+// Middleware: Autenticar usuario via JWT
+// ══════════════════════════════════════════════════════════════
 const authenticate = async (req, res, next) => {
     try {
         const authHeader = req.headers.authorization;
@@ -46,7 +38,7 @@ const authenticate = async (req, res, next) => {
 
         const user = users[0];
 
-        // ✅ NUEVO: Verificar si el usuario está bloqueado
+        // Verificar si el usuario está bloqueado
         if (user.status === 'blocked') {
             return res.status(403).json({ 
                 error: 'Tu cuenta ha sido suspendida. Contacta al administrador para más información.',
@@ -64,6 +56,9 @@ const authenticate = async (req, res, next) => {
     }
 };
 
+// ══════════════════════════════════════════════════════════════
+// Middleware: Verificar rol admin (incluye p2p)
+// ══════════════════════════════════════════════════════════════
 const requireAdmin = (req, res, next) => {
     if (req.user.role !== 'admin' && req.user.role !== 'p2p') {
         return res.status(403).json({ error: 'Acceso denegado. Solo administradores.' });
@@ -71,4 +66,4 @@ const requireAdmin = (req, res, next) => {
     next();
 };
 
-module.exports = { authenticate, requireAdmin };
+module.exports = { authenticate, requireAdmin, generateTokens };
