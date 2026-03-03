@@ -534,36 +534,41 @@ exports.toggleBlockUser = async (req, res) => {
     }
 };
 
-// POST /api/admin/users/:id/edit — Editar datos y/o contraseña de un usuario
+// ══════════════════════════════════════════════════════════════
+// POST /api/admin/users/:id/edit — Editar datos + contraseña + referido
+// ══════════════════════════════════════════════════════════════
 exports.editUser = async (req, res) => {
     try {
         const userId = req.params.id;
-        const { fullName, email, phone, documentNumber, role, status, password } = req.body;
+        const { fullName, email, phone, documentNumber, role, status, password, referredBy } = req.body;
 
         if (!fullName || !email) {
             return res.status(400).json({ error: 'Nombre y email son obligatorios' });
         }
 
-        // Verificar que el usuario existe
         const [userRows] = await pool.execute(`SELECT id, role FROM users WHERE id = ?`, [userId]);
         if (!userRows.length) return res.status(404).json({ error: 'Usuario no encontrado' });
 
-        // Verificar email único (si se cambia)
         const [emailCheck] = await pool.execute(`SELECT id FROM users WHERE email = ? AND id != ?`, [email.toLowerCase().trim(), userId]);
-        if (emailCheck.length) return res.status(400).json({ error: 'Ese email ya está en uso por otro usuario' });
+        if (emailCheck.length) return res.status(400).json({ error: 'Ese email ya está en uso' });
 
-        // Construir UPDATE dinámico
-        const fields = [
-            'full_name = ?', 'email = ?', 'phone = ?',
-            'document_number = ?', 'role = ?', 'status = ?'
-        ];
+        // Validar referido si viene
+        let referrerId = null;
+        if (referredBy && referredBy !== '' && referredBy !== 'none') {
+            const [refRows] = await pool.execute(`SELECT id, full_name FROM users WHERE referral_code = ? OR id = ?`, [referredBy, parseInt(referredBy) || 0]);
+            if (!refRows.length) return res.status(400).json({ error: 'Código o ID de referido no encontrado' });
+            if (refRows[0].id == userId) return res.status(400).json({ error: 'Un usuario no puede referirse a sí mismo' });
+            referrerId = refRows[0].id;
+        }
+
+        const fields = ['full_name = ?', 'email = ?', 'phone = ?', 'document_number = ?', 'role = ?', 'status = ?', 'referred_by = ?'];
         const values = [
             fullName.trim(), email.toLowerCase().trim(),
             phone || null, documentNumber || null,
-            role || 'client', status || 'active'
+            role || 'client', status || 'active',
+            referredBy === 'none' || referredBy === '' ? null : referrerId
         ];
 
-        // Si viene nueva contraseña, hashearla
         if (password && password.length >= 8) {
             const bcrypt = require('bcryptjs');
             const hashed = await bcrypt.hash(password, 12);
@@ -578,5 +583,86 @@ exports.editUser = async (req, res) => {
     } catch (error) {
         console.error('Error editUser:', error);
         res.status(500).json({ error: 'Error interno del servidor' });
+    }
+};
+
+// ══════════════════════════════════════════════════════════════
+// POST /api/admin/loans/create — Crear préstamo directo para un usuario
+// ══════════════════════════════════════════════════════════════
+exports.adminCreateLoan = async (req, res) => {
+    const connection = await pool.getConnection();
+    try {
+        await connection.beginTransaction();
+
+        const { userId, amount, termMonths, monthlyRate, purpose, notes, startDate } = req.body;
+
+        if (!userId || !amount || !termMonths || !monthlyRate) {
+            return res.status(400).json({ error: 'userId, amount, termMonths y monthlyRate son requeridos' });
+        }
+
+        const parsedAmount = parseFloat(amount);
+        const parsedRate   = parseFloat(monthlyRate);
+        const parsedTerm   = parseInt(termMonths);
+
+        if (parsedAmount < 100000) return res.status(400).json({ error: 'Monto mínimo: $100.000 COP' });
+        if (parsedRate < 1 || parsedRate > 20) return res.status(400).json({ error: 'Tasa mensual debe estar entre 1% y 20%' });
+        if (![1, 2, 3, 6, 12].includes(parsedTerm)) return res.status(400).json({ error: 'Plazo debe ser 1, 2, 3, 6 o 12 meses' });
+
+        const [userRows] = await connection.execute(`SELECT id, full_name FROM users WHERE id = ?`, [userId]);
+        if (!userRows.length) return res.status(404).json({ error: 'Usuario no encontrado' });
+
+        const loanStart = startDate ? new Date(startDate) : new Date();
+        const dueDate = new Date(loanStart);
+        dueDate.setMonth(dueDate.getMonth() + parsedTerm);
+        const formatDate = d => d.toISOString().slice(0, 10);
+
+        const refId = 'LOAN-' + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2, 5).toUpperCase();
+
+        // Insertar préstamo en estado 'active' directamente
+        const [loanResult] = await connection.execute(
+            `INSERT INTO loans (user_id, amount, remaining, monthly_rate, is_partner, status, start_date, due_date, notes, ref_id, created_at, updated_at)
+             VALUES (?, ?, ?, ?, 0, 'active', ?, ?, ?, ?, NOW(), NOW())`,
+            [userId, parsedAmount, parsedAmount, parsedRate, formatDate(loanStart), formatDate(dueDate),
+             notes || `Préstamo ${parsedTerm} mes${parsedTerm > 1 ? 'es' : ''} — Ref: ${refId}`, refId]
+        );
+
+        const loanId = loanResult.insertId;
+
+        // Registrar transacción de préstamo (acredita al balance del usuario)
+        await connection.execute(
+            `INSERT INTO transactions (user_id, type, amount, description, ref_id, created_at)
+             VALUES (?, 'loan', ?, ?, ?, ?)`,
+            [userId, parsedAmount, purpose || `Préstamo SANSE — ${parsedTerm} mes${parsedTerm > 1 ? 'es' : ''} al ${parsedRate}% mensual`, refId, loanStart.toISOString().slice(0, 19).replace('T', ' ')]
+        );
+
+        // Registrar loan_request como aprobada para historial
+        await connection.execute(
+            `INSERT INTO loan_requests (user_id, investment_id, amount, term_months, monthly_rate, purpose, status, approved_amount, approved_rate, ref_id, notes, created_at, updated_at)
+             VALUES (?, NULL, ?, ?, ?, ?, 'active', ?, ?, ?, ?, NOW(), NOW())`,
+            [userId, parsedAmount, parsedTerm, parsedRate, purpose || 'Préstamo registrado por administrador',
+             parsedAmount, parsedRate, refId, notes || 'Creado directamente por admin']
+        );
+
+        await auditLog({
+            userId: req.user?.id,
+            action: 'admin_create_loan',
+            entityType: 'loan',
+            entityId: loanId,
+            details: { targetUserId: userId, amount: parsedAmount, termMonths: parsedTerm, monthlyRate: parsedRate, refId },
+            ipAddress: req.ip,
+        });
+
+        await connection.commit();
+
+        res.status(201).json({
+            message: `Préstamo de ${parsedAmount.toLocaleString('es-CO')} COP creado para ${userRows[0].full_name}`,
+            loan: { id: loanId, refId, amount: parsedAmount, termMonths: parsedTerm, monthlyRate: parsedRate, dueDate: formatDate(dueDate) }
+        });
+    } catch (error) {
+        await connection.rollback();
+        console.error('Error adminCreateLoan:', error);
+        res.status(500).json({ error: 'Error interno del servidor' });
+    } finally {
+        connection.release();
     }
 };
