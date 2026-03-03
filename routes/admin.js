@@ -25,13 +25,12 @@ router.get('/transactions/recent', adminController.getRecentTransactions);
 router.post('/transactions', adminController.createTransaction);
 router.delete('/transactions/:id', adminController.deleteTransaction);
 
-// Inversiones
-router.post('/investments', adminController.createInvestment);
-router.delete('/investments/:id', adminController.deleteInvestment);
-
-// Rendimientos SDTC
+// Inversiones — rutas específicas ANTES que las parametrizadas
 router.get('/investments/active', adminController.getActiveInvestments);
+router.post('/investments', adminController.createInvestment);
 router.post('/investments/:investmentId/return', adminController.registerInvestmentReturn);
+router.post('/investments/:id/cancel', adminController.adminCancelInvestment);
+router.delete('/investments/:id', adminController.deleteInvestment);
 
 // Balance
 router.post('/balance', adminController.recordBalance);
@@ -50,8 +49,6 @@ router.post('/users/:id/edit', adminController.editUser);
 // Crear préstamo directo para un usuario
 router.post('/loans/create', adminController.adminCreateLoan);
 
-// Cancelar inversión (admin)
-router.post('/investments/:id/cancel', adminController.adminCancelInvestment);
 
 // === SOLICITUDES DE RETIRO (ADMIN) ===
 router.get('/withdrawals', withdrawalController.adminGetWithdrawals);
