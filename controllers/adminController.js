@@ -593,11 +593,8 @@ exports.adminCreateLoan = async (req, res) => {
             ]
         );
 
-        // Recalcular balance
-        const [inRows]  = await connection.execute(`SELECT COALESCE(SUM(amount),0) as total FROM transactions WHERE user_id = ? AND type IN ('deposit','payment','interest','profit','investment_return','investment_withdrawal','loan')`, [userId]);
-        const [outRows] = await connection.execute(`SELECT COALESCE(SUM(amount),0) as total FROM transactions WHERE user_id = ? AND type IN ('withdraw')`, [userId]);
-        const newBalance = parseFloat(inRows[0].total) - parseFloat(outRows[0].total);
-        await connection.execute(`UPDATE users SET balance = ? WHERE id = ?`, [newBalance, userId]);
+        // Recalcular balance y guardar en balance_history
+        const newBalance = await recalculateAndSaveBalance(connection, userId);
 
         await connection.commit();
 
