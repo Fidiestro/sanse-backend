@@ -1,23 +1,8 @@
 // ══════════════════════════════════════════════════════════════
-// DEPOSIT CONTROLLER — Sanse Capital
+// controllers/depositController.js — Sanse Capital
 // ══════════════════════════════════════════════════════════════
-const { pool } = require('../config/database');
-const https = require('https');
-
-const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '8468569082:AAEpx5VaQOtEQnrz9PHbkyh0O-_LTw0CaLg';
-const CHAT_ID = process.env.TELEGRAM_CHAT_ID || '1735923786';
-
-function sendTelegramNotification(message) {
-    const data = JSON.stringify({ chat_id: CHAT_ID, text: message, parse_mode: 'Markdown' });
-    const options = {
-        hostname: 'api.telegram.org', path: `/bot${BOT_TOKEN}/sendMessage`,
-        method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': data.length }
-    };
-    const req = https.request(options);
-    req.on('error', (e) => console.error('Telegram error:', e.message));
-    req.write(data);
-    req.end();
-}
+const { pool }   = require('../config/database');
+const { notify } = require('../utils/telegram');
 
 // ══════════════════════════════════════════════════════════════
 // GET /api/deposits/my — Mis depósitos
@@ -54,7 +39,8 @@ exports.requestDeposit = async (req, res) => {
 
         // Verificar que no tenga demasiados depósitos pendientes
         const [pending] = await pool.execute(
-            `SELECT COUNT(*) as c FROM deposit_requests WHERE user_id = ? AND status = 'pending'`, [userId]
+            `SELECT COUNT(*) as c FROM deposit_requests WHERE user_id = ? AND status = 'pending'`,
+            [userId]
         );
         if (parseInt(pending[0].c) >= 3) {
             return res.status(400).json({ error: 'Ya tienes 3 depósitos pendientes de revisión. Espera a que sean procesados.' });
@@ -67,12 +53,10 @@ exports.requestDeposit = async (req, res) => {
             [userId, amount, proofImage, note || null, refId]
         );
 
-        // Info del usuario
         const [userRows] = await pool.execute(`SELECT full_name, email, phone FROM users WHERE id = ?`, [userId]);
         const user = userRows[0] || {};
 
-        // Notificar por Telegram
-        sendTelegramNotification(
+        await notify(
             `📥 *NUEVO DEPÓSITO — Sanse Capital*\n\n` +
             `👤 *${user.full_name || 'Usuario ID:' + userId}*\n` +
             `📧 ${user.email || '—'}\n` +
@@ -146,20 +130,18 @@ exports.adminProcessDeposit = async (req, res) => {
         }
 
         if (action === 'approve') {
-            // 1. Actualizar estado del depósito
             await connection.execute(
                 `UPDATE deposit_requests SET status = 'approved', admin_notes = ?, processed_at = NOW(), processed_by = ? WHERE id = ?`,
                 [notes || null, adminId, depositId]
             );
 
-            // 2. Crear transacción de depósito
             const txRefId = 'TXDEP-' + deposit.ref_id.replace('DEP-', '');
             await connection.execute(
                 `INSERT INTO transactions (user_id, type, amount, description, ref_id, created_at) VALUES (?, 'deposit', ?, ?, ?, NOW())`,
                 [deposit.user_id, deposit.amount, `Depósito aprobado — Ref: ${deposit.ref_id}`, txRefId]
             );
 
-            // 3. Recalcular balance
+            // Recalcular balance
             const [inRows] = await connection.execute(
                 `SELECT COALESCE(SUM(amount), 0) as total FROM transactions WHERE user_id = ? AND type IN ('deposit','payment','interest','profit','investment_return','investment_withdrawal','loan')`,
                 [deposit.user_id]
@@ -179,8 +161,7 @@ exports.adminProcessDeposit = async (req, res) => {
 
             await connection.commit();
 
-            // Telegram
-            sendTelegramNotification(
+            await notify(
                 `✅ *DEPÓSITO APROBADO — Sanse Capital*\n\n` +
                 `👤 ${deposit.full_name}\n` +
                 `💰 $${Math.round(parseFloat(deposit.amount)).toLocaleString('es-CO')} COP\n` +
@@ -191,7 +172,6 @@ exports.adminProcessDeposit = async (req, res) => {
             res.json({
                 message: `Depósito aprobado. $${Math.round(parseFloat(deposit.amount)).toLocaleString('es-CO')} acreditados.`,
                 deposit: { id: depositId, status: 'approved', newBalance },
-                // Datos para enviar WhatsApp desde frontend
                 whatsapp: {
                     phone: deposit.phone,
                     userName: deposit.full_name,
@@ -200,14 +180,14 @@ exports.adminProcessDeposit = async (req, res) => {
                 }
             });
 
-        } else if (action === 'reject') {
+        } else {
             await connection.execute(
                 `UPDATE deposit_requests SET status = 'rejected', admin_notes = ?, processed_at = NOW(), processed_by = ? WHERE id = ?`,
                 [notes || 'Depósito rechazado', adminId, depositId]
             );
             await connection.commit();
 
-            sendTelegramNotification(
+            await notify(
                 `❌ *DEPÓSITO RECHAZADO — Sanse Capital*\n\n` +
                 `👤 ${deposit.full_name}\n` +
                 `💰 $${Math.round(parseFloat(deposit.amount)).toLocaleString('es-CO')} COP\n` +

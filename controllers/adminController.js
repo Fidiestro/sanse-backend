@@ -1,4 +1,8 @@
+// ══════════════════════════════════════════════════════════════
+// controllers/adminController.js — Sanse Capital
+// ══════════════════════════════════════════════════════════════
 const { pool } = require('../config/database');
+const { auditLog } = require('../utils/helpers');
 
 // GET /api/admin/stats — Estadísticas generales
 exports.getStats = async (req, res) => {
@@ -13,9 +17,9 @@ exports.getStats = async (req, res) => {
             `SELECT COALESCE(SUM(amount),0) as total FROM transactions WHERE type = 'loan'`
         );
         res.json({
-            totalBalance: parseFloat(balanceRows[0].total) - parseFloat(withdrawRows[0].total),
+            totalBalance:    parseFloat(balanceRows[0].total) - parseFloat(withdrawRows[0].total),
             totalWithdrawals: parseFloat(withdrawRows[0].total),
-            totalLoans: parseFloat(loanRows[0].total),
+            totalLoans:      parseFloat(loanRows[0].total),
         });
     } catch (error) {
         console.error('Error stats:', error);
@@ -23,15 +27,13 @@ exports.getStats = async (req, res) => {
     }
 };
 
-// GET /api/admin/transactions/recent — Últimas 30 transacciones con nombre de usuario
+// GET /api/admin/transactions/recent
 exports.getRecentTransactions = async (req, res) => {
     try {
         const [rows] = await pool.execute(
             `SELECT t.*, u.full_name as user_name 
-             FROM transactions t 
-             LEFT JOIN users u ON t.user_id = u.id 
-             ORDER BY t.created_at DESC 
-             LIMIT 30`
+             FROM transactions t LEFT JOIN users u ON t.user_id = u.id 
+             ORDER BY t.created_at DESC LIMIT 30`
         );
         res.json(rows);
     } catch (error) {
@@ -40,7 +42,7 @@ exports.getRecentTransactions = async (req, res) => {
     }
 };
 
-// POST /api/admin/investments — Crear inversión
+// POST /api/admin/investments — Crear inversión manual
 exports.createInvestment = async (req, res) => {
     try {
         const { userId, type, amount, annualRate, startDate, status } = req.body;
@@ -69,33 +71,21 @@ async function recalculateAndSaveBalance(connection, userId) {
         [userId]
     );
     const [outRows] = await connection.execute(
-        `SELECT COALESCE(SUM(amount), 0) as total 
-         FROM transactions 
-         WHERE user_id = ? AND type IN ('withdraw')`,
+        `SELECT COALESCE(SUM(amount), 0) as total FROM transactions WHERE user_id = ? AND type IN ('withdraw')`,
         [userId]
     );
 
-    const totalIn = parseFloat(inRows[0].total);
-    const totalOut = parseFloat(outRows[0].total);
-    const newBalance = Math.max(0, totalIn - totalOut);
-
+    const newBalance = Math.max(0, parseFloat(inRows[0].total) - parseFloat(outRows[0].total));
     const today = new Date().toISOString().slice(0, 10);
 
     const [existing] = await connection.execute(
-        `SELECT id FROM balance_history WHERE user_id = ? AND snapshot_date = ?`,
-        [userId, today]
+        `SELECT id FROM balance_history WHERE user_id = ? AND snapshot_date = ?`, [userId, today]
     );
 
     if (existing.length > 0) {
-        await connection.execute(
-            `UPDATE balance_history SET amount = ? WHERE user_id = ? AND snapshot_date = ?`,
-            [newBalance, userId, today]
-        );
+        await connection.execute(`UPDATE balance_history SET amount = ? WHERE user_id = ? AND snapshot_date = ?`, [newBalance, userId, today]);
     } else {
-        await connection.execute(
-            `INSERT INTO balance_history (user_id, amount, snapshot_date) VALUES (?, ?, ?)`,
-            [userId, newBalance, today]
-        );
+        await connection.execute(`INSERT INTO balance_history (user_id, amount, snapshot_date) VALUES (?, ?, ?)`, [userId, newBalance, today]);
     }
 
     return newBalance;
@@ -108,14 +98,11 @@ exports.createTransaction = async (req, res) => {
         await connection.beginTransaction();
 
         const { userId, type, amount, description, date } = req.body;
-        if (!userId || !type || !amount) {
-            return res.status(400).json({ error: 'userId, type y amount son requeridos' });
-        }
+        if (!userId || !type || !amount) return res.status(400).json({ error: 'userId, type y amount son requeridos' });
 
         const [countRows] = await connection.execute('SELECT COUNT(*) as c FROM transactions');
         const refId = 'TX-' + String(countRows[0].c + 1).padStart(5, '0');
-
-        const dateObj = date ? new Date(date) : new Date();
+        const dateObj   = date ? new Date(date) : new Date();
         const createdAt = dateObj.toISOString().slice(0, 19).replace('T', ' ');
 
         const [result] = await connection.execute(
@@ -124,15 +111,9 @@ exports.createTransaction = async (req, res) => {
         );
 
         const newBalance = await recalculateAndSaveBalance(connection, userId);
-
         await connection.commit();
 
-        res.status(201).json({
-            message: 'Transacción creada',
-            id: result.insertId,
-            refId,
-            newBalance,
-        });
+        res.status(201).json({ message: 'Transacción creada', id: result.insertId, refId, newBalance });
     } catch (error) {
         await connection.rollback();
         console.error('Error creando transacción:', error);
@@ -142,10 +123,7 @@ exports.createTransaction = async (req, res) => {
     }
 };
 
-// ══════════════════════════════════════════════════════════════════
 // POST /api/admin/investments/:investmentId/return — Registrar rendimiento mensual CDTC
-// Este es el endpoint CLAVE para que las ganancias aparezcan en el dashboard del usuario
-// ══════════════════════════════════════════════════════════════════
 exports.registerInvestmentReturn = async (req, res) => {
     const connection = await pool.getConnection();
     try {
@@ -154,126 +132,77 @@ exports.registerInvestmentReturn = async (req, res) => {
         const investmentId = req.params.investmentId;
         const { rate, periodMonth, notes } = req.body;
 
-        // rate = porcentaje mensual (ej: 3.5 para 3.5%)
-        // periodMonth = mes del rendimiento (ej: "2026-03-01")
+        if (!rate || !periodMonth) return res.status(400).json({ error: 'rate y periodMonth son requeridos' });
+        if (rate < 0 || rate > 100) return res.status(400).json({ error: 'La tasa debe estar entre 0 y 100' });
 
-        if (!rate || !periodMonth) {
-            return res.status(400).json({ error: 'rate y periodMonth son requeridos' });
-        }
-
-        if (rate < 0 || rate > 100) {
-            return res.status(400).json({ error: 'La tasa debe estar entre 0 y 100' });
-        }
-
-        // 1. Obtener la inversión
         const [invRows] = await connection.execute(
-            `SELECT id, user_id, amount, status, type FROM investments WHERE id = ?`,
-            [investmentId]
+            `SELECT id, user_id, amount, status, type FROM investments WHERE id = ?`, [investmentId]
         );
-
-        if (!invRows.length) {
-            await connection.rollback();
-            return res.status(404).json({ error: 'Inversión no encontrada' });
-        }
-
+        if (!invRows.length) { await connection.rollback(); return res.status(404).json({ error: 'Inversión no encontrada' }); }
         const investment = invRows[0];
+        if (investment.status !== 'active') { await connection.rollback(); return res.status(400).json({ error: 'La inversión no está activa' }); }
 
-        if (investment.status !== 'active') {
-            await connection.rollback();
-            return res.status(400).json({ error: 'La inversión no está activa' });
-        }
-
-        // 2. Verificar que no exista ya un rendimiento para ese mes
         const [existingReturn] = await connection.execute(
-            `SELECT id FROM investment_returns WHERE investment_id = ? AND period_month = ?`,
-            [investmentId, periodMonth]
+            `SELECT id FROM investment_returns WHERE investment_id = ? AND period_month = ?`, [investmentId, periodMonth]
         );
+        if (existingReturn.length > 0) { await connection.rollback(); return res.status(400).json({ error: `Ya existe un rendimiento registrado para el mes ${periodMonth}` }); }
 
-        if (existingReturn.length > 0) {
-            await connection.rollback();
-            return res.status(400).json({ error: `Ya existe un rendimiento registrado para el mes ${periodMonth}` });
-        }
-
-        // 3. Calcular ganancia: capital * (tasa / 100)
-        const capitalBase = parseFloat(investment.amount);
+        const capitalBase       = parseFloat(investment.amount);
         const grossAmountEarned = Math.round(capitalBase * (rate / 100));
 
-        // 3b. Verificar si el usuario tiene referidor → descontar 5% de comisión
         let referralCommission = 0;
-        let referrerId = null;
+        let referrerId         = null;
         const [refRows] = await connection.execute('SELECT referred_by FROM users WHERE id = ?', [investment.user_id]);
         if (refRows.length && refRows[0].referred_by) {
-            referrerId = refRows[0].referred_by;
+            referrerId         = refRows[0].referred_by;
             referralCommission = Math.round(grossAmountEarned * 0.05);
         }
-        const amountEarned = grossAmountEarned - referralCommission; // El usuario recibe el neto
+        const amountEarned = grossAmountEarned - referralCommission;
 
-        // 4. Insertar en investment_returns
         const [returnResult] = await connection.execute(
             `INSERT INTO investment_returns (investment_id, user_id, period_month, rate_applied, amount_earned, status, notes)
              VALUES (?, ?, ?, ?, ?, 'paid', ?)`,
             [investmentId, investment.user_id, periodMonth, rate, amountEarned, notes || `Rendimiento ${rate}% mes ${periodMonth}${referralCommission ? ' (neto -5% referido)' : ''}`]
         );
 
-        // 5. Crear transacción asociada para que aparezca en movimientos
         const [countRows] = await connection.execute('SELECT COUNT(*) as c FROM transactions');
         const refId = 'RET-' + String(countRows[0].c + 1).padStart(5, '0');
 
         await connection.execute(
             `INSERT INTO transactions (user_id, investment_id, type, amount, description, ref_id, created_at)
              VALUES (?, ?, 'investment_return', ?, ?, ?, NOW())`,
-            [
-                investment.user_id,
-                investmentId,
-                amountEarned,
-                `Rendimiento CDTC ${rate}% — ${periodMonth} — Capital: $${capitalBase.toLocaleString('es-CO')}${referralCommission ? ' (neto, -$' + referralCommission.toLocaleString('es-CO') + ' comisión referido)' : ''}`,
-                refId,
-            ]
+            [investment.user_id, investmentId, amountEarned,
+             `Rendimiento CDTC ${rate}% — ${periodMonth} — Capital: $${capitalBase.toLocaleString('es-CO')}${referralCommission ? ' (neto, -$' + referralCommission.toLocaleString('es-CO') + ' comisión referido)' : ''}`,
+             refId]
         );
 
-        // 5b. Si hay comisión de referido, crear transacción para el referidor
         let referralRefId = null;
         if (referrerId && referralCommission >= 100) {
             referralRefId = 'REF-' + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2, 5).toUpperCase();
-
-            // Registrar en tabla de comisiones
             try {
                 await connection.execute(
                     `INSERT INTO referral_commissions (referrer_id, referred_id, source_type, source_id, source_amount, commission_rate, commission_amount, status, ref_id) 
                      VALUES (?, ?, 'investment_return', ?, ?, 0.05, ?, 'paid', ?)`,
                     [referrerId, investment.user_id, returnResult.insertId, grossAmountEarned, referralCommission, referralRefId]
                 );
-            } catch(e) { console.error('Error registrando comisión en tabla:', e.message); }
+            } catch (e) { console.error('Error registrando comisión en tabla:', e.message); }
 
-            // Crear transacción de ganancia para el referidor
             await connection.execute(
                 `INSERT INTO transactions (user_id, type, amount, description, ref_id, created_at) VALUES (?, 'profit', ?, ?, ?, NOW())`,
                 [referrerId, referralCommission, `Comisión referido — 5% de rendimiento CDTC`, referralRefId]
             );
-
-            // Recalcular balance del referidor
-            const referrerBalance = await recalculateAndSaveBalance(connection, referrerId);
+            await recalculateAndSaveBalance(connection, referrerId);
         }
 
-        // 6. Recalcular balance del usuario (la ganancia se suma al balance disponible)
         const newBalance = await recalculateAndSaveBalance(connection, investment.user_id);
-
         await connection.commit();
 
         res.status(201).json({
             message: `Rendimiento registrado exitosamente${referralCommission ? ' (5% comisión referido descontada)' : ''}`,
             return: {
-                id: returnResult.insertId,
-                investmentId,
-                userId: investment.user_id,
-                periodMonth,
-                rate,
-                grossAmountEarned,
-                referralCommission,
-                amountEarned,
-                capitalBase,
-                refId,
-                newBalance,
+                id: returnResult.insertId, investmentId, userId: investment.user_id,
+                periodMonth, rate, grossAmountEarned, referralCommission, amountEarned,
+                capitalBase, refId, newBalance,
                 referral: referrerId ? { referrerId, commission: referralCommission, refId: referralRefId } : null,
             },
         });
@@ -286,55 +215,33 @@ exports.registerInvestmentReturn = async (req, res) => {
     }
 };
 
-// ══════════════════════════════════════════════════════════════════
-// GET /api/admin/investments/active — Listar inversiones activas (para el panel admin)
-// ══════════════════════════════════════════════════════════════════
+// GET /api/admin/investments/active
 exports.getActiveInvestments = async (req, res) => {
     try {
         const [rows] = await pool.execute(
             `SELECT i.id, i.user_id, i.type, i.amount, i.start_date, i.end_date, i.lock_end_date,
                     i.min_monthly_rate, i.max_monthly_rate, i.status, i.created_at,
                     u.full_name as user_name, u.email as user_email
-             FROM investments i
-             LEFT JOIN users u ON i.user_id = u.id
-             WHERE i.status IN ('active', 'pending_deposit')
-             ORDER BY i.created_at DESC`
+             FROM investments i LEFT JOIN users u ON i.user_id = u.id
+             WHERE i.status IN ('active', 'pending_deposit') ORDER BY i.created_at DESC`
         );
 
-        // Para cada inversión, traer rendimientos ya registrados
-        const results = await Promise.all(
-            rows.map(async (inv) => {
-                const [returns] = await pool.execute(
-                    `SELECT period_month, rate_applied, amount_earned, status
-                     FROM investment_returns WHERE investment_id = ? ORDER BY period_month ASC`,
-                    [inv.id]
-                );
-                const totalEarned = returns.reduce((sum, r) => sum + parseFloat(r.amount_earned), 0);
-
-                return {
-                    id: inv.id,
-                    userId: inv.user_id,
-                    userName: inv.user_name,
-                    userEmail: inv.user_email,
-                    type: inv.type,
-                    amount: parseFloat(inv.amount),
-                    startDate: inv.start_date,
-                    endDate: inv.end_date,
-                    lockEndDate: inv.lock_end_date,
-                    minMonthlyRate: parseFloat(inv.min_monthly_rate || 0),
-                    maxMonthlyRate: parseFloat(inv.max_monthly_rate || 0),
-                    status: inv.status,
-                    totalEarned,
-                    returnsCount: returns.length,
-                    returns: returns.map(r => ({
-                        month: r.period_month,
-                        rate: parseFloat(r.rate_applied),
-                        earned: parseFloat(r.amount_earned),
-                        status: r.status,
-                    })),
-                };
-            })
-        );
+        const results = await Promise.all(rows.map(async (inv) => {
+            const [returns] = await pool.execute(
+                `SELECT period_month, rate_applied, amount_earned, status FROM investment_returns WHERE investment_id = ? ORDER BY period_month ASC`,
+                [inv.id]
+            );
+            const totalEarned = returns.reduce((sum, r) => sum + parseFloat(r.amount_earned), 0);
+            return {
+                id: inv.id, userId: inv.user_id, userName: inv.user_name, userEmail: inv.user_email,
+                type: inv.type, amount: parseFloat(inv.amount),
+                startDate: inv.start_date, endDate: inv.end_date, lockEndDate: inv.lock_end_date,
+                minMonthlyRate: parseFloat(inv.min_monthly_rate || 0),
+                maxMonthlyRate: parseFloat(inv.max_monthly_rate || 0),
+                status: inv.status, totalEarned, returnsCount: returns.length,
+                returns: returns.map(r => ({ month: r.period_month, rate: parseFloat(r.rate_applied), earned: parseFloat(r.amount_earned), status: r.status })),
+            };
+        }));
 
         res.json(results);
     } catch (error) {
@@ -343,16 +250,15 @@ exports.getActiveInvestments = async (req, res) => {
     }
 };
 
-// POST /api/admin/balance — Registrar balance (manual)
+// POST /api/admin/balance
 exports.recordBalance = async (req, res) => {
     try {
         const { userId, balance, date } = req.body;
-        if (!userId || balance === undefined) {
-            return res.status(400).json({ error: 'userId y balance son requeridos' });
-        }
+        if (!userId || balance === undefined) return res.status(400).json({ error: 'userId y balance son requeridos' });
+        const snapshotDate = date ? new Date(date).toISOString().slice(0, 10) : new Date().toISOString().slice(0, 10);
         const [result] = await pool.execute(
             `INSERT INTO balance_history (user_id, amount, snapshot_date) VALUES (?, ?, ?)`,
-            [userId, balance, (() => { const d = date ? new Date(date) : new Date(); return d.toISOString().slice(0, 10); })()]
+            [userId, balance, snapshotDate]
         );
         res.status(201).json({ message: 'Balance registrado', id: result.insertId });
     } catch (error) {
@@ -366,10 +272,9 @@ exports.recalculateBalance = async (req, res) => {
     const connection = await pool.getConnection();
     try {
         await connection.beginTransaction();
-        const userId = req.params.userId;
-        const newBalance = await recalculateAndSaveBalance(connection, userId);
+        const newBalance = await recalculateAndSaveBalance(connection, req.params.userId);
         await connection.commit();
-        res.json({ message: 'Balance recalculado', userId, newBalance });
+        res.json({ message: 'Balance recalculado', userId: req.params.userId, newBalance });
     } catch (error) {
         await connection.rollback();
         console.error('Error recalculando balance:', error);
@@ -384,17 +289,12 @@ exports.recalculateAllBalances = async (req, res) => {
     const connection = await pool.getConnection();
     try {
         await connection.beginTransaction();
-
-        const [users] = await connection.execute(
-            `SELECT DISTINCT user_id FROM transactions`
-        );
-
+        const [users] = await connection.execute(`SELECT DISTINCT user_id FROM transactions`);
         const results = [];
         for (const row of users) {
             const newBalance = await recalculateAndSaveBalance(connection, row.user_id);
             results.push({ userId: row.user_id, balance: newBalance });
         }
-
         await connection.commit();
         res.json({ message: `Balances recalculados para ${results.length} usuarios`, results });
     } catch (error) {
@@ -415,8 +315,8 @@ exports.getUserDetails = async (req, res) => {
         );
         if (!user.length) return res.status(404).json({ error: 'Usuario no encontrado' });
 
-        const [investments] = await pool.execute(`SELECT * FROM investments WHERE user_id = ? ORDER BY start_date DESC`, [userId]);
-        const [transactions] = await pool.execute(`SELECT * FROM transactions WHERE user_id = ? ORDER BY created_at DESC LIMIT 50`, [userId]);
+        const [investments]    = await pool.execute(`SELECT * FROM investments WHERE user_id = ? ORDER BY start_date DESC`, [userId]);
+        const [transactions]   = await pool.execute(`SELECT * FROM transactions WHERE user_id = ? ORDER BY created_at DESC LIMIT 50`, [userId]);
         const [balanceHistory] = await pool.execute(`SELECT * FROM balance_history WHERE user_id = ? ORDER BY snapshot_date ASC`, [userId]);
 
         res.json({ user: user[0], investments, transactions, balanceHistory });
@@ -431,7 +331,9 @@ exports.deleteInvestment = async (req, res) => {
     try {
         await pool.execute('DELETE FROM investments WHERE id = ?', [req.params.id]);
         res.json({ message: 'Inversión eliminada' });
-    } catch (error) { res.status(500).json({ error: 'Error interno' }); }
+    } catch (error) {
+        res.status(500).json({ error: 'Error interno' });
+    }
 };
 
 // DELETE /api/admin/transactions/:id
@@ -439,17 +341,9 @@ exports.deleteTransaction = async (req, res) => {
     const connection = await pool.getConnection();
     try {
         await connection.beginTransaction();
-
-        const [txRows] = await connection.execute(
-            'SELECT user_id FROM transactions WHERE id = ?', [req.params.id]
-        );
-
+        const [txRows] = await connection.execute('SELECT user_id FROM transactions WHERE id = ?', [req.params.id]);
         await connection.execute('DELETE FROM transactions WHERE id = ?', [req.params.id]);
-
-        if (txRows.length > 0) {
-            await recalculateAndSaveBalance(connection, txRows[0].user_id);
-        }
-
+        if (txRows.length > 0) await recalculateAndSaveBalance(connection, txRows[0].user_id);
         await connection.commit();
         res.json({ message: 'Transacción eliminada y balance actualizado' });
     } catch (error) {
@@ -460,40 +354,36 @@ exports.deleteTransaction = async (req, res) => {
     }
 };
 
-// POST /api/admin/investments/:id/cancel — Admin cancela cualquier inversión
+// POST /api/admin/investments/:id/cancel
+// FIX: reason ahora se pasa como parámetro SQL (?) en lugar de interpolarse
+//      directamente en el string, eliminando el riesgo de inyección.
 exports.adminCancelInvestment = async (req, res) => {
     const connection = await pool.getConnection();
     try {
         await connection.beginTransaction();
 
-        const invId = req.params.id;
-        const { reason } = req.body;
+        const invId  = req.params.id;
+        const reason = req.body.reason || 'Sin motivo';
 
         const [invRows] = await connection.execute(
-            `SELECT * FROM investments WHERE id = ? AND status IN ('active', 'pending_deposit')`,
-            [invId]
+            `SELECT * FROM investments WHERE id = ? AND status IN ('active', 'pending_deposit')`, [invId]
         );
-        if (!invRows.length) {
-            return res.status(404).json({ error: 'Inversión no encontrada o ya completada/cancelada' });
-        }
+        if (!invRows.length) return res.status(404).json({ error: 'Inversión no encontrada o ya completada/cancelada' });
         const inv = invRows[0];
 
-        // Cambiar a cancelled
+        // FIX: reason como parámetro ?, no interpolado en SQL
         await connection.execute(
-            `UPDATE investments SET status = 'cancelled', notes = CONCAT(IFNULL(notes,''), ' | ADMIN CANCEL: ${(reason || 'Sin motivo').replace(/'/g, "''")}') WHERE id = ?`,
-            [invId]
+            `UPDATE investments SET status = 'cancelled', notes = CONCAT(IFNULL(notes,''), ?) WHERE id = ?`,
+            [` | ADMIN CANCEL: ${reason}`, invId]
         );
 
-        // Eliminar transacciones de inversión asociadas
         await connection.execute(
-            `DELETE FROM transactions WHERE investment_id = ? AND type = 'investment'`,
-            [invId]
+            `DELETE FROM transactions WHERE investment_id = ? AND type = 'investment'`, [invId]
         );
 
-        // Recalcular balance del usuario
         await recalculateAndSaveBalance(connection, inv.user_id);
-
         await connection.commit();
+
         res.json({ message: 'Inversión cancelada por admin. Capital devuelto al usuario.', userId: inv.user_id, amount: parseFloat(inv.amount) });
     } catch (error) {
         await connection.rollback();
@@ -504,26 +394,29 @@ exports.adminCancelInvestment = async (req, res) => {
     }
 };
 
-// POST /api/admin/users/:id/toggle-block — Bloquear/Desbloquear usuario
+// POST /api/admin/users/:id/toggle-block
+// FIX: reason ahora se pasa como parámetro SQL (?) eliminando el riesgo
+//      de inyección que existía con la interpolación directa anterior.
 exports.toggleBlockUser = async (req, res) => {
     try {
         const userId = req.params.id;
-        const { reason } = req.body;
+        const reason = req.body.reason || '';
 
         const [userRows] = await pool.execute(`SELECT id, status, role FROM users WHERE id = ?`, [userId]);
         if (!userRows.length) return res.status(404).json({ error: 'Usuario no encontrado' });
         if (userRows[0].role === 'admin') return res.status(400).json({ error: 'No se puede bloquear a un administrador' });
 
         const currentStatus = userRows[0].status;
-        const newStatus = currentStatus === 'blocked' ? 'active' : 'blocked';
+        const newStatus     = currentStatus === 'blocked' ? 'active' : 'blocked';
 
         await pool.execute(`UPDATE users SET status = ? WHERE id = ?`, [newStatus, userId]);
 
-        // Si se bloquea, invalidar sesiones (opcional: se podría agregar columna blocked_at)
+        // FIX: reason como parámetro ?, no interpolado en SQL
         if (newStatus === 'blocked' && reason) {
+            const note = `\nBLOQUEADO: ${reason} — ${new Date().toISOString().slice(0, 16)}`;
             await pool.execute(
-                `UPDATE users SET notes = CONCAT(IFNULL(notes,''), '\nBLOQUEADO: ${reason.replace(/'/g, "''")} — ${new Date().toISOString().slice(0,16)}') WHERE id = ?`,
-                [userId]
+                `UPDATE users SET notes = CONCAT(IFNULL(notes,''), ?) WHERE id = ?`,
+                [note, userId]
             );
         }
 
@@ -534,9 +427,7 @@ exports.toggleBlockUser = async (req, res) => {
     }
 };
 
-// ══════════════════════════════════════════════════════════════
-// POST /api/admin/loans/create — Crear préstamo directo (sin solicitud previa)
-// ══════════════════════════════════════════════════════════════
+// POST /api/admin/loans/create — Crear préstamo directo
 exports.adminCreateLoan = async (req, res) => {
     const connection = await pool.getConnection();
     try {
@@ -564,46 +455,34 @@ exports.adminCreateLoan = async (req, res) => {
 
         const refId = 'LADM-' + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2, 5).toUpperCase();
 
-        // Insertar directamente como 'active' en loan_requests
         const [result] = await connection.execute(
             `INSERT INTO loan_requests
              (user_id, amount, term_months, purpose, credit_score, status, ref_id,
               approved_amount, approved_rate, monthly_rate, start_date, due_date, admin_notes, processed_at, processed_by)
              VALUES (?, ?, ?, ?, 999, 'active', ?, ?, ?, ?, ?, ?, ?, NOW(), ?)`,
-            [
-                userId, parsedAmount, parsedTerm,
-                purpose || `Préstamo ${parsedTerm} mes${parsedTerm > 1 ? 'es' : ''} — Admin`,
-                refId,
-                parsedAmount, parsedRate, parsedRate,
-                fmt(loanStart), fmt(dueDate),
-                notes || 'Creado directamente por administrador',
-                req.user?.id || null
-            ]
+            [userId, parsedAmount, parsedTerm,
+             purpose || `Préstamo ${parsedTerm} mes${parsedTerm > 1 ? 'es' : ''} — Admin`,
+             refId, parsedAmount, parsedRate, parsedRate,
+             fmt(loanStart), fmt(dueDate),
+             notes || 'Creado directamente por administrador',
+             req.user?.id || null]
         );
 
-        // Registrar transacción que acredita al balance
         await connection.execute(
-            `INSERT INTO transactions (user_id, type, amount, description, ref_id, created_at)
-             VALUES (?, 'loan', ?, ?, ?, ?)`,
-            [
-                userId, parsedAmount,
-                purpose || `Préstamo SANSE — ${parsedTerm} mes${parsedTerm > 1 ? 'es' : ''} al ${parsedRate}% mensual`,
-                refId,
-                fmt(loanStart)
-            ]
+            `INSERT INTO transactions (user_id, type, amount, description, ref_id, created_at) VALUES (?, 'loan', ?, ?, ?, ?)`,
+            [userId, parsedAmount,
+             purpose || `Préstamo SANSE — ${parsedTerm} mes${parsedTerm > 1 ? 'es' : ''} al ${parsedRate}% mensual`,
+             refId, fmt(loanStart)]
         );
 
-        // Recalcular balance
-        const [inRows]  = await connection.execute(`SELECT COALESCE(SUM(amount),0) as total FROM transactions WHERE user_id = ? AND type IN ('deposit','payment','interest','profit','investment_return','investment_withdrawal','loan')`, [userId]);
-        const [outRows] = await connection.execute(`SELECT COALESCE(SUM(amount),0) as total FROM transactions WHERE user_id = ? AND type IN ('withdraw')`, [userId]);
-        const newBalance = parseFloat(inRows[0].total) - parseFloat(outRows[0].total);
-        await connection.execute(`UPDATE users SET balance = ? WHERE id = ?`, [newBalance, userId]);
+        // Recalcular balance usando la función centralizada (fuente única de verdad)
+        const newBalance = await recalculateAndSaveBalance(connection, userId);
 
         await connection.commit();
 
         res.status(201).json({
             message: `Préstamo de $${parsedAmount.toLocaleString('es-CO')} COP creado para ${userRows[0].full_name}`,
-            loan: { id: result.insertId, refId, amount: parsedAmount, termMonths: parsedTerm, monthlyRate: parsedRate, dueDate: fmt(dueDate) }
+            loan: { id: result.insertId, refId, amount: parsedAmount, termMonths: parsedTerm, monthlyRate: parsedRate, dueDate: fmt(dueDate), newBalance }
         });
     } catch (error) {
         await connection.rollback();
@@ -614,16 +493,13 @@ exports.adminCreateLoan = async (req, res) => {
     }
 };
 
-// ══════════════════════════════════════════════════════════════
-// POST /api/admin/users/:id/edit — Editar datos + contraseña + referido
-// ══════════════════════════════════════════════════════════════
+// POST /api/admin/users/:id/edit
 exports.editUser = async (req, res) => {
     try {
         const userId = req.params.id;
         const { fullName, email, phone, documentNumber, role, status, password, referredBy } = req.body;
 
-        if (!fullName || !email)
-            return res.status(400).json({ error: 'Nombre y email son obligatorios' });
+        if (!fullName || !email) return res.status(400).json({ error: 'Nombre y email son obligatorios' });
 
         const [userRows] = await pool.execute(`SELECT id FROM users WHERE id = ?`, [userId]);
         if (!userRows.length) return res.status(404).json({ error: 'Usuario no encontrado' });
@@ -637,11 +513,11 @@ exports.editUser = async (req, res) => {
             if (!isNaN(ref) && ref !== parseInt(userId)) referrerId = ref;
         }
 
-        const fields = ['full_name=?','email=?','phone=?','document_number=?','role=?','status=?','referred_by=?'];
+        const fields = ['full_name=?', 'email=?', 'phone=?', 'document_number=?', 'role=?', 'status=?', 'referred_by=?'];
         const values = [
             fullName.trim(), email.toLowerCase().trim(),
-            phone||null, documentNumber||null,
-            role||'client', status||'active',
+            phone || null, documentNumber || null,
+            role || 'client', status || 'active',
             referredBy === 'none' || referredBy === '' ? null : referrerId
         ];
 
