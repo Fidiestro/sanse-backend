@@ -1,542 +1,332 @@
 const { pool } = require('../config/database');
-const { auditLog } = require('../utils/helpers');
 
-// GET /api/investments/available — Productos de inversión disponibles
-exports.getAvailableProducts = async (req, res) => {
+// GET /api/admin/stats — Estadísticas generales
+exports.getStats = async (req, res) => {
     try {
-        const products = [
-            {
-                id: 'cdtc_3m',
-                name: 'CDTC 3 Meses',
-                durationMonths: 3,
-                minMonthlyRate: 2.0,
-                maxMonthlyRate: 3.0,
-                minAmount: 100000,
-                features: ['Plazo fijo de 3 meses', 'Rendimiento mensual variable 2% — 3%', 'Capital bloqueado hasta vencimiento'],
-            },
-            {
-                id: 'cdtc_6m',
-                name: 'CDTC 6 Meses',
-                durationMonths: 6,
-                minMonthlyRate: 2.0,
-                maxMonthlyRate: 4.0,
-                minAmount: 100000,
-                features: ['Plazo fijo de 6 meses', 'Rendimiento mensual variable 2% — 4%', 'Capital bloqueado hasta vencimiento'],
-            },
-            {
-                id: 'cdtc_12m',
-                name: 'CDTC 12 Meses',
-                durationMonths: 12,
-                minMonthlyRate: 3.0,
-                maxMonthlyRate: 4.0,
-                minAmount: 100000,
-                features: ['Plazo fijo de 12 meses', 'Rendimiento mensual variable 3% — 4%', 'Capital bloqueado hasta vencimiento'],
-            },
-        ];
-        res.json(products);
+        const [balanceRows] = await pool.execute(
+            `SELECT COALESCE(SUM(t.amount),0) as total FROM transactions t WHERE t.type IN ('deposit','payment')`
+        );
+        const [withdrawRows] = await pool.execute(
+            `SELECT COALESCE(SUM(amount),0) as total FROM transactions WHERE type = 'withdraw'`
+        );
+        const [loanRows] = await pool.execute(
+            `SELECT COALESCE(SUM(amount),0) as total FROM transactions WHERE type = 'loan'`
+        );
+        res.json({
+            totalBalance: parseFloat(balanceRows[0].total) - parseFloat(withdrawRows[0].total),
+            totalWithdrawals: parseFloat(withdrawRows[0].total),
+            totalLoans: parseFloat(loanRows[0].total),
+        });
     } catch (error) {
-        console.error('Error obteniendo productos:', error);
+        console.error('Error stats:', error);
         res.status(500).json({ error: 'Error interno del servidor' });
     }
 };
 
-// POST /api/investments/create — Usuario crea inversión CDTC desde su balance disponible
-exports.createUserInvestment = async (req, res) => {
+// GET /api/admin/transactions/recent — Últimas 30 transacciones con nombre de usuario
+exports.getRecentTransactions = async (req, res) => {
+    try {
+        const [rows] = await pool.execute(
+            `SELECT t.*, u.full_name as user_name 
+             FROM transactions t 
+             LEFT JOIN users u ON t.user_id = u.id 
+             ORDER BY t.created_at DESC 
+             LIMIT 30`
+        );
+        res.json(rows);
+    } catch (error) {
+        console.error('Error recent transactions:', error);
+        res.status(500).json({ error: 'Error interno del servidor' });
+    }
+};
+
+// POST /api/admin/investments — Crear inversión
+exports.createInvestment = async (req, res) => {
+    try {
+        const { userId, type, amount, annualRate, startDate, status } = req.body;
+        if (!userId || !type || !amount || !annualRate) {
+            return res.status(400).json({ error: 'userId, type, amount y annualRate son requeridos' });
+        }
+        const [result] = await pool.execute(
+            `INSERT INTO investments (user_id, type, amount, annual_rate, start_date, status) VALUES (?, ?, ?, ?, ?, ?)`,
+            [userId, type, amount, annualRate, startDate || new Date().toISOString().split('T')[0], status || 'active']
+        );
+        res.status(201).json({ message: 'Inversión creada', id: result.insertId });
+    } catch (error) {
+        console.error('Error creando inversión:', error);
+        res.status(500).json({ error: 'Error interno del servidor' });
+    }
+};
+
+// ══════════════════════════════════════════════════
+// Función auxiliar: Recalcular balance de un usuario
+// ══════════════════════════════════════════════════
+async function recalculateAndSaveBalance(connection, userId) {
+    const [inRows] = await connection.execute(
+        `SELECT COALESCE(SUM(amount), 0) as total 
+         FROM transactions 
+         WHERE user_id = ? AND type IN ('deposit', 'payment', 'interest', 'profit', 'investment_return', 'investment_withdrawal')`,
+        [userId]
+    );
+    const [outRows] = await connection.execute(
+        `SELECT COALESCE(SUM(amount), 0) as total 
+         FROM transactions 
+         WHERE user_id = ? AND type IN ('withdraw')`,
+        [userId]
+    );
+
+    const totalIn = parseFloat(inRows[0].total);
+    const totalOut = parseFloat(outRows[0].total);
+    const newBalance = Math.max(0, totalIn - totalOut);
+
+    const today = new Date().toISOString().slice(0, 10);
+
+    const [existing] = await connection.execute(
+        `SELECT id FROM balance_history WHERE user_id = ? AND snapshot_date = ?`,
+        [userId, today]
+    );
+
+    if (existing.length > 0) {
+        await connection.execute(
+            `UPDATE balance_history SET amount = ? WHERE user_id = ? AND snapshot_date = ?`,
+            [newBalance, userId, today]
+        );
+    } else {
+        await connection.execute(
+            `INSERT INTO balance_history (user_id, amount, snapshot_date) VALUES (?, ?, ?)`,
+            [userId, newBalance, today]
+        );
+    }
+
+    return newBalance;
+}
+
+// POST /api/admin/transactions — Crear transacción (+ auto actualiza balance_history)
+exports.createTransaction = async (req, res) => {
     const connection = await pool.getConnection();
     try {
         await connection.beginTransaction();
 
-        const userId = req.user.id;
-        const { productId } = req.body;
-        const amount = parseFloat(req.body.amount);
-
-        if (!productId || !amount || isNaN(amount)) {
-            return res.status(400).json({ error: 'productId y amount son requeridos' });
+        const { userId, type, amount, description, date } = req.body;
+        if (!userId || !type || !amount) {
+            return res.status(400).json({ error: 'userId, type y amount son requeridos' });
         }
 
-        // Configuración por plan
-        const PLANS = {
-            cdtc_3m:  { durationMonths: 3,  minRate: 2.0, maxRate: 3.0 },
-            cdtc_6m:  { durationMonths: 6,  minRate: 2.0, maxRate: 4.0 },
-            cdtc_12m: { durationMonths: 12, minRate: 3.0, maxRate: 4.0 },
-        };
-        const plan = PLANS[productId];
-        if (!plan) {
-            return res.status(400).json({ error: 'Producto no disponible. Usa: cdtc_3m, cdtc_6m o cdtc_12m' });
-        }
-        const { durationMonths, minRate, maxRate } = plan;
-        if (amount < 100000 || !isFinite(amount)) {
-            return res.status(400).json({ error: 'Monto mínimo de inversión: $100.000 COP' });
-        }
+        const [countRows] = await connection.execute('SELECT COUNT(*) as c FROM transactions');
+        const refId = 'TX-' + String(countRows[0].c + 1).padStart(5, '0');
 
-        // Verificar máximo 3 CDTC activas por usuario
-        const [activeCountRows] = await connection.execute(
-            `SELECT COUNT(*) as c FROM investments WHERE user_id = ? AND status IN ('active', 'pending_deposit')`,
-            [userId]
-        );
-        if (activeCountRows[0].c >= 3) {
-            return res.status(400).json({ error: 'Máximo 3 inversiones CDTC activas permitidas. Espera a que una termine o retírala para crear otra.' });
-        }
-
-        // 1. Calcular balance disponible del usuario
-        const [balanceRows] = await connection.execute(
-            `SELECT amount FROM balance_history WHERE user_id = ? ORDER BY snapshot_date DESC LIMIT 1`,
-            [userId]
-        );
-        const currentBalance = balanceRows.length > 0 ? parseFloat(balanceRows[0].amount) : 0;
-
-        // 2. Calcular total invertido activamente (incluye pending_deposit)
-        const [investedRows] = await connection.execute(
-            `SELECT COALESCE(SUM(amount), 0) as total FROM investments WHERE user_id = ? AND status IN ('active', 'pending_deposit')`,
-            [userId]
-        );
-        const totalInvested = parseFloat(investedRows[0].total);
-
-        // 3. Restar retiros pendientes/aprobados (dinero comprometido)
-        const [pendingWR] = await connection.execute(
-            `SELECT COALESCE(SUM(amount), 0) as total FROM withdrawal_requests WHERE user_id = ? AND status IN ('pending', 'approved')`,
-            [userId]
-        );
-        const pendingWithdrawals = parseFloat(pendingWR[0].total);
-
-        const availableBalance = currentBalance - totalInvested - pendingWithdrawals;
-
-        if (amount > availableBalance) {
-            return res.status(400).json({
-                error: `Saldo disponible insuficiente. Disponible: $${Math.round(Math.max(0, availableBalance)).toLocaleString('es-CO')} COP`,
-                available: Math.max(0, availableBalance),
-            });
-        }
-
-        // 3. Calcular fechas
-        const startDate = new Date();
-        const endDate = new Date();
-        endDate.setMonth(endDate.getMonth() + durationMonths);
-        const lockEndDate = new Date(endDate);
-
-        const formatDate = (d) => d.toISOString().slice(0, 10);
-
-        // 4. Crear la inversión en estado pending_deposit (12h para confirmar/cancelar)
-        const depositDeadline = new Date();
-        depositDeadline.setHours(depositDeadline.getHours() + 12);
+        const dateObj = date ? new Date(date) : new Date();
+        const createdAt = dateObj.toISOString().slice(0, 19).replace('T', ' ');
 
         const [result] = await connection.execute(
-            `INSERT INTO investments 
-             (user_id, type, amount, annual_rate, duration_months, min_monthly_rate, max_monthly_rate, 
-              start_date, end_date, lock_end_date, invested_from_balance, status, notes) 
-             VALUES (?, 'CDTC', ?, 0, ?, ?, ?, ?, ?, ?, 1, 'pending_deposit', ?)`,
-            [
-                userId,
-                amount,
-                durationMonths,
-                minRate,
-                maxRate,
-                formatDate(startDate),
-                formatDate(endDate),
-                formatDate(lockEndDate),
-                `Inversión CDTC ${durationMonths}m — Período de depósito hasta: ${depositDeadline.toISOString().slice(0,16).replace('T',' ')}. Desbloqueo: ${formatDate(lockEndDate)}`,
-            ]
+            `INSERT INTO transactions (user_id, type, amount, description, ref_id, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
+            [userId, type, amount, description || '', refId, createdAt]
         );
 
-        const investmentId = result.insertId;
-
-        // 5. Registrar transacción
-        // Unique ref_id using timestamp + random
-        const refId = 'INV-' + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2,5).toUpperCase();
-
-        await connection.execute(
-            `INSERT INTO transactions (user_id, investment_id, type, amount, description, ref_id, created_at) 
-             VALUES (?, ?, 'investment', ?, ?, ?, NOW())`,
-            [userId, investmentId, amount, `Inversión CDTC a ${durationMonths} meses — Desbloqueo: ${formatDate(lockEndDate)}`, refId]
-        );
-
-        // 6. Audit log
-        await auditLog({
-            userId,
-            action: 'create_investment',
-            entityType: 'investment',
-            entityId: investmentId,
-            details: { type: 'CDTC', amount, durationMonths, lockEndDate: formatDate(lockEndDate) },
-            ipAddress: req.ip,
-        });
+        const newBalance = await recalculateAndSaveBalance(connection, userId);
 
         await connection.commit();
 
         res.status(201).json({
-            message: `Inversión CDTC a ${durationMonths} meses creada. Tienes 12 horas para confirmar o cancelar.`,
-            investment: {
-                id: investmentId,
-                type: 'CDTC',
-                amount,
-                durationMonths,
-                startDate: formatDate(startDate),
-                endDate: formatDate(endDate),
-                lockEndDate: formatDate(lockEndDate),
-                minMonthlyRate: minRate,
-                maxMonthlyRate: maxRate,
-                status: 'pending_deposit',
-                depositDeadline: depositDeadline.toISOString(),
-                refId,
-            },
+            message: 'Transacción creada',
+            id: result.insertId,
+            refId,
+            newBalance,
         });
     } catch (error) {
         await connection.rollback();
-        console.error('Error creando inversión:', error);
+        console.error('Error creando transacción:', error);
         res.status(500).json({ error: 'Error interno del servidor' });
     } finally {
         connection.release();
     }
 };
 
-// ══════════════════════════════════════════════════════════════
-// POST /api/investments/:id/cancel — Cancelar inversión en período de depósito (12h)
-// Solo funciona si status es 'pending_deposit'
-// ══════════════════════════════════════════════════════════════
-exports.cancelInvestment = async (req, res) => {
+// ══════════════════════════════════════════════════════════════════
+// POST /api/admin/investments/:investmentId/return — Registrar rendimiento mensual CDTC
+// Este es el endpoint CLAVE para que las ganancias aparezcan en el dashboard del usuario
+// ══════════════════════════════════════════════════════════════════
+exports.registerInvestmentReturn = async (req, res) => {
     const connection = await pool.getConnection();
     try {
         await connection.beginTransaction();
 
-        const userId = req.user.id;
-        const investmentId = req.params.id;
+        const investmentId = req.params.investmentId;
+        const { rate, periodMonth, notes } = req.body;
 
+        // rate = porcentaje mensual (ej: 3.5 para 3.5%)
+        // periodMonth = mes del rendimiento (ej: "2026-03-01")
+
+        if (!rate || !periodMonth) {
+            return res.status(400).json({ error: 'rate y periodMonth son requeridos' });
+        }
+
+        if (rate < 0 || rate > 100) {
+            return res.status(400).json({ error: 'La tasa debe estar entre 0 y 100' });
+        }
+
+        // 1. Obtener la inversión
         const [invRows] = await connection.execute(
-            `SELECT * FROM investments WHERE id = ? AND user_id = ? AND status = 'pending_deposit'`,
-            [investmentId, userId]
-        );
-        if (!invRows.length) {
-            return res.status(404).json({ error: 'Inversión no encontrada o ya no se puede cancelar (período de 12 horas expirado)' });
-        }
-
-        // Verificar que aún estamos dentro de las 12h
-        const inv = invRows[0];
-        const createdAt = new Date(inv.created_at);
-        const deadline = new Date(createdAt.getTime() + 12 * 60 * 60 * 1000);
-        if (new Date() > deadline) {
-            // Auto-activar si expiró
-            await connection.execute(`UPDATE investments SET status = 'active' WHERE id = ?`, [investmentId]);
-            await connection.commit();
-            return res.status(400).json({ error: 'El período de cancelación de 12 horas ya expiró. La inversión ahora está activa.' });
-        }
-
-        // Cancelar: cambiar status a cancelled (no eliminar para mantener audit trail)
-        await connection.execute(`UPDATE investments SET status = 'cancelled' WHERE id = ? AND user_id = ?`, [investmentId, userId]);
-        
-        // Eliminar la transacción de inversión asociada (para que no cuente en balance)
-        await connection.execute(`DELETE FROM transactions WHERE investment_id = ? AND user_id = ? AND type = 'investment'`, [investmentId, userId]);
-
-        await auditLog({
-            userId,
-            action: 'cancel_investment',
-            entityType: 'investment',
-            entityId: parseInt(investmentId),
-            details: { amount: parseFloat(inv.amount), reason: 'Cancelado dentro de 12h' },
-            ipAddress: req.ip,
-        });
-
-        await connection.commit();
-
-        res.json({
-            message: 'Inversión cancelada exitosamente. El capital vuelve a tu saldo disponible.',
-            refundedAmount: parseFloat(inv.amount),
-        });
-    } catch (error) {
-        await connection.rollback();
-        console.error('Error cancelando inversión:', error);
-        res.status(500).json({ error: 'Error interno del servidor' });
-    } finally {
-        connection.release();
-    }
-};
-
-// ══════════════════════════════════════════════════════════════
-// POST /api/investments/:id/confirm — Confirmar inversión (activa inmediatamente)
-// ══════════════════════════════════════════════════════════════
-exports.confirmInvestment = async (req, res) => {
-    try {
-        const userId = req.user.id;
-        const investmentId = req.params.id;
-
-        const [invRows] = await pool.execute(
-            `SELECT * FROM investments WHERE id = ? AND user_id = ? AND status = 'pending_deposit'`,
-            [investmentId, userId]
-        );
-        if (!invRows.length) {
-            return res.status(404).json({ error: 'Inversión no encontrada o ya está activa' });
-        }
-
-        await pool.execute(`UPDATE investments SET status = 'active' WHERE id = ?`, [investmentId]);
-
-        res.json({ message: 'Inversión confirmada y activada.', investmentId: parseInt(investmentId) });
-    } catch (error) {
-        console.error('Error confirmando inversión:', error);
-        res.status(500).json({ error: 'Error interno del servidor' });
-    }
-};
-
-// ══════════════════════════════════════════════════════════════
-// POST /api/investments/:id/add-capital — Agregar capital a inversión existente
-// La fecha de vencimiento NO cambia, solo aumenta el monto invertido
-// ══════════════════════════════════════════════════════════════
-exports.addCapitalToInvestment = async (req, res) => {
-    const connection = await pool.getConnection();
-    try {
-        await connection.beginTransaction();
-
-        const userId = req.user.id;
-        const investmentId = req.params.id;
-        const { amount: rawAmount } = req.body;
-        const amount = parseFloat(rawAmount);
-
-        if (!amount || isNaN(amount) || !isFinite(amount) || amount < 50000) {
-            return res.status(400).json({ error: 'Monto mínimo para agregar: $50.000 COP' });
-        }
-
-        // 1. Verificar que la inversión existe, es del usuario, y está activa
-        const [invRows] = await connection.execute(
-            `SELECT * FROM investments WHERE id = ? AND user_id = ? AND status = 'active'`,
-            [investmentId, userId]
-        );
-        if (!invRows.length) {
-            return res.status(404).json({ error: 'Inversión no encontrada o no está activa' });
-        }
-        const inv = invRows[0];
-
-        // 2. Verificar que no haya vencido
-        const now = new Date();
-        const lockEnd = new Date(inv.lock_end_date || inv.end_date);
-        if (now >= lockEnd) {
-            return res.status(400).json({ error: 'No se puede agregar capital a una inversión vencida. Retírala y crea una nueva.' });
-        }
-
-        // 3. Verificar balance disponible
-        const [balanceRows] = await connection.execute(
-            `SELECT amount FROM balance_history WHERE user_id = ? ORDER BY snapshot_date DESC LIMIT 1`,
-            [userId]
-        );
-        const currentBalance = balanceRows.length > 0 ? parseFloat(balanceRows[0].amount) : 0;
-
-        const [investedRows] = await connection.execute(
-            `SELECT COALESCE(SUM(amount), 0) as total FROM investments WHERE user_id = ? AND status IN ('active', 'pending_deposit')`,
-            [userId]
-        );
-        const totalInvested = parseFloat(investedRows[0].total);
-
-        const [pendingWR] = await connection.execute(
-            `SELECT COALESCE(SUM(amount), 0) as total FROM withdrawal_requests WHERE user_id = ? AND status IN ('pending', 'approved')`,
-            [userId]
-        );
-        const pendingWithdrawals = parseFloat(pendingWR[0].total);
-
-        const availableBalance = currentBalance - totalInvested - pendingWithdrawals;
-
-        if (amount > availableBalance) {
-            return res.status(400).json({
-                error: `Saldo disponible insuficiente. Disponible: $${Math.round(Math.max(0, availableBalance)).toLocaleString('es-CO')} COP`,
-                available: Math.max(0, availableBalance),
-            });
-        }
-
-        // 4. Actualizar monto (NO cambia lock_end_date ni end_date)
-        const previousAmount = parseFloat(inv.amount);
-        const newAmount = previousAmount + amount;
-        const addedDate = now.toISOString().slice(0, 10);
-
-        await connection.execute(
-            `UPDATE investments SET amount = ? WHERE id = ?`,
-            [newAmount, investmentId]
-        );
-
-        // 5. Registrar transacción
-        // Unique ref_id using timestamp + random
-        const refId = 'ADD-' + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2,5).toUpperCase();
-
-        const lockDateStr = (inv.lock_end_date || inv.end_date).toString().slice(0, 10);
-
-        await connection.execute(
-            `INSERT INTO transactions (user_id, investment_id, type, amount, description, ref_id, created_at) 
-             VALUES (?, ?, 'investment', ?, ?, ?, NOW())`,
-            [userId, investmentId, amount, `Capital adicional CDTC #${investmentId} — Mismo vencimiento: ${lockDateStr}`, refId]
-        );
-
-        // 6. Audit log
-        await auditLog({
-            userId,
-            action: 'add_capital',
-            entityType: 'investment',
-            entityId: parseInt(investmentId),
-            details: { previousAmount, addedAmount: amount, newAmount, lockEndDate: lockDateStr },
-            ipAddress: req.ip,
-        });
-
-        await connection.commit();
-
-        res.json({
-            message: 'Capital agregado exitosamente',
-            investment: {
-                id: parseInt(investmentId),
-                previousAmount,
-                addedAmount: amount,
-                newAmount,
-                lockEndDate: lockDateStr,
-                refId,
-            },
-        });
-    } catch (error) {
-        await connection.rollback();
-        console.error('Error agregando capital:', error);
-        res.status(500).json({ error: 'Error interno del servidor' });
-    } finally {
-        connection.release();
-    }
-};
-
-// ══════════════════════════════════════════════════════════════
-// POST /api/investments/:id/withdraw — Retirar inversión vencida
-// Solo funciona si lock_end_date ya pasó
-// Cambia status a 'completed' y el capital vuelve al disponible
-// ══════════════════════════════════════════════════════════════
-exports.withdrawInvestment = async (req, res) => {
-    const connection = await pool.getConnection();
-    try {
-        await connection.beginTransaction();
-
-        const userId = req.user.id;
-        const investmentId = req.params.id;
-
-        // 1. Verificar inversión
-        const [invRows] = await connection.execute(
-            `SELECT * FROM investments WHERE id = ? AND user_id = ? AND status = 'active'`,
-            [investmentId, userId]
-        );
-        if (!invRows.length) {
-            return res.status(404).json({ error: 'Inversión no encontrada o no está activa' });
-        }
-        const inv = invRows[0];
-
-        // 2. Verificar que ya venció
-        const now = new Date();
-        const lockEnd = new Date(inv.lock_end_date || inv.end_date);
-        if (now < lockEnd) {
-            const daysLeft = Math.ceil((lockEnd - now) / (1000 * 60 * 60 * 24));
-            return res.status(400).json({
-                error: `La inversión aún no ha vencido. Faltan ${daysLeft} días para el desbloqueo.`,
-                daysRemaining: daysLeft,
-                lockEndDate: lockEnd.toISOString().slice(0, 10),
-            });
-        }
-
-        // 3. Capital a devolver
-        const capitalAmount = parseFloat(inv.amount);
-
-        // 4. Marcar inversión como completada
-        await connection.execute(
-            `UPDATE investments SET status = 'completed' WHERE id = ?`,
+            `SELECT id, user_id, amount, status, type FROM investments WHERE id = ?`,
             [investmentId]
         );
 
-        // 5. NO necesita transacción extra: al cambiar a completed, el amount
-        // ya no se cuenta como "invertido", así que automáticamente vuelve al disponible
-        // Pero registramos una transacción informativa
-        // Unique ref_id using timestamp + random
-        const refId = 'WDR-' + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2,5).toUpperCase();
+        if (!invRows.length) {
+            await connection.rollback();
+            return res.status(404).json({ error: 'Inversión no encontrada' });
+        }
 
-        await connection.execute(
-            `INSERT INTO transactions (user_id, investment_id, type, amount, description, ref_id, created_at) 
-             VALUES (?, ?, 'investment_withdrawal', ?, ?, ?, NOW())`,
-            [userId, investmentId, capitalAmount, `Retiro inversión CDTC #${investmentId} — Capital liberado`, refId]
+        const investment = invRows[0];
+
+        if (investment.status !== 'active') {
+            await connection.rollback();
+            return res.status(400).json({ error: 'La inversión no está activa' });
+        }
+
+        // 2. Verificar que no exista ya un rendimiento para ese mes
+        const [existingReturn] = await connection.execute(
+            `SELECT id FROM investment_returns WHERE investment_id = ? AND period_month = ?`,
+            [investmentId, periodMonth]
         );
 
-        // 6. Audit log
-        await auditLog({
-            userId,
-            action: 'withdraw_investment',
-            entityType: 'investment',
-            entityId: parseInt(investmentId),
-            details: { capitalReturned: capitalAmount },
-            ipAddress: req.ip,
-        });
+        if (existingReturn.length > 0) {
+            await connection.rollback();
+            return res.status(400).json({ error: `Ya existe un rendimiento registrado para el mes ${periodMonth}` });
+        }
+
+        // 3. Calcular ganancia: capital * (tasa / 100)
+        const capitalBase = parseFloat(investment.amount);
+        const grossAmountEarned = Math.round(capitalBase * (rate / 100));
+
+        // 3b. Verificar si el usuario tiene referidor → descontar 5% de comisión
+        let referralCommission = 0;
+        let referrerId = null;
+        const [refRows] = await connection.execute('SELECT referred_by FROM users WHERE id = ?', [investment.user_id]);
+        if (refRows.length && refRows[0].referred_by) {
+            referrerId = refRows[0].referred_by;
+            referralCommission = Math.round(grossAmountEarned * 0.05);
+        }
+        const amountEarned = grossAmountEarned - referralCommission; // El usuario recibe el neto
+
+        // 4. Insertar en investment_returns
+        const [returnResult] = await connection.execute(
+            `INSERT INTO investment_returns (investment_id, user_id, period_month, rate_applied, amount_earned, status, notes)
+             VALUES (?, ?, ?, ?, ?, 'paid', ?)`,
+            [investmentId, investment.user_id, periodMonth, rate, amountEarned, notes || `Rendimiento ${rate}% mes ${periodMonth}${referralCommission ? ' (neto -5% referido)' : ''}`]
+        );
+
+        // 5. Crear transacción asociada para que aparezca en movimientos
+        const [countRows] = await connection.execute('SELECT COUNT(*) as c FROM transactions');
+        const refId = 'RET-' + String(countRows[0].c + 1).padStart(5, '0');
+
+        await connection.execute(
+            `INSERT INTO transactions (user_id, investment_id, type, amount, description, ref_id, created_at)
+             VALUES (?, ?, 'investment_return', ?, ?, ?, NOW())`,
+            [
+                investment.user_id,
+                investmentId,
+                amountEarned,
+                `Rendimiento CDTC ${rate}% — ${periodMonth} — Capital: $${capitalBase.toLocaleString('es-CO')}${referralCommission ? ' (neto, -$' + referralCommission.toLocaleString('es-CO') + ' comisión referido)' : ''}`,
+                refId,
+            ]
+        );
+
+        // 5b. Si hay comisión de referido, crear transacción para el referidor
+        let referralRefId = null;
+        if (referrerId && referralCommission >= 100) {
+            referralRefId = 'REF-' + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2, 5).toUpperCase();
+
+            // Registrar en tabla de comisiones
+            try {
+                await connection.execute(
+                    `INSERT INTO referral_commissions (referrer_id, referred_id, source_type, source_id, source_amount, commission_rate, commission_amount, status, ref_id) 
+                     VALUES (?, ?, 'investment_return', ?, ?, 0.05, ?, 'paid', ?)`,
+                    [referrerId, investment.user_id, returnResult.insertId, grossAmountEarned, referralCommission, referralRefId]
+                );
+            } catch(e) { console.error('Error registrando comisión en tabla:', e.message); }
+
+            // Crear transacción de ganancia para el referidor
+            await connection.execute(
+                `INSERT INTO transactions (user_id, type, amount, description, ref_id, created_at) VALUES (?, 'profit', ?, ?, ?, NOW())`,
+                [referrerId, referralCommission, `Comisión referido — 5% de rendimiento CDTC`, referralRefId]
+            );
+
+            // Recalcular balance del referidor
+            const referrerBalance = await recalculateAndSaveBalance(connection, referrerId);
+        }
+
+        // 6. Recalcular balance del usuario (la ganancia se suma al balance disponible)
+        const newBalance = await recalculateAndSaveBalance(connection, investment.user_id);
 
         await connection.commit();
 
-        res.json({
-            message: 'Inversión retirada exitosamente. El capital ha vuelto a tu saldo disponible.',
-            investment: {
-                id: parseInt(investmentId),
-                capitalReturned: capitalAmount,
+        res.status(201).json({
+            message: `Rendimiento registrado exitosamente${referralCommission ? ' (5% comisión referido descontada)' : ''}`,
+            return: {
+                id: returnResult.insertId,
+                investmentId,
+                userId: investment.user_id,
+                periodMonth,
+                rate,
+                grossAmountEarned,
+                referralCommission,
+                amountEarned,
+                capitalBase,
                 refId,
+                newBalance,
+                referral: referrerId ? { referrerId, commission: referralCommission, refId: referralRefId } : null,
             },
         });
     } catch (error) {
         await connection.rollback();
-        console.error('Error retirando inversión:', error);
+        console.error('Error registrando rendimiento:', error);
         res.status(500).json({ error: 'Error interno del servidor' });
     } finally {
         connection.release();
     }
 };
 
-// GET /api/investments/my — Inversiones del usuario con detalle
-exports.getMyInvestments = async (req, res) => {
+// ══════════════════════════════════════════════════════════════════
+// GET /api/admin/investments/active — Listar inversiones activas (para el panel admin)
+// ══════════════════════════════════════════════════════════════════
+exports.getActiveInvestments = async (req, res) => {
     try {
-        const userId = req.user.id;
-
-        const [investments] = await pool.execute(
-            `SELECT id, type, amount, annual_rate, duration_months, min_monthly_rate, max_monthly_rate,
-                    start_date, end_date, lock_end_date, status, notes, created_at
-             FROM investments WHERE user_id = ? ORDER BY created_at DESC`,
-            [userId]
+        const [rows] = await pool.execute(
+            `SELECT i.id, i.user_id, i.type, i.amount, i.start_date, i.end_date, i.lock_end_date,
+                    i.min_monthly_rate, i.max_monthly_rate, i.status, i.created_at,
+                    u.full_name as user_name, u.email as user_email
+             FROM investments i
+             LEFT JOIN users u ON i.user_id = u.id
+             WHERE i.status IN ('active', 'pending_deposit')
+             ORDER BY i.created_at DESC`
         );
 
+        // Para cada inversión, traer rendimientos ya registrados
         const results = await Promise.all(
-            investments.map(async (inv) => {
+            rows.map(async (inv) => {
                 const [returns] = await pool.execute(
-                    `SELECT period_month, rate_applied, amount_earned, status 
+                    `SELECT period_month, rate_applied, amount_earned, status
                      FROM investment_returns WHERE investment_id = ? ORDER BY period_month ASC`,
                     [inv.id]
                 );
-
                 const totalEarned = returns.reduce((sum, r) => sum + parseFloat(r.amount_earned), 0);
-                const now = new Date();
-                const end = new Date(inv.lock_end_date || inv.end_date);
-                const start = new Date(inv.start_date);
-                const totalDays = Math.max(1, (end - start) / (1000 * 60 * 60 * 24));
-                const elapsedDays = Math.max(0, (now - start) / (1000 * 60 * 60 * 24));
-                const progressPct = Math.min(100, Math.round((elapsedDays / totalDays) * 100));
-                const daysRemaining = Math.max(0, Math.ceil((end - now) / (1000 * 60 * 60 * 24)));
-                const isMatured = now >= end;
-                const isPendingDeposit = inv.status === 'pending_deposit';
-                const createdAt = new Date(inv.created_at);
-                const depositDeadline = isPendingDeposit ? new Date(createdAt.getTime() + 12 * 60 * 60 * 1000) : null;
-                const canCancel = isPendingDeposit && now < depositDeadline;
-
-                // Auto-activate if pending_deposit and 12h passed
-                if (isPendingDeposit && !canCancel) {
-                    await pool.execute(`UPDATE investments SET status = 'active' WHERE id = ? AND status = 'pending_deposit'`, [inv.id]);
-                    inv.status = 'active';
-                }
 
                 return {
                     id: inv.id,
+                    userId: inv.user_id,
+                    userName: inv.user_name,
+                    userEmail: inv.user_email,
                     type: inv.type,
                     amount: parseFloat(inv.amount),
-                    annualRate: parseFloat(inv.annual_rate),
-                    durationMonths: inv.duration_months,
-                    minMonthlyRate: parseFloat(inv.min_monthly_rate || 0),
-                    maxMonthlyRate: parseFloat(inv.max_monthly_rate || 0),
                     startDate: inv.start_date,
                     endDate: inv.end_date,
                     lockEndDate: inv.lock_end_date,
+                    minMonthlyRate: parseFloat(inv.min_monthly_rate || 0),
+                    maxMonthlyRate: parseFloat(inv.max_monthly_rate || 0),
                     status: inv.status,
-                    notes: inv.notes,
-                    progressPct,
-                    daysRemaining,
                     totalEarned,
-                    isMatured,
-                    isPendingDeposit: inv.status === 'pending_deposit',
-                    canCancel: inv.status === 'pending_deposit',
-                    depositDeadline: depositDeadline ? depositDeadline.toISOString() : null,
-                    returns: returns.map((r) => ({
+                    returnsCount: returns.length,
+                    returns: returns.map(r => ({
                         month: r.period_month,
                         rate: parseFloat(r.rate_applied),
                         earned: parseFloat(r.amount_earned),
@@ -548,172 +338,325 @@ exports.getMyInvestments = async (req, res) => {
 
         res.json(results);
     } catch (error) {
-        console.error('Error obteniendo inversiones:', error);
+        console.error('Error listando inversiones activas:', error);
         res.status(500).json({ error: 'Error interno del servidor' });
     }
 };
 
-// GET /api/investments/:id — Detalle de una inversión específica
-exports.getInvestmentDetail = async (req, res) => {
+// POST /api/admin/balance — Registrar balance (manual)
+exports.recordBalance = async (req, res) => {
     try {
-        const userId = req.user.id;
-        const investmentId = req.params.id;
-
-        const [rows] = await pool.execute(
-            `SELECT * FROM investments WHERE id = ? AND user_id = ?`,
-            [investmentId, userId]
+        const { userId, balance, date } = req.body;
+        if (!userId || balance === undefined) {
+            return res.status(400).json({ error: 'userId y balance son requeridos' });
+        }
+        const [result] = await pool.execute(
+            `INSERT INTO balance_history (user_id, amount, snapshot_date) VALUES (?, ?, ?)`,
+            [userId, balance, (() => { const d = date ? new Date(date) : new Date(); return d.toISOString().slice(0, 10); })()]
         );
-        if (!rows.length) return res.status(404).json({ error: 'Inversión no encontrada' });
-
-        const inv = rows[0];
-        const now = new Date();
-        const end = new Date(inv.lock_end_date || inv.end_date);
-        const isMatured = now >= end;
-
-        const [returns] = await pool.execute(
-            `SELECT period_month, rate_applied, amount_earned, status, notes 
-             FROM investment_returns WHERE investment_id = ? ORDER BY period_month ASC`,
-            [investmentId]
-        );
-
-        const [transactions] = await pool.execute(
-            `SELECT type, amount, description, ref_id, created_at 
-             FROM transactions WHERE investment_id = ? ORDER BY created_at ASC`,
-            [investmentId]
-        );
-
-        res.json({
-            investment: {
-                id: inv.id,
-                type: inv.type,
-                amount: parseFloat(inv.amount),
-                durationMonths: inv.duration_months,
-                minMonthlyRate: parseFloat(inv.min_monthly_rate || 0),
-                maxMonthlyRate: parseFloat(inv.max_monthly_rate || 0),
-                startDate: inv.start_date,
-                endDate: inv.end_date,
-                lockEndDate: inv.lock_end_date,
-                status: inv.status,
-                notes: inv.notes,
-                isMatured,
-            },
-            returns: returns.map((r) => ({
-                month: r.period_month,
-                rate: parseFloat(r.rate_applied),
-                earned: parseFloat(r.amount_earned),
-                status: r.status,
-                notes: r.notes,
-            })),
-            transactions: transactions.map((t) => ({
-                type: t.type,
-                amount: parseFloat(t.amount),
-                description: t.description,
-                refId: t.ref_id,
-                date: t.created_at,
-            })),
-        });
+        res.status(201).json({ message: 'Balance registrado', id: result.insertId });
     } catch (error) {
-        console.error('Error obteniendo detalle:', error);
+        console.error('Error registrando balance:', error);
         res.status(500).json({ error: 'Error interno del servidor' });
     }
 };
 
-// GET /api/investments/balance-summary — Resumen de balance para el dashboard
-exports.getBalanceSummary = async (req, res) => {
+// POST /api/admin/recalculate-balance/:userId
+exports.recalculateBalance = async (req, res) => {
+    const connection = await pool.getConnection();
     try {
-        const userId = req.user.id;
-
-        const [balanceRows] = await pool.execute(
-            `SELECT amount FROM balance_history WHERE user_id = ? ORDER BY snapshot_date DESC LIMIT 1`,
-            [userId]
-        );
-        const totalBalance = balanceRows.length > 0 ? parseFloat(balanceRows[0].amount) : 0;
-
-        const [investedRows] = await pool.execute(
-            `SELECT COALESCE(SUM(amount), 0) as total FROM investments WHERE user_id = ? AND status IN ('active', 'pending_deposit')`,
-            [userId]
-        );
-        const totalInvested = parseFloat(investedRows[0].total);
-
-        // Restar retiros pendientes y aprobados (dinero ya comprometido)
-        const [pendingWithdrawals] = await pool.execute(
-            `SELECT COALESCE(SUM(amount), 0) as total FROM withdrawal_requests WHERE user_id = ? AND status IN ('pending', 'approved')`,
-            [userId]
-        );
-        const pendingWithdrawalAmount = parseFloat(pendingWithdrawals[0].total);
-
-        const [earningsRows] = await pool.execute(
-            `SELECT COALESCE(SUM(amount_earned), 0) as total FROM investment_returns WHERE user_id = ?`,
-            [userId]
-        );
-        const totalEarnings = parseFloat(earningsRows[0].total);
-
-        const availableBalance = totalBalance - totalInvested - pendingWithdrawalAmount;
-
-        res.json({
-            totalBalance,
-            totalInvested,
-            availableBalance: Math.max(0, availableBalance),
-            totalEarnings,
-            pendingWithdrawals: pendingWithdrawalAmount,
-        });
+        await connection.beginTransaction();
+        const userId = req.params.userId;
+        const newBalance = await recalculateAndSaveBalance(connection, userId);
+        await connection.commit();
+        res.json({ message: 'Balance recalculado', userId, newBalance });
     } catch (error) {
-        console.error('Error balance summary:', error);
+        await connection.rollback();
+        console.error('Error recalculando balance:', error);
+        res.status(500).json({ error: 'Error interno del servidor' });
+    } finally {
+        connection.release();
+    }
+};
+
+// POST /api/admin/recalculate-all-balances
+exports.recalculateAllBalances = async (req, res) => {
+    const connection = await pool.getConnection();
+    try {
+        await connection.beginTransaction();
+
+        const [users] = await connection.execute(
+            `SELECT DISTINCT user_id FROM transactions`
+        );
+
+        const results = [];
+        for (const row of users) {
+            const newBalance = await recalculateAndSaveBalance(connection, row.user_id);
+            results.push({ userId: row.user_id, balance: newBalance });
+        }
+
+        await connection.commit();
+        res.json({ message: `Balances recalculados para ${results.length} usuarios`, results });
+    } catch (error) {
+        await connection.rollback();
+        console.error('Error recalculando todos los balances:', error);
+        res.status(500).json({ error: 'Error interno del servidor' });
+    } finally {
+        connection.release();
+    }
+};
+
+// GET /api/admin/users/:id/details
+exports.getUserDetails = async (req, res) => {
+    try {
+        const userId = req.params.id;
+        const [user] = await pool.execute(
+            `SELECT id, email, full_name, phone, document_number, role, monthly_goal, created_at FROM users WHERE id = ? AND is_active = 1`, [userId]
+        );
+        if (!user.length) return res.status(404).json({ error: 'Usuario no encontrado' });
+
+        const [investments] = await pool.execute(`SELECT * FROM investments WHERE user_id = ? ORDER BY start_date DESC`, [userId]);
+        const [transactions] = await pool.execute(`SELECT * FROM transactions WHERE user_id = ? ORDER BY created_at DESC LIMIT 50`, [userId]);
+        const [balanceHistory] = await pool.execute(`SELECT * FROM balance_history WHERE user_id = ? ORDER BY snapshot_date ASC`, [userId]);
+
+        res.json({ user: user[0], investments, transactions, balanceHistory });
+    } catch (error) {
+        console.error('Error detalles:', error);
         res.status(500).json({ error: 'Error interno del servidor' });
     }
 };
 
-// GET /api/investments/global-stats — Estadísticas globales de CDTC (público para usuarios)
-exports.getGlobalStats = async (req, res) => {
+// DELETE /api/admin/investments/:id
+exports.deleteInvestment = async (req, res) => {
     try {
-        // 1. Total capital bloqueado en CDTC activas (todos los usuarios)
-        const [lockedRows] = await pool.execute(
-            `SELECT COALESCE(SUM(amount), 0) as total, COUNT(*) as count 
-             FROM investments WHERE status IN ('active', 'pending_deposit')`
+        await pool.execute('DELETE FROM investments WHERE id = ?', [req.params.id]);
+        res.json({ message: 'Inversión eliminada' });
+    } catch (error) { res.status(500).json({ error: 'Error interno' }); }
+};
+
+// DELETE /api/admin/transactions/:id
+exports.deleteTransaction = async (req, res) => {
+    const connection = await pool.getConnection();
+    try {
+        await connection.beginTransaction();
+
+        const [txRows] = await connection.execute(
+            'SELECT user_id FROM transactions WHERE id = ?', [req.params.id]
         );
-        const totalLocked = parseFloat(lockedRows[0].total);
-        const totalActiveInvestments = parseInt(lockedRows[0].count);
 
-        // 2. Total usuarios invirtiendo
-        const [usersRows] = await pool.execute(
-            `SELECT COUNT(DISTINCT user_id) as count FROM investments WHERE status IN ('active', 'pending_deposit')`
+        await connection.execute('DELETE FROM transactions WHERE id = ?', [req.params.id]);
+
+        if (txRows.length > 0) {
+            await recalculateAndSaveBalance(connection, txRows[0].user_id);
+        }
+
+        await connection.commit();
+        res.json({ message: 'Transacción eliminada y balance actualizado' });
+    } catch (error) {
+        await connection.rollback();
+        res.status(500).json({ error: 'Error interno' });
+    } finally {
+        connection.release();
+    }
+};
+
+// POST /api/admin/investments/:id/cancel — Admin cancela cualquier inversión
+exports.adminCancelInvestment = async (req, res) => {
+    const connection = await pool.getConnection();
+    try {
+        await connection.beginTransaction();
+
+        const invId = req.params.id;
+        const { reason } = req.body;
+
+        const [invRows] = await connection.execute(
+            `SELECT * FROM investments WHERE id = ? AND status IN ('active', 'pending_deposit')`,
+            [invId]
         );
-        const totalInvestors = parseInt(usersRows[0].count);
+        if (!invRows.length) {
+            return res.status(404).json({ error: 'Inversión no encontrada o ya completada/cancelada' });
+        }
+        const inv = invRows[0];
 
-        // 3. Calcular APY real basado en rendimientos pagados
-        // APY = ((1 + tasa_mensual_promedio)^12 - 1) × 100
-        const [returnsRows] = await pool.execute(
-            `SELECT AVG(rate_applied) as avgMonthlyRate, 
-                    SUM(amount_earned) as totalEarned,
-                    COUNT(*) as totalPayments
-             FROM investment_returns WHERE status = 'paid'`
+        // Cambiar a cancelled
+        await connection.execute(
+            `UPDATE investments SET status = 'cancelled', notes = CONCAT(IFNULL(notes,''), ' | ADMIN CANCEL: ${(reason || 'Sin motivo').replace(/'/g, "''")}') WHERE id = ?`,
+            [invId]
         );
-        const avgMonthlyRate = parseFloat(returnsRows[0].avgMonthlyRate) || 0;
-        const totalEarnedGlobal = parseFloat(returnsRows[0].totalEarned) || 0;
-        const totalPayments = parseInt(returnsRows[0].totalPayments) || 0;
 
-        // APY compuesto: ((1 + r/100)^12 - 1) × 100
-        const apyReal = avgMonthlyRate > 0 
-            ? ((Math.pow(1 + avgMonthlyRate / 100, 12) - 1) * 100).toFixed(1)
-            : 0;
+        // Eliminar transacciones de inversión asociadas
+        await connection.execute(
+            `DELETE FROM transactions WHERE investment_id = ? AND type = 'investment'`,
+            [invId]
+        );
 
-        // APY rango (basado en min 2% y max 4% mensual)
-        const apyMin = ((Math.pow(1.02, 12) - 1) * 100).toFixed(1); // ~26.8%
-        const apyMax = ((Math.pow(1.04, 12) - 1) * 100).toFixed(1); // ~60.1%
+        // Recalcular balance del usuario
+        await recalculateAndSaveBalance(connection, inv.user_id);
 
-        res.json({
-            totalLocked,
-            totalActiveInvestments,
-            totalInvestors,
-            avgMonthlyRate: parseFloat(avgMonthlyRate.toFixed(2)),
-            apyReal: parseFloat(apyReal),
-            apyMin: parseFloat(apyMin),
-            apyMax: parseFloat(apyMax),
-            totalEarnedGlobal,
-            totalPayments,
+        await connection.commit();
+        res.json({ message: 'Inversión cancelada por admin. Capital devuelto al usuario.', userId: inv.user_id, amount: parseFloat(inv.amount) });
+    } catch (error) {
+        await connection.rollback();
+        console.error('Error admin cancel investment:', error);
+        res.status(500).json({ error: 'Error interno' });
+    } finally {
+        connection.release();
+    }
+};
+
+// POST /api/admin/users/:id/toggle-block — Bloquear/Desbloquear usuario
+exports.toggleBlockUser = async (req, res) => {
+    try {
+        const userId = req.params.id;
+        const { reason } = req.body;
+
+        const [userRows] = await pool.execute(`SELECT id, status, role FROM users WHERE id = ?`, [userId]);
+        if (!userRows.length) return res.status(404).json({ error: 'Usuario no encontrado' });
+        if (userRows[0].role === 'admin') return res.status(400).json({ error: 'No se puede bloquear a un administrador' });
+
+        const currentStatus = userRows[0].status;
+        const newStatus = currentStatus === 'blocked' ? 'active' : 'blocked';
+
+        await pool.execute(`UPDATE users SET status = ? WHERE id = ?`, [newStatus, userId]);
+
+        // Si se bloquea, invalidar sesiones (opcional: se podría agregar columna blocked_at)
+        if (newStatus === 'blocked' && reason) {
+            await pool.execute(
+                `UPDATE users SET notes = CONCAT(IFNULL(notes,''), '\nBLOQUEADO: ${reason.replace(/'/g, "''")} — ${new Date().toISOString().slice(0,16)}') WHERE id = ?`,
+                [userId]
+            );
+        }
+
+        res.json({ message: `Usuario ${newStatus === 'blocked' ? 'bloqueado' : 'desbloqueado'}`, status: newStatus });
+    } catch (error) {
+        console.error('Error toggle block:', error);
+        res.status(500).json({ error: 'Error interno' });
+    }
+};
+
+// ══════════════════════════════════════════════════════════════
+// POST /api/admin/loans/create — Crear préstamo directo (sin solicitud previa)
+// ══════════════════════════════════════════════════════════════
+exports.adminCreateLoan = async (req, res) => {
+    const connection = await pool.getConnection();
+    try {
+        await connection.beginTransaction();
+
+        const { userId, amount, termMonths, monthlyRate, purpose, notes, startDate } = req.body;
+
+        if (!userId || !amount || !termMonths || !monthlyRate)
+            return res.status(400).json({ error: 'userId, amount, termMonths y monthlyRate son requeridos' });
+
+        const parsedAmount = parseFloat(amount);
+        const parsedRate   = parseFloat(monthlyRate);
+        const parsedTerm   = parseInt(termMonths);
+
+        if (parsedAmount < 100000) return res.status(400).json({ error: 'Monto mínimo: $100.000 COP' });
+        if (parsedRate < 1 || parsedRate > 20) return res.status(400).json({ error: 'Tasa entre 1% y 20%' });
+
+        const [userRows] = await connection.execute(`SELECT id, full_name FROM users WHERE id = ?`, [userId]);
+        if (!userRows.length) return res.status(404).json({ error: 'Usuario no encontrado' });
+
+        const loanStart = startDate ? new Date(startDate) : new Date();
+        const dueDate   = new Date(loanStart);
+        dueDate.setMonth(dueDate.getMonth() + parsedTerm);
+        const fmt = d => d.toISOString().slice(0, 10);
+
+        const refId = 'LADM-' + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2, 5).toUpperCase();
+
+        // Insertar directamente como 'active' en loan_requests
+        const [result] = await connection.execute(
+            `INSERT INTO loan_requests
+             (user_id, amount, term_months, purpose, credit_score, status, ref_id,
+              approved_amount, approved_rate, monthly_rate, start_date, due_date, admin_notes, processed_at, processed_by)
+             VALUES (?, ?, ?, ?, 999, 'active', ?, ?, ?, ?, ?, ?, ?, NOW(), ?)`,
+            [
+                userId, parsedAmount, parsedTerm,
+                purpose || `Préstamo ${parsedTerm} mes${parsedTerm > 1 ? 'es' : ''} — Admin`,
+                refId,
+                parsedAmount, parsedRate, parsedRate,
+                fmt(loanStart), fmt(dueDate),
+                notes || 'Creado directamente por administrador',
+                req.user?.id || null
+            ]
+        );
+
+        // Registrar transacción que acredita al balance
+        await connection.execute(
+            `INSERT INTO transactions (user_id, type, amount, description, ref_id, created_at)
+             VALUES (?, 'loan', ?, ?, ?, ?)`,
+            [
+                userId, parsedAmount,
+                purpose || `Préstamo SANSE — ${parsedTerm} mes${parsedTerm > 1 ? 'es' : ''} al ${parsedRate}% mensual`,
+                refId,
+                fmt(loanStart)
+            ]
+        );
+
+        // Recalcular balance
+        const [inRows]  = await connection.execute(`SELECT COALESCE(SUM(amount),0) as total FROM transactions WHERE user_id = ? AND type IN ('deposit','payment','interest','profit','investment_return','investment_withdrawal','loan')`, [userId]);
+        const [outRows] = await connection.execute(`SELECT COALESCE(SUM(amount),0) as total FROM transactions WHERE user_id = ? AND type IN ('withdraw')`, [userId]);
+        const newBalance = parseFloat(inRows[0].total) - parseFloat(outRows[0].total);
+        await connection.execute(`UPDATE users SET balance = ? WHERE id = ?`, [newBalance, userId]);
+
+        await connection.commit();
+
+        res.status(201).json({
+            message: `Préstamo de $${parsedAmount.toLocaleString('es-CO')} COP creado para ${userRows[0].full_name}`,
+            loan: { id: result.insertId, refId, amount: parsedAmount, termMonths: parsedTerm, monthlyRate: parsedRate, dueDate: fmt(dueDate) }
         });
     } catch (error) {
-        console.error('Error global stats:', error);
+        await connection.rollback();
+        console.error('Error adminCreateLoan:', error);
+        res.status(500).json({ error: 'Error interno: ' + error.message });
+    } finally {
+        connection.release();
+    }
+};
+
+// ══════════════════════════════════════════════════════════════
+// POST /api/admin/users/:id/edit — Editar datos + contraseña + referido
+// ══════════════════════════════════════════════════════════════
+exports.editUser = async (req, res) => {
+    try {
+        const userId = req.params.id;
+        const { fullName, email, phone, documentNumber, role, status, password, referredBy } = req.body;
+
+        if (!fullName || !email)
+            return res.status(400).json({ error: 'Nombre y email son obligatorios' });
+
+        const [userRows] = await pool.execute(`SELECT id FROM users WHERE id = ?`, [userId]);
+        if (!userRows.length) return res.status(404).json({ error: 'Usuario no encontrado' });
+
+        const [emailCheck] = await pool.execute(`SELECT id FROM users WHERE email = ? AND id != ?`, [email.toLowerCase().trim(), userId]);
+        if (emailCheck.length) return res.status(400).json({ error: 'Ese email ya está en uso' });
+
+        let referrerId = null;
+        if (referredBy && referredBy !== '' && referredBy !== 'none') {
+            const ref = parseInt(referredBy);
+            if (!isNaN(ref) && ref !== parseInt(userId)) referrerId = ref;
+        }
+
+        const fields = ['full_name=?','email=?','phone=?','document_number=?','role=?','status=?','referred_by=?'];
+        const values = [
+            fullName.trim(), email.toLowerCase().trim(),
+            phone||null, documentNumber||null,
+            role||'client', status||'active',
+            referredBy === 'none' || referredBy === '' ? null : referrerId
+        ];
+
+        if (password && password.length >= 8) {
+            const bcrypt = require('bcryptjs');
+            fields.push('password_hash=?');
+            values.push(await bcrypt.hash(password, 12));
+        }
+
+        values.push(userId);
+        await pool.execute(`UPDATE users SET ${fields.join(',')} WHERE id = ?`, values);
+
+        res.json({ message: 'Usuario actualizado correctamente' });
+    } catch (error) {
+        console.error('Error editUser:', error);
         res.status(500).json({ error: 'Error interno del servidor' });
     }
 };
