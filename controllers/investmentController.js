@@ -6,8 +6,8 @@ exports.getAvailableProducts = async (req, res) => {
     try {
         const products = [
             {
-                id: 'sdtc_3m',
-                name: 'SDTC 3 Meses',
+                id: 'cdtc_3m',
+                name: 'CDTC 3 Meses',
                 durationMonths: 3,
                 minMonthlyRate: 2.0,
                 maxMonthlyRate: 3.0,
@@ -15,8 +15,8 @@ exports.getAvailableProducts = async (req, res) => {
                 features: ['Plazo fijo de 3 meses', 'Rendimiento mensual variable 2% — 3%', 'Capital bloqueado hasta vencimiento'],
             },
             {
-                id: 'sdtc_6m',
-                name: 'SDTC 6 Meses',
+                id: 'cdtc_6m',
+                name: 'CDTC 6 Meses',
                 durationMonths: 6,
                 minMonthlyRate: 2.0,
                 maxMonthlyRate: 4.0,
@@ -24,8 +24,8 @@ exports.getAvailableProducts = async (req, res) => {
                 features: ['Plazo fijo de 6 meses', 'Rendimiento mensual variable 2% — 4%', 'Capital bloqueado hasta vencimiento'],
             },
             {
-                id: 'sdtc_12m',
-                name: 'SDTC 12 Meses',
+                id: 'cdtc_12m',
+                name: 'CDTC 12 Meses',
                 durationMonths: 12,
                 minMonthlyRate: 3.0,
                 maxMonthlyRate: 4.0,
@@ -40,7 +40,7 @@ exports.getAvailableProducts = async (req, res) => {
     }
 };
 
-// POST /api/investments/create — Usuario crea inversión SDTC desde su balance disponible
+// POST /api/investments/create — Usuario crea inversión CDTC desde su balance disponible
 exports.createUserInvestment = async (req, res) => {
     const connection = await pool.getConnection();
     try {
@@ -56,26 +56,26 @@ exports.createUserInvestment = async (req, res) => {
 
         // Configuración por plan
         const PLANS = {
-            sdtc_3m:  { durationMonths: 3,  minRate: 2.0, maxRate: 3.0 },
-            sdtc_6m:  { durationMonths: 6,  minRate: 2.0, maxRate: 4.0 },
-            sdtc_12m: { durationMonths: 12, minRate: 3.0, maxRate: 4.0 },
+            cdtc_3m:  { durationMonths: 3,  minRate: 2.0, maxRate: 3.0 },
+            cdtc_6m:  { durationMonths: 6,  minRate: 2.0, maxRate: 4.0 },
+            cdtc_12m: { durationMonths: 12, minRate: 3.0, maxRate: 4.0 },
         };
         const plan = PLANS[productId];
         if (!plan) {
-            return res.status(400).json({ error: 'Producto no disponible. Usa: sdtc_3m, sdtc_6m o sdtc_12m' });
+            return res.status(400).json({ error: 'Producto no disponible. Usa: cdtc_3m, cdtc_6m o cdtc_12m' });
         }
         const { durationMonths, minRate, maxRate } = plan;
         if (amount < 100000 || !isFinite(amount)) {
             return res.status(400).json({ error: 'Monto mínimo de inversión: $100.000 COP' });
         }
 
-        // Verificar máximo 3 SDTC activas por usuario
+        // Verificar máximo 3 CDTC activas por usuario
         const [activeCountRows] = await connection.execute(
             `SELECT COUNT(*) as c FROM investments WHERE user_id = ? AND status IN ('active', 'pending_deposit')`,
             [userId]
         );
         if (activeCountRows[0].c >= 3) {
-            return res.status(400).json({ error: 'Máximo 3 inversiones SDTC activas permitidas. Espera a que una termine o retírala para crear otra.' });
+            return res.status(400).json({ error: 'Máximo 3 inversiones CDTC activas permitidas. Espera a que una termine o retírala para crear otra.' });
         }
 
         // 1. Calcular balance disponible del usuario
@@ -124,7 +124,7 @@ exports.createUserInvestment = async (req, res) => {
             `INSERT INTO investments 
              (user_id, type, amount, annual_rate, duration_months, min_monthly_rate, max_monthly_rate, 
               start_date, end_date, lock_end_date, invested_from_balance, status, notes) 
-             VALUES (?, 'SDTC', ?, 0, ?, ?, ?, ?, ?, ?, 1, 'pending_deposit', ?)`,
+             VALUES (?, 'CDTC', ?, 0, ?, ?, ?, ?, ?, ?, 1, 'pending_deposit', ?)`,
             [
                 userId,
                 amount,
@@ -134,7 +134,7 @@ exports.createUserInvestment = async (req, res) => {
                 formatDate(startDate),
                 formatDate(endDate),
                 formatDate(lockEndDate),
-                `Inversión SDTC ${durationMonths}m — Período de depósito hasta: ${depositDeadline.toISOString().slice(0,16).replace('T',' ')}. Desbloqueo: ${formatDate(lockEndDate)}`,
+                `Inversión CDTC ${durationMonths}m — Período de depósito hasta: ${depositDeadline.toISOString().slice(0,16).replace('T',' ')}. Desbloqueo: ${formatDate(lockEndDate)}`,
             ]
         );
 
@@ -147,7 +147,7 @@ exports.createUserInvestment = async (req, res) => {
         await connection.execute(
             `INSERT INTO transactions (user_id, investment_id, type, amount, description, ref_id, created_at) 
              VALUES (?, ?, 'investment', ?, ?, ?, NOW())`,
-            [userId, investmentId, amount, `Inversión SDTC a ${durationMonths} meses — Desbloqueo: ${formatDate(lockEndDate)}`, refId]
+            [userId, investmentId, amount, `Inversión CDTC a ${durationMonths} meses — Desbloqueo: ${formatDate(lockEndDate)}`, refId]
         );
 
         // 6. Audit log
@@ -156,17 +156,17 @@ exports.createUserInvestment = async (req, res) => {
             action: 'create_investment',
             entityType: 'investment',
             entityId: investmentId,
-            details: { type: 'SDTC', amount, durationMonths, lockEndDate: formatDate(lockEndDate) },
+            details: { type: 'CDTC', amount, durationMonths, lockEndDate: formatDate(lockEndDate) },
             ipAddress: req.ip,
         });
 
         await connection.commit();
 
         res.status(201).json({
-            message: `Inversión SDTC a ${durationMonths} meses creada. Tienes 12 horas para confirmar o cancelar.`,
+            message: `Inversión CDTC a ${durationMonths} meses creada. Tienes 12 horas para confirmar o cancelar.`,
             investment: {
                 id: investmentId,
-                type: 'SDTC',
+                type: 'CDTC',
                 amount,
                 durationMonths,
                 startDate: formatDate(startDate),
@@ -356,7 +356,7 @@ exports.addCapitalToInvestment = async (req, res) => {
         await connection.execute(
             `INSERT INTO transactions (user_id, investment_id, type, amount, description, ref_id, created_at) 
              VALUES (?, ?, 'investment', ?, ?, ?, NOW())`,
-            [userId, investmentId, amount, `Capital adicional SDTC #${investmentId} — Mismo vencimiento: ${lockDateStr}`, refId]
+            [userId, investmentId, amount, `Capital adicional CDTC #${investmentId} — Mismo vencimiento: ${lockDateStr}`, refId]
         );
 
         // 6. Audit log
@@ -444,7 +444,7 @@ exports.withdrawInvestment = async (req, res) => {
         await connection.execute(
             `INSERT INTO transactions (user_id, investment_id, type, amount, description, ref_id, created_at) 
              VALUES (?, ?, 'investment_withdrawal', ?, ?, ?, NOW())`,
-            [userId, investmentId, capitalAmount, `Retiro inversión SDTC #${investmentId} — Capital liberado`, refId]
+            [userId, investmentId, capitalAmount, `Retiro inversión CDTC #${investmentId} — Capital liberado`, refId]
         );
 
         // 6. Audit log
@@ -663,10 +663,10 @@ exports.getBalanceSummary = async (req, res) => {
     }
 };
 
-// GET /api/investments/global-stats — Estadísticas globales de SDTC (público para usuarios)
+// GET /api/investments/global-stats — Estadísticas globales de CDTC (público para usuarios)
 exports.getGlobalStats = async (req, res) => {
     try {
-        // 1. Total capital bloqueado en SDTC activas (todos los usuarios)
+        // 1. Total capital bloqueado en CDTC activas (todos los usuarios)
         const [lockedRows] = await pool.execute(
             `SELECT COALESCE(SUM(amount), 0) as total, COUNT(*) as count 
              FROM investments WHERE status IN ('active', 'pending_deposit')`

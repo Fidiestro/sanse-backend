@@ -255,7 +255,7 @@ async function processReferralCommission(referredUserId, sourceType, sourceId, a
         // Crear transacción para el referidor
         await db.execute(
             `INSERT INTO transactions (user_id, type, amount, description, ref_id, created_at) VALUES (?, 'profit', ?, ?, ?, NOW())`,
-            [referrerId, commissionAmount, `Comisión referido (5% de ${sourceType === 'investment_return' ? 'rendimiento SDTC' : 'intereses préstamo'})`, refId]
+            [referrerId, commissionAmount, `Comisión referido (5% de ${sourceType === 'investment_return' ? 'rendimiento CDTC' : 'intereses préstamo'})`, refId]
         );
 
         // Recalcular balance del referidor
