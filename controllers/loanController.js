@@ -360,6 +360,11 @@ exports.payLoan = async (req, res) => {
         const monthlyInterest  = Math.round(capital * (loanRate / 100));
         const interestPortion  = Math.min(amount, monthlyInterest);
 
+        // Calcular nuevo capital pendiente tras el abono
+        const capitalPortion   = Math.max(0, amount - interestPortion);
+        const newCapital       = Math.max(0, capital - capitalPortion);
+        const isFullyPaid      = newCapital <= 0;
+
         // Comisión de referido
         let referralCommission = 0;
         let referrerId         = null;
@@ -390,12 +395,19 @@ exports.payLoan = async (req, res) => {
             );
         }
 
-        // FIX: nota de abono como parámetro ?, no interpolada en SQL
+        // Actualizar capital pendiente y estado del préstamo
         const abonoNote = ` | ABONO $${Math.round(amount).toLocaleString('es-CO')} ${new Date().toISOString().slice(0, 10)} ref:${refId}`;
-        await connection.execute(
-            `UPDATE loan_requests SET admin_notes = CONCAT(IFNULL(admin_notes,''), ?) WHERE id = ?`,
-            [abonoNote, loanId]
-        );
+        if (isFullyPaid) {
+            await connection.execute(
+                `UPDATE loan_requests SET approved_amount = 0, status = 'paid', admin_notes = CONCAT(IFNULL(admin_notes,''), ?), processed_at = NOW() WHERE id = ?`,
+                [abonoNote + ' | PAGADO COMPLETO', loanId]
+            );
+        } else {
+            await connection.execute(
+                `UPDATE loan_requests SET approved_amount = ?, admin_notes = CONCAT(IFNULL(admin_notes,''), ?) WHERE id = ?`,
+                [newCapital, abonoNote, loanId]
+            );
+        }
 
         // Recalcular balance usuario
         const [inRows]  = await connection.execute(`SELECT COALESCE(SUM(amount), 0) as total FROM transactions WHERE user_id = ? AND type IN ('deposit','payment','interest','profit','investment_return','investment_withdrawal','loan')`, [userId]);
@@ -423,11 +435,13 @@ exports.payLoan = async (req, res) => {
             `💳 *ABONO A PRÉSTAMO — Sanse Capital*\n\n` +
             `👤 *${userRows[0]?.full_name || 'Usuario'}*\n` +
             `💰 Abono: *$${Math.round(amount).toLocaleString('es-CO')} COP*\n` +
-            `🏦 Préstamo: ${loan.ref_id} — Capital: $${Math.round(capital).toLocaleString('es-CO')}\n` +
+            `🏦 Préstamo: ${loan.ref_id} — Capital anterior: $${Math.round(capital).toLocaleString('es-CO')}\n` +
+            `📉 Capital pendiente: $${Math.round(newCapital).toLocaleString('es-CO')} COP\n` +
+            `${isFullyPaid ? '✅ *PRÉSTAMO PAGADO COMPLETAMENTE*\n' : ''}` +
             `🔖 Ref abono: ${refId}`
         );
 
-        res.json({ message: 'Abono registrado exitosamente', payment: { amount, refId, newBalance } });
+        res.json({ message: isFullyPaid ? '¡Préstamo pagado completamente!' : 'Abono registrado exitosamente', payment: { amount, refId, newBalance, remainingCapital: newCapital, isFullyPaid } });
     } catch (error) {
         await connection.rollback();
         console.error('Error abonando préstamo:', error);
