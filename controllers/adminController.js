@@ -536,3 +536,5 @@ exports.editUser = async (req, res) => {
         res.status(500).json({ error: 'Error interno del servidor' });
     }
 };
+
+// QUe esta pasado
