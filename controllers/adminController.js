@@ -507,10 +507,14 @@ exports.editUser = async (req, res) => {
         const [emailCheck] = await pool.execute(`SELECT id FROM users WHERE email = ? AND id != ?`, [email.toLowerCase().trim(), userId]);
         if (emailCheck.length) return res.status(400).json({ error: 'Ese email ya está en uso' });
 
+        // Calcular referrerId de forma robusta:
+        // null / undefined / 'none' / '' → limpiar referido
+        // número o string numérico → asignar ese ID (si no es el mismo usuario)
         let referrerId = null;
-        if (referredBy && referredBy !== '' && referredBy !== 'none') {
-            const ref = parseInt(referredBy);
-            if (!isNaN(ref) && ref !== parseInt(userId)) referrerId = ref;
+        const refRaw = referredBy;
+        if (refRaw !== null && refRaw !== undefined && refRaw !== 'none' && refRaw !== '') {
+            const ref = parseInt(refRaw, 10);
+            if (!isNaN(ref) && ref > 0 && ref !== parseInt(userId)) referrerId = ref;
         }
 
         const fields = ['full_name=?', 'email=?', 'phone=?', 'document_number=?', 'role=?', 'status=?', 'referred_by=?'];
@@ -518,7 +522,7 @@ exports.editUser = async (req, res) => {
             fullName.trim(), email.toLowerCase().trim(),
             phone || null, documentNumber || null,
             role || 'client', status || 'active',
-            referredBy === 'none' || referredBy === '' ? null : referrerId
+            referrerId   // ya es null o el ID entero correcto
         ];
 
         if (password && password.length >= 8) {

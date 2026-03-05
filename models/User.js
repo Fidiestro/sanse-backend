@@ -61,7 +61,7 @@ class User {
 
     static async findAll({ page = 1, limit = 20, role } = {}) {
         const offset = (page - 1) * limit;
-        let query = `SELECT id, email, full_name, phone, role, is_active, created_at FROM users WHERE is_active = 1`;
+        let query = `SELECT id, email, full_name, phone, role, is_active, status, document_number, referred_by, referral_code, created_at FROM users WHERE is_active = 1`;
         const params = [];
         if (role) { query += ' AND role = ?'; params.push(role); }
         query += ` ORDER BY created_at DESC LIMIT ${parseInt(limit)} OFFSET ${parseInt(offset)}`;
