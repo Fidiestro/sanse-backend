@@ -1,3 +1,7 @@
+// ══════════════════════════════════════════════════════════════
+// controllers/dashboardController.js — Sanse Capital
+// FIX: Consulta loan_requests (tabla real) en vez de loans (no existe)
+// ══════════════════════════════════════════════════════════════
 const { pool } = require('../config/database');
 
 exports.getSummary = async (req, res) => {
@@ -35,18 +39,20 @@ exports.getSummary = async (req, res) => {
             [userId]
         );
 
-        // 5. Préstamos activos
+        // 5. Préstamos activos — FIX: usa loan_requests (tabla real del sistema)
         let loans = [];
         try {
             const [loanRows] = await pool.execute(
-                `SELECT id, amount, monthly_rate, start_date, status 
-                 FROM loans WHERE user_id = ? AND status = 'active'`,
+                `SELECT id, amount, approved_amount, monthly_rate, start_date, due_date, status, ref_id
+                 FROM loan_requests WHERE user_id = ? AND status IN ('active', 'overdue')`,
                 [userId]
             );
             loans = loanRows;
-        } catch (e) {}
+        } catch (e) {
+            console.error('Error consultando préstamos para dashboard:', e.message);
+        }
 
-        // Cálculos — AHORA incluye investment_return como ganancia
+        // Cálculos — incluye investment_return como ganancia
         const totalInvested = investments.reduce((sum, i) => sum + parseFloat(i.amount), 0);
         const totalProfit = transactions
             .filter(t => t.type === 'profit' || t.type === 'interest' || t.type === 'investment_return')
@@ -86,9 +92,16 @@ exports.getSummary = async (req, res) => {
             balanceHistory: balanceHistory.map(b => ({
                 amount: parseFloat(b.amount), date: b.snapshot_date,
             })),
+            // FIX: Mapeo correcto con campos de loan_requests
             loans: loans.map(l => ({
-                id: l.id, amount: parseFloat(l.amount),
-                monthlyRate: parseFloat(l.monthly_rate), date: l.start_date, status: l.status,
+                id: l.id,
+                amount: parseFloat(l.amount),
+                pendingAmount: l.approved_amount !== null ? parseFloat(l.approved_amount) : parseFloat(l.amount),
+                monthlyRate: parseFloat(l.monthly_rate || 0),
+                date: l.start_date,
+                dueDate: l.due_date,
+                status: l.status,
+                refId: l.ref_id,
             })),
         });
     } catch (error) {

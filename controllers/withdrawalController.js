@@ -1,49 +1,91 @@
 // ══════════════════════════════════════════════════════════════
 // controllers/withdrawalController.js — Sanse Capital
-// FIX: adminProcessWithdrawal 'complete' ahora incluye 'loan' e
-//      'investment_withdrawal' en el recálculo de balance, igual
-//      que loanController.js — corrige saldo incorrecto tras retiro.
+// FIXES:
+//  1. Usa balanceHelper centralizado
+//  2. Agrega métodos faltantes: getPaymentMethods, createPaymentMethod,
+//     deletePaymentMethod, createWithdrawalRequest (aliases)
 // ══════════════════════════════════════════════════════════════
 const { pool }   = require('../config/database');
 const { notify } = require('../utils/telegram');
+const { recalculateAndSaveBalance } = require('../utils/balanceHelper');
 
 // ══════════════════════════════════════════════════════════════
-// Helper compartido: recalcular balance de un usuario
-// Incluye TODOS los tipos de ingreso para consistencia
+// MÉTODOS DE PAGO — Requeridos por routes/withdrawals.js
+// FIX: Estos métodos no existían, causando crash al cargar rutas
 // ══════════════════════════════════════════════════════════════
-async function recalcBalance(connection, userId) {
-    const [inRows] = await connection.execute(
-        `SELECT COALESCE(SUM(amount), 0) as total FROM transactions
-         WHERE user_id = ? AND type IN ('deposit','payment','interest','profit',
-                                        'investment_return','investment_withdrawal','loan')`,
-        [userId]
-    );
-    const [outRows] = await connection.execute(
-        `SELECT COALESCE(SUM(amount), 0) as total FROM transactions
-         WHERE user_id = ? AND type IN ('withdraw')`,
-        [userId]
-    );
-    const newBalance = Math.max(0, parseFloat(inRows[0].total) - parseFloat(outRows[0].total));
-    const today = new Date().toISOString().slice(0, 10);
-    const [existing] = await connection.execute(
-        `SELECT id FROM balance_history WHERE user_id = ? AND snapshot_date = ?`, [userId, today]
-    );
-    if (existing.length) {
-        await connection.execute(
-            `UPDATE balance_history SET amount = ? WHERE user_id = ? AND snapshot_date = ?`,
-            [newBalance, userId, today]
+
+// GET /api/withdrawals/payment-methods
+exports.getPaymentMethods = async (req, res) => {
+    try {
+        const [rows] = await pool.execute(
+            `SELECT id, bank_name, account_number, account_type, account_holder, is_default, created_at
+             FROM payment_methods WHERE user_id = ? AND is_active = 1 ORDER BY is_default DESC, created_at DESC`,
+            [req.user.id]
         );
-    } else {
-        await connection.execute(
-            `INSERT INTO balance_history (user_id, amount, snapshot_date) VALUES (?, ?, ?)`,
-            [userId, newBalance, today]
-        );
+        res.json(rows);
+    } catch (error) {
+        // Si la tabla no existe aún, devolver array vacío
+        if (error.code === 'ER_NO_SUCH_TABLE') {
+            return res.json([]);
+        }
+        console.error('Error getPaymentMethods:', error);
+        res.status(500).json({ error: 'Error interno del servidor' });
     }
-    return newBalance;
-}
+};
+
+// POST /api/withdrawals/payment-methods
+exports.createPaymentMethod = async (req, res) => {
+    try {
+        const { bankName, accountNumber, accountType, accountHolder, isDefault } = req.body;
+        if (!bankName || !accountNumber || !accountHolder) {
+            return res.status(400).json({ error: 'Banco, número de cuenta y titular son requeridos' });
+        }
+
+        // Si es default, quitar default de los demás
+        if (isDefault) {
+            await pool.execute(
+                `UPDATE payment_methods SET is_default = 0 WHERE user_id = ?`,
+                [req.user.id]
+            );
+        }
+
+        const [result] = await pool.execute(
+            `INSERT INTO payment_methods (user_id, bank_name, account_number, account_type, account_holder, is_default)
+             VALUES (?, ?, ?, ?, ?, ?)`,
+            [req.user.id, bankName, accountNumber, accountType || 'savings', accountHolder, isDefault ? 1 : 0]
+        );
+
+        res.status(201).json({ message: 'Método de pago creado', id: result.insertId });
+    } catch (error) {
+        if (error.code === 'ER_NO_SUCH_TABLE') {
+            return res.status(500).json({ error: 'Tabla payment_methods no configurada. Contacta al administrador.' });
+        }
+        console.error('Error createPaymentMethod:', error);
+        res.status(500).json({ error: 'Error interno del servidor' });
+    }
+};
+
+// DELETE /api/withdrawals/payment-methods/:id
+exports.deletePaymentMethod = async (req, res) => {
+    try {
+        const [result] = await pool.execute(
+            `UPDATE payment_methods SET is_active = 0 WHERE id = ? AND user_id = ?`,
+            [req.params.id, req.user.id]
+        );
+        if (result.affectedRows === 0) {
+            return res.status(404).json({ error: 'Método de pago no encontrado' });
+        }
+        res.json({ message: 'Método de pago eliminado' });
+    } catch (error) {
+        console.error('Error deletePaymentMethod:', error);
+        res.status(500).json({ error: 'Error interno del servidor' });
+    }
+};
 
 // ══════════════════════════════════════════════════════════════
 // POST /api/withdrawals/request
+// FIX: También exportado como createWithdrawalRequest (alias)
+//      para que routes/withdrawals.js funcione correctamente
 // ══════════════════════════════════════════════════════════════
 exports.requestWithdrawal = async (req, res) => {
     try {
@@ -117,6 +159,9 @@ exports.requestWithdrawal = async (req, res) => {
     }
 };
 
+// FIX: Alias para compatibilidad con routes/withdrawals.js
+exports.createWithdrawalRequest = exports.requestWithdrawal;
+
 // ══════════════════════════════════════════════════════════════
 // GET /api/withdrawals/my
 // ══════════════════════════════════════════════════════════════
@@ -167,9 +212,7 @@ exports.adminGetWithdrawals = async (req, res) => {
 
 // ══════════════════════════════════════════════════════════════
 // ADMIN: POST /api/admin/withdrawals/:id/process
-// FIX: Al completar un retiro, el recálculo de balance ahora
-//      incluye 'loan' e 'investment_withdrawal' en los inflows,
-//      igual que en loanController.js — evita saldo incorrecto.
+// FIX: Usa balanceHelper centralizado
 // ══════════════════════════════════════════════════════════════
 exports.adminProcessWithdrawal = async (req, res) => {
     const connection = await pool.getConnection();
@@ -212,7 +255,6 @@ exports.adminProcessWithdrawal = async (req, res) => {
             if (wr.status !== 'approved')
                 return res.status(400).json({ error: 'Solo se pueden completar solicitudes aprobadas' });
 
-            // Registrar la transacción de retiro
             const refId = 'WC-' + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2, 5).toUpperCase();
             await connection.execute(
                 `INSERT INTO transactions (user_id, type, amount, description, ref_id, created_at)
@@ -226,8 +268,8 @@ exports.adminProcessWithdrawal = async (req, res) => {
                 [notes || null, req.user.id, withdrawalId]
             );
 
-            // FIX: Recálculo completo con todos los tipos de ingreso incluyendo 'loan' e 'investment_withdrawal'
-            const newBalance = await recalcBalance(connection, wr.user_id);
+            // FIX: Usa balanceHelper centralizado
+            const newBalance = await recalculateAndSaveBalance(connection, wr.user_id);
 
             const [userRows] = await connection.execute(`SELECT full_name FROM users WHERE id = ?`, [wr.user_id]);
             await notify(

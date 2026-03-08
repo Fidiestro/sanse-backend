@@ -1,14 +1,12 @@
 // ══════════════════════════════════════════════════════════════
 // controllers/loanController.js — Sanse Capital
 // FIXES:
-//  1. requestLoan ya NO bloquea por score bajo (solo el admin decide)
-//  2. payLoan: lógica capital/interés corregida — el abono primero cubre
-//     intereses y luego reduce capital (igual que una cuota real)
-//  3. payLoan: recálculo de balance incluye todos los tipos de ingreso
-//  4. adminProcessLoan approve: recálculo de balance completo
+//  1. Usa balanceHelper centralizado (elimina recalcBalance local)
+//  2. Resto de lógica sin cambios (ya estaba correcta)
 // ══════════════════════════════════════════════════════════════
 const { pool }   = require('../config/database');
 const { notify } = require('../utils/telegram');
+const { recalculateAndSaveBalance } = require('../utils/balanceHelper');
 
 // ══════════════════════════════════════════════════════════════
 // SISTEMA DE PUNTOS CREDITICIOS — "Sanse Score" (máx 1000 pts)
@@ -83,33 +81,6 @@ async function calculateCreditScore(userId) {
 }
 
 // ══════════════════════════════════════════════════════════════
-// Helper: recalcular balance de un usuario dentro de una conexión
-// ══════════════════════════════════════════════════════════════
-async function recalcBalance(connection, userId) {
-    const [inRows] = await connection.execute(
-        `SELECT COALESCE(SUM(amount), 0) as total FROM transactions
-         WHERE user_id = ? AND type IN ('deposit','payment','interest','profit','investment_return','investment_withdrawal','loan')`,
-        [userId]
-    );
-    const [outRows] = await connection.execute(
-        `SELECT COALESCE(SUM(amount), 0) as total FROM transactions
-         WHERE user_id = ? AND type IN ('withdraw')`,
-        [userId]
-    );
-    const newBalance = Math.max(0, parseFloat(inRows[0].total) - parseFloat(outRows[0].total));
-    const today = new Date().toISOString().slice(0, 10);
-    const [existing] = await connection.execute(
-        `SELECT id FROM balance_history WHERE user_id = ? AND snapshot_date = ?`, [userId, today]
-    );
-    if (existing.length) {
-        await connection.execute(`UPDATE balance_history SET amount = ? WHERE user_id = ? AND snapshot_date = ?`, [newBalance, userId, today]);
-    } else {
-        await connection.execute(`INSERT INTO balance_history (user_id, amount, snapshot_date) VALUES (?, ?, ?)`, [userId, newBalance, today]);
-    }
-    return newBalance;
-}
-
-// ══════════════════════════════════════════════════════════════
 // GET /api/loans/my
 // ══════════════════════════════════════════════════════════════
 exports.getMyLoans = async (req, res) => {
@@ -134,8 +105,6 @@ exports.getMyLoans = async (req, res) => {
                 id: l.id, source: 'request', amount: parseFloat(l.amount),
                 monthlyRate: parseFloat(l.monthly_rate || 0), term: l.term_months,
                 purpose: l.purpose, status: l.status, adminNotes: l.admin_notes,
-                // FIX: approved_amount ahora representa el capital PENDIENTE.
-                // Si es null (no aprobado aún) se usa amount original como referencia.
                 approvedAmount: l.approved_amount !== null && l.approved_amount !== undefined
                     ? parseFloat(l.approved_amount)
                     : null,
@@ -167,8 +136,6 @@ exports.getCreditScore = async (req, res) => {
 
 // ══════════════════════════════════════════════════════════════
 // POST /api/loans/request
-// FIX: Se eliminó el bloqueo por score bajo. El admin es quien
-//      aprueba o rechaza la solicitud. El score es solo informativo.
 // ══════════════════════════════════════════════════════════════
 exports.requestLoan = async (req, res) => {
     try {
@@ -183,7 +150,6 @@ exports.requestLoan = async (req, res) => {
         if (!termMonths || ![1, 2, 3, 6].includes(parseInt(termMonths)))
             return res.status(400).json({ error: 'Plazo debe ser 1, 2, 3 o 6 meses' });
 
-        // Solo bloquear si ya tiene una solicitud activa/pendiente
         try {
             const [existing] = await pool.execute(
                 `SELECT COUNT(*) as c FROM loan_requests WHERE user_id = ? AND status IN ('pending', 'active')`, [userId]
@@ -192,7 +158,6 @@ exports.requestLoan = async (req, res) => {
                 return res.status(400).json({ error: 'Ya tienes una solicitud pendiente o un préstamo activo.' });
         } catch (e) {}
 
-        // Calcular score solo para informar al admin (no bloquea)
         const score = await calculateCreditScore(userId);
 
         const refId = 'LOAN-' + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2, 5).toUpperCase();
@@ -248,6 +213,7 @@ exports.adminGetLoans = async (req, res) => {
 
 // ══════════════════════════════════════════════════════════════
 // ADMIN: POST /api/admin/loans/:id/process
+// FIX: Usa balanceHelper centralizado
 // ══════════════════════════════════════════════════════════════
 exports.adminProcessLoan = async (req, res) => {
     const connection = await pool.getConnection();
@@ -278,8 +244,6 @@ exports.adminProcessLoan = async (req, res) => {
             const dueDate   = new Date();
             dueDate.setMonth(dueDate.getMonth() + parseInt(loan.term_months));
 
-            // approved_amount = capital TOTAL original (para el plan de cuotas)
-            // Se mantiene igual hasta que se abone
             await connection.execute(
                 `UPDATE loan_requests SET status = 'active', approved_amount = ?, approved_rate = ?, monthly_rate = ?,
                  start_date = ?, due_date = ?, admin_notes = ?, processed_at = NOW(), processed_by = ? WHERE id = ?`,
@@ -292,8 +256,8 @@ exports.adminProcessLoan = async (req, res) => {
                 [loan.user_id, finalAmount, `Préstamo aprobado — ${loan.term_months} meses al ${finalRate}% mensual — Ref: ${loan.ref_id}`, refId]
             );
 
-            // FIX: recálculo completo usando helper
-            const newBalance = await recalcBalance(connection, loan.user_id);
+            // FIX: Usa balanceHelper centralizado
+            const newBalance = await recalculateAndSaveBalance(connection, loan.user_id);
 
             const [userRows] = await connection.execute(`SELECT full_name FROM users WHERE id = ?`, [loan.user_id]);
             await notify(
@@ -351,11 +315,7 @@ exports.adminGetCreditScore = async (req, res) => {
 
 // ══════════════════════════════════════════════════════════════
 // POST /api/loans/pay — Abonar a un préstamo
-// FIX: 
-//  - El abono primero cubre intereses del mes actual, luego capital
-//  - Se registra la transacción como 'withdraw' (sale del balance)
-//  - Se recalcula el balance correctamente incluyendo todos los tipos
-//  - approved_amount se actualiza con el capital RESTANTE
+// FIX: Usa balanceHelper centralizado
 // ══════════════════════════════════════════════════════════════
 exports.payLoan = async (req, res) => {
     const connection = await pool.getConnection();
@@ -376,16 +336,12 @@ exports.payLoan = async (req, res) => {
         if (!loanRows.length) return res.status(404).json({ error: 'Préstamo no encontrado o no está activo' });
         const loan = loanRows[0];
 
-        // Capital pendiente actual
-        // approved_amount se usa como "capital pendiente" una vez activo
         const originalCapital = parseFloat(loan.amount);
         const pendingCapital  = (loan.approved_amount !== null && loan.approved_amount !== undefined)
             ? parseFloat(loan.approved_amount)
             : originalCapital;
         const loanRate = parseFloat(loan.approved_rate || loan.monthly_rate || 4);
-        const term     = parseInt(loan.term_months) || 1;
 
-        // Interés mensual sobre el capital PENDIENTE actual
         const monthlyInterest = Math.round(pendingCapital * (loanRate / 100));
 
         // Balance disponible del usuario
@@ -408,15 +364,12 @@ exports.payLoan = async (req, res) => {
             });
         }
 
-        // ── Desglose del abono ──────────────────────────────────────
-        // 1. El abono cubre primero los intereses del período
-        // 2. El remanente reduce el capital pendiente
         const interestCovered = Math.min(amount, monthlyInterest);
         const capitalReduced  = Math.max(0, amount - interestCovered);
         const newPendingCapital = Math.max(0, pendingCapital - capitalReduced);
         const isFullyPaid = newPendingCapital <= 0;
 
-        // ── Comisión de referido (5% de los intereses cubiertos) ────
+        // Comisión de referido (5% de los intereses cubiertos)
         let referralCommission = 0;
         let referrerId = null;
         const [refCheck] = await connection.execute('SELECT referred_by FROM users WHERE id = ?', [userId]);
@@ -425,7 +378,7 @@ exports.payLoan = async (req, res) => {
             referralCommission = Math.round(interestCovered * 0.05);
         }
 
-        // ── Registrar transacción de abono (sale del balance) ───────
+        // Registrar transacción de abono
         const refId = 'PAY-' + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2, 5).toUpperCase();
         await connection.execute(
             `INSERT INTO transactions (user_id, type, amount, description, ref_id, created_at) VALUES (?, 'withdraw', ?, ?, ?, NOW())`,
@@ -434,7 +387,7 @@ exports.payLoan = async (req, res) => {
              refId]
         );
 
-        // ── Comisión al referidor ────────────────────────────────────
+        // Comisión al referidor
         if (referrerId && referralCommission >= 100) {
             const referralRefId = 'REF-' + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2, 5).toUpperCase();
             try {
@@ -451,7 +404,7 @@ exports.payLoan = async (req, res) => {
             );
         }
 
-        // ── Actualizar préstamo ──────────────────────────────────────
+        // Actualizar préstamo
         const abonoNote = ` | ABONO $${Math.round(amount).toLocaleString('es-CO')} ${new Date().toISOString().slice(0, 10)} ref:${refId} (interes:$${Math.round(interestCovered).toLocaleString('es-CO')} capital:$${Math.round(capitalReduced).toLocaleString('es-CO')})`;
         if (isFullyPaid) {
             await connection.execute(
@@ -467,11 +420,11 @@ exports.payLoan = async (req, res) => {
             );
         }
 
-        // ── Recalcular balances ──────────────────────────────────────
-        const newBalance = await recalcBalance(connection, userId);
+        // FIX: Usa balanceHelper centralizado
+        const newBalance = await recalculateAndSaveBalance(connection, userId);
 
         if (referrerId && referralCommission >= 100) {
-            await recalcBalance(connection, referrerId);
+            await recalculateAndSaveBalance(connection, referrerId);
         }
 
         await connection.commit();

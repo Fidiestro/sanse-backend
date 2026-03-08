@@ -1,25 +1,42 @@
 // ══════════════════════════════════════════════════════════════
 // controllers/adminController.js — Sanse Capital
+// FIXES:
+//  1. Usa balanceHelper centralizado (fuente única de verdad)
+//  2. getStats ahora incluye TODOS los tipos de ingreso/egreso
+//  3. createTransaction valida tipos de transacción
+//  4. editUser valida que referredBy exista en la DB
+//  5. registerInvestmentReturn usa refId basado en timestamp (sin colisión)
 // ══════════════════════════════════════════════════════════════
 const { pool } = require('../config/database');
 const { auditLog } = require('../utils/helpers');
+const { recalculateAndSaveBalance, isValidTransactionType, INFLOW_TYPES, OUTFLOW_TYPES } = require('../utils/balanceHelper');
 
 // GET /api/admin/stats — Estadísticas generales
+// FIX: Ahora usa los mismos tipos que balanceHelper para consistencia
 exports.getStats = async (req, res) => {
     try {
-        const [balanceRows] = await pool.execute(
-            `SELECT COALESCE(SUM(t.amount),0) as total FROM transactions t WHERE t.type IN ('deposit','payment')`
+        const inflowPlaceholders = INFLOW_TYPES.map(() => '?').join(',');
+        const outflowPlaceholders = OUTFLOW_TYPES.map(() => '?').join(',');
+
+        const [inRows] = await pool.execute(
+            `SELECT COALESCE(SUM(amount), 0) as total FROM transactions WHERE type IN (${inflowPlaceholders})`,
+            [...INFLOW_TYPES]
         );
-        const [withdrawRows] = await pool.execute(
-            `SELECT COALESCE(SUM(amount),0) as total FROM transactions WHERE type = 'withdraw'`
+        const [outRows] = await pool.execute(
+            `SELECT COALESCE(SUM(amount), 0) as total FROM transactions WHERE type IN (${outflowPlaceholders})`,
+            [...OUTFLOW_TYPES]
         );
         const [loanRows] = await pool.execute(
-            `SELECT COALESCE(SUM(amount),0) as total FROM transactions WHERE type = 'loan'`
+            `SELECT COALESCE(SUM(amount), 0) as total FROM transactions WHERE type = 'loan'`
         );
+        const [withdrawRows] = await pool.execute(
+            `SELECT COALESCE(SUM(amount), 0) as total FROM transactions WHERE type = 'withdraw'`
+        );
+
         res.json({
-            totalBalance:    parseFloat(balanceRows[0].total) - parseFloat(withdrawRows[0].total),
+            totalBalance:     parseFloat(inRows[0].total) - parseFloat(outRows[0].total),
             totalWithdrawals: parseFloat(withdrawRows[0].total),
-            totalLoans:      parseFloat(loanRows[0].total),
+            totalLoans:       parseFloat(loanRows[0].total),
         });
     } catch (error) {
         console.error('Error stats:', error);
@@ -60,38 +77,8 @@ exports.createInvestment = async (req, res) => {
     }
 };
 
-// ══════════════════════════════════════════════════
-// Función auxiliar: Recalcular balance de un usuario
-// ══════════════════════════════════════════════════
-async function recalculateAndSaveBalance(connection, userId) {
-    const [inRows] = await connection.execute(
-        `SELECT COALESCE(SUM(amount), 0) as total 
-         FROM transactions 
-         WHERE user_id = ? AND type IN ('deposit', 'payment', 'interest', 'profit', 'investment_return', 'investment_withdrawal')`,
-        [userId]
-    );
-    const [outRows] = await connection.execute(
-        `SELECT COALESCE(SUM(amount), 0) as total FROM transactions WHERE user_id = ? AND type IN ('withdraw')`,
-        [userId]
-    );
-
-    const newBalance = Math.max(0, parseFloat(inRows[0].total) - parseFloat(outRows[0].total));
-    const today = new Date().toISOString().slice(0, 10);
-
-    const [existing] = await connection.execute(
-        `SELECT id FROM balance_history WHERE user_id = ? AND snapshot_date = ?`, [userId, today]
-    );
-
-    if (existing.length > 0) {
-        await connection.execute(`UPDATE balance_history SET amount = ? WHERE user_id = ? AND snapshot_date = ?`, [newBalance, userId, today]);
-    } else {
-        await connection.execute(`INSERT INTO balance_history (user_id, amount, snapshot_date) VALUES (?, ?, ?)`, [userId, newBalance, today]);
-    }
-
-    return newBalance;
-}
-
 // POST /api/admin/transactions — Crear transacción (+ auto actualiza balance_history)
+// FIX: Ahora valida que el tipo de transacción sea reconocido por el sistema
 exports.createTransaction = async (req, res) => {
     const connection = await pool.getConnection();
     try {
@@ -99,6 +86,13 @@ exports.createTransaction = async (req, res) => {
 
         const { userId, type, amount, description, date } = req.body;
         if (!userId || !type || !amount) return res.status(400).json({ error: 'userId, type y amount son requeridos' });
+
+        // FIX: Validar tipo de transacción
+        if (!isValidTransactionType(type)) {
+            return res.status(400).json({
+                error: `Tipo de transacción inválido: "${type}". Tipos válidos: deposit, payment, interest, profit, investment_return, investment_withdrawal, loan, withdraw, investment`,
+            });
+        }
 
         const [countRows] = await connection.execute('SELECT COUNT(*) as c FROM transactions');
         const refId = 'TX-' + String(countRows[0].c + 1).padStart(5, '0');
@@ -110,6 +104,7 @@ exports.createTransaction = async (req, res) => {
             [userId, type, amount, description || '', refId, createdAt]
         );
 
+        // FIX: Usa balanceHelper centralizado
         const newBalance = await recalculateAndSaveBalance(connection, userId);
         await connection.commit();
 
@@ -124,6 +119,7 @@ exports.createTransaction = async (req, res) => {
 };
 
 // POST /api/admin/investments/:investmentId/return — Registrar rendimiento mensual CDTC
+// FIX: refId ahora usa timestamp+random en lugar de COUNT(*) para evitar colisiones
 exports.registerInvestmentReturn = async (req, res) => {
     const connection = await pool.getConnection();
     try {
@@ -165,8 +161,8 @@ exports.registerInvestmentReturn = async (req, res) => {
             [investmentId, investment.user_id, periodMonth, rate, amountEarned, notes || `Rendimiento ${rate}% mes ${periodMonth}${referralCommission ? ' (neto -5% referido)' : ''}`]
         );
 
-        const [countRows] = await connection.execute('SELECT COUNT(*) as c FROM transactions');
-        const refId = 'RET-' + String(countRows[0].c + 1).padStart(5, '0');
+        // FIX: refId basado en timestamp+random (sin colisión por concurrencia)
+        const refId = 'RET-' + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2, 5).toUpperCase();
 
         await connection.execute(
             `INSERT INTO transactions (user_id, investment_id, type, amount, description, ref_id, created_at)
@@ -191,9 +187,11 @@ exports.registerInvestmentReturn = async (req, res) => {
                 `INSERT INTO transactions (user_id, type, amount, description, ref_id, created_at) VALUES (?, 'profit', ?, ?, ?, NOW())`,
                 [referrerId, referralCommission, `Comisión referido — 5% de rendimiento CDTC`, referralRefId]
             );
+            // FIX: Usa balanceHelper centralizado
             await recalculateAndSaveBalance(connection, referrerId);
         }
 
+        // FIX: Usa balanceHelper centralizado
         const newBalance = await recalculateAndSaveBalance(connection, investment.user_id);
         await connection.commit();
 
@@ -268,6 +266,7 @@ exports.recordBalance = async (req, res) => {
 };
 
 // POST /api/admin/recalculate-balance/:userId
+// FIX: Usa balanceHelper centralizado
 exports.recalculateBalance = async (req, res) => {
     const connection = await pool.getConnection();
     try {
@@ -285,6 +284,7 @@ exports.recalculateBalance = async (req, res) => {
 };
 
 // POST /api/admin/recalculate-all-balances
+// FIX: Usa balanceHelper centralizado
 exports.recalculateAllBalances = async (req, res) => {
     const connection = await pool.getConnection();
     try {
@@ -337,6 +337,7 @@ exports.deleteInvestment = async (req, res) => {
 };
 
 // DELETE /api/admin/transactions/:id
+// FIX: Usa balanceHelper centralizado
 exports.deleteTransaction = async (req, res) => {
     const connection = await pool.getConnection();
     try {
@@ -355,8 +356,6 @@ exports.deleteTransaction = async (req, res) => {
 };
 
 // POST /api/admin/investments/:id/cancel
-// FIX: reason ahora se pasa como parámetro SQL (?) en lugar de interpolarse
-//      directamente en el string, eliminando el riesgo de inyección.
 exports.adminCancelInvestment = async (req, res) => {
     const connection = await pool.getConnection();
     try {
@@ -371,7 +370,6 @@ exports.adminCancelInvestment = async (req, res) => {
         if (!invRows.length) return res.status(404).json({ error: 'Inversión no encontrada o ya completada/cancelada' });
         const inv = invRows[0];
 
-        // FIX: reason como parámetro ?, no interpolado en SQL
         await connection.execute(
             `UPDATE investments SET status = 'cancelled', notes = CONCAT(IFNULL(notes,''), ?) WHERE id = ?`,
             [` | ADMIN CANCEL: ${reason}`, invId]
@@ -381,6 +379,7 @@ exports.adminCancelInvestment = async (req, res) => {
             `DELETE FROM transactions WHERE investment_id = ? AND type = 'investment'`, [invId]
         );
 
+        // FIX: Usa balanceHelper centralizado
         await recalculateAndSaveBalance(connection, inv.user_id);
         await connection.commit();
 
@@ -395,8 +394,6 @@ exports.adminCancelInvestment = async (req, res) => {
 };
 
 // POST /api/admin/users/:id/toggle-block
-// FIX: reason ahora se pasa como parámetro SQL (?) eliminando el riesgo
-//      de inyección que existía con la interpolación directa anterior.
 exports.toggleBlockUser = async (req, res) => {
     try {
         const userId = req.params.id;
@@ -411,7 +408,6 @@ exports.toggleBlockUser = async (req, res) => {
 
         await pool.execute(`UPDATE users SET status = ? WHERE id = ?`, [newStatus, userId]);
 
-        // FIX: reason como parámetro ?, no interpolado en SQL
         if (newStatus === 'blocked' && reason) {
             const note = `\nBLOQUEADO: ${reason} — ${new Date().toISOString().slice(0, 16)}`;
             await pool.execute(
@@ -428,6 +424,7 @@ exports.toggleBlockUser = async (req, res) => {
 };
 
 // POST /api/admin/loans/create — Crear préstamo directo
+// FIX: Usa balanceHelper centralizado
 exports.adminCreateLoan = async (req, res) => {
     const connection = await pool.getConnection();
     try {
@@ -475,7 +472,7 @@ exports.adminCreateLoan = async (req, res) => {
              refId, fmt(loanStart)]
         );
 
-        // Recalcular balance usando la función centralizada (fuente única de verdad)
+        // FIX: Usa balanceHelper centralizado
         const newBalance = await recalculateAndSaveBalance(connection, userId);
 
         await connection.commit();
@@ -494,6 +491,7 @@ exports.adminCreateLoan = async (req, res) => {
 };
 
 // POST /api/admin/users/:id/edit
+// FIX: Ahora valida que referredBy exista en la DB
 exports.editUser = async (req, res) => {
     try {
         const userId = req.params.id;
@@ -507,14 +505,19 @@ exports.editUser = async (req, res) => {
         const [emailCheck] = await pool.execute(`SELECT id FROM users WHERE email = ? AND id != ?`, [email.toLowerCase().trim(), userId]);
         if (emailCheck.length) return res.status(400).json({ error: 'Ese email ya está en uso' });
 
-        // Calcular referrerId de forma robusta:
-        // null / undefined / 'none' / '' → limpiar referido
-        // número o string numérico → asignar ese ID (si no es el mismo usuario)
+        // Calcular referrerId de forma robusta + FIX: validar que exista
         let referrerId = null;
         const refRaw = referredBy;
         if (refRaw !== null && refRaw !== undefined && refRaw !== 'none' && refRaw !== '') {
             const ref = parseInt(refRaw, 10);
-            if (!isNaN(ref) && ref > 0 && ref !== parseInt(userId)) referrerId = ref;
+            if (!isNaN(ref) && ref > 0 && ref !== parseInt(userId)) {
+                // FIX: Verificar que el usuario referidor exista en la DB
+                const [refExists] = await pool.execute(`SELECT id FROM users WHERE id = ? AND is_active = 1`, [ref]);
+                if (!refExists.length) {
+                    return res.status(400).json({ error: `El usuario referidor con ID ${ref} no existe` });
+                }
+                referrerId = ref;
+            }
         }
 
         const fields = ['full_name=?', 'email=?', 'phone=?', 'document_number=?', 'role=?', 'status=?', 'referred_by=?'];
@@ -522,7 +525,7 @@ exports.editUser = async (req, res) => {
             fullName.trim(), email.toLowerCase().trim(),
             phone || null, documentNumber || null,
             role || 'client', status || 'active',
-            referrerId   // ya es null o el ID entero correcto
+            referrerId
         ];
 
         if (password && password.length >= 8) {

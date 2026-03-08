@@ -1,8 +1,11 @@
 // ══════════════════════════════════════════════════════════════
 // controllers/depositController.js — Sanse Capital
+// FIX: adminProcessDeposit ahora usa balanceHelper centralizado
+//      en vez de recálculo inline
 // ══════════════════════════════════════════════════════════════
 const { pool }   = require('../config/database');
 const { notify } = require('../utils/telegram');
+const { recalculateAndSaveBalance } = require('../utils/balanceHelper');
 
 // ══════════════════════════════════════════════════════════════
 // GET /api/deposits/my — Mis depósitos
@@ -37,7 +40,6 @@ exports.requestDeposit = async (req, res) => {
             return res.status(400).json({ error: 'Debes subir un comprobante de pago (imagen)' });
         }
 
-        // Verificar que no tenga demasiados depósitos pendientes
         const [pending] = await pool.execute(
             `SELECT COUNT(*) as c FROM deposit_requests WHERE user_id = ? AND status = 'pending'`,
             [userId]
@@ -103,7 +105,8 @@ exports.adminGetDeposits = async (req, res) => {
 };
 
 // ══════════════════════════════════════════════════════════════
-// ADMIN: POST /api/admin/deposits/:id/process — Aprobar/Rechazar depósito
+// ADMIN: POST /api/admin/deposits/:id/process — Aprobar/Rechazar
+// FIX: Usa balanceHelper centralizado en vez de recálculo inline
 // ══════════════════════════════════════════════════════════════
 exports.adminProcessDeposit = async (req, res) => {
     const connection = await pool.getConnection();
@@ -111,7 +114,7 @@ exports.adminProcessDeposit = async (req, res) => {
         await connection.beginTransaction();
 
         const depositId = req.params.id;
-        const { action, notes } = req.body; // action: 'approve' | 'reject'
+        const { action, notes } = req.body;
         const adminId = req.user.id;
 
         if (!['approve', 'reject'].includes(action)) {
@@ -141,23 +144,8 @@ exports.adminProcessDeposit = async (req, res) => {
                 [deposit.user_id, deposit.amount, `Depósito aprobado — Ref: ${deposit.ref_id}`, txRefId]
             );
 
-            // Recalcular balance
-            const [inRows] = await connection.execute(
-                `SELECT COALESCE(SUM(amount), 0) as total FROM transactions WHERE user_id = ? AND type IN ('deposit','payment','interest','profit','investment_return','investment_withdrawal','loan')`,
-                [deposit.user_id]
-            );
-            const [outRows] = await connection.execute(
-                `SELECT COALESCE(SUM(amount), 0) as total FROM transactions WHERE user_id = ? AND type IN ('withdraw')`,
-                [deposit.user_id]
-            );
-            const newBalance = Math.max(0, parseFloat(inRows[0].total) - parseFloat(outRows[0].total));
-            const today = new Date().toISOString().slice(0, 10);
-            const [existing] = await connection.execute(`SELECT id FROM balance_history WHERE user_id = ? AND snapshot_date = ?`, [deposit.user_id, today]);
-            if (existing.length) {
-                await connection.execute(`UPDATE balance_history SET amount = ? WHERE user_id = ? AND snapshot_date = ?`, [newBalance, deposit.user_id, today]);
-            } else {
-                await connection.execute(`INSERT INTO balance_history (user_id, amount, snapshot_date) VALUES (?, ?, ?)`, [deposit.user_id, newBalance, today]);
-            }
+            // FIX: Usa balanceHelper centralizado en vez de recálculo inline
+            const newBalance = await recalculateAndSaveBalance(connection, deposit.user_id);
 
             await connection.commit();
 

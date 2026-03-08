@@ -1,9 +1,11 @@
 // ══════════════════════════════════════════════════════════════
 // controllers/referralController.js — Sanse Capital
+// FIX: processReferralCommission ahora usa balanceHelper centralizado
 // ══════════════════════════════════════════════════════════════
 const { pool }   = require('../config/database');
 const bcrypt     = require('bcryptjs');
 const { notify } = require('../utils/telegram');
+const { recalculateAndSaveBalance } = require('../utils/balanceHelper');
 
 function generateReferralCode() {
     const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -14,8 +16,6 @@ function generateReferralCode() {
 
 // ══════════════════════════════════════════════════════════════
 // POST /api/auth/register — Registro público de usuarios
-// FIX: role cambiado de 'user' a 'client' para consistencia con
-//      User.create() y los checks de autenticación del sistema.
 // ══════════════════════════════════════════════════════════════
 exports.publicRegister = async (req, res) => {
     try {
@@ -37,7 +37,6 @@ exports.publicRegister = async (req, res) => {
         const hashedPassword   = await bcrypt.hash(password, 12);
         const userReferralCode = generateReferralCode();
 
-        // FIX: role = 'client' (consistente con User.create() y middleware de roles)
         const [result] = await pool.execute(
             `INSERT INTO users (full_name, email, password_hash, phone, document_number, role, referral_code, referred_by, status, created_at) 
              VALUES (?, ?, ?, ?, ?, 'client', ?, ?, 'active', NOW())`,
@@ -194,7 +193,7 @@ exports.getMyReferrals = async (req, res) => {
 
 // ══════════════════════════════════════════════════════════════
 // Utilidad interna: processReferralCommission
-// Importada por investmentController y loanController
+// FIX: Usa balanceHelper centralizado en vez de recálculo inline
 // ══════════════════════════════════════════════════════════════
 async function processReferralCommission(referredUserId, sourceType, sourceId, amount, connection = null) {
     const db = connection || pool;
@@ -221,13 +220,8 @@ async function processReferralCommission(referredUserId, sourceType, sourceId, a
             [referrerId, commissionAmount, `Comisión referido (5% de ${sourceType === 'investment_return' ? 'rendimiento CDTC' : 'intereses préstamo'})`, refId]
         );
 
-        const [inRows]  = await db.execute(`SELECT COALESCE(SUM(amount), 0) as total FROM transactions WHERE user_id = ? AND type IN ('deposit','payment','interest','profit','investment_return','investment_withdrawal','loan')`, [referrerId]);
-        const [outRows] = await db.execute(`SELECT COALESCE(SUM(amount), 0) as total FROM transactions WHERE user_id = ? AND type IN ('withdraw')`, [referrerId]);
-        const newBalance = Math.max(0, parseFloat(inRows[0].total) - parseFloat(outRows[0].total));
-        const today = new Date().toISOString().slice(0, 10);
-        const [existing] = await db.execute(`SELECT id FROM balance_history WHERE user_id = ? AND snapshot_date = ?`, [referrerId, today]);
-        if (existing.length) await db.execute(`UPDATE balance_history SET amount = ? WHERE user_id = ? AND snapshot_date = ?`, [newBalance, referrerId, today]);
-        else                 await db.execute(`INSERT INTO balance_history (user_id, amount, snapshot_date) VALUES (?, ?, ?)`, [referrerId, newBalance, today]);
+        // FIX: Usa balanceHelper centralizado
+        await recalculateAndSaveBalance(db, referrerId);
 
         return { referrerId, commissionAmount, refId };
     } catch (error) {
