@@ -2,29 +2,30 @@
 // controllers/withdrawalController.js — Sanse Capital
 // FIXES:
 //  1. Usa balanceHelper centralizado
-//  2. Agrega métodos faltantes: getPaymentMethods, createPaymentMethod,
-//     deletePaymentMethod, createWithdrawalRequest (aliases)
+//  2. getPaymentMethods, createPaymentMethod, deletePaymentMethod
+//     alineados con el esquema REAL de la tabla payment_methods:
+//     (user_id, type, label, phone, account_number, account_type,
+//      holder_name, holder_document, is_default, is_active)
+//  3. requestWithdrawal + alias createWithdrawalRequest
 // ══════════════════════════════════════════════════════════════
 const { pool }   = require('../config/database');
 const { notify } = require('../utils/telegram');
 const { recalculateAndSaveBalance } = require('../utils/balanceHelper');
 
 // ══════════════════════════════════════════════════════════════
-// MÉTODOS DE PAGO — Requeridos por routes/withdrawals.js
-// FIX: Estos métodos no existían, causando crash al cargar rutas
+// MÉTODOS DE PAGO — Esquema real de la tabla payment_methods
 // ══════════════════════════════════════════════════════════════
 
 // GET /api/withdrawals/payment-methods
 exports.getPaymentMethods = async (req, res) => {
     try {
         const [rows] = await pool.execute(
-            `SELECT id, bank_name, account_number, account_type, account_holder, is_default, created_at
+            `SELECT id, type, label, phone, account_number, account_type, holder_name, holder_document, is_default, created_at
              FROM payment_methods WHERE user_id = ? AND is_active = 1 ORDER BY is_default DESC, created_at DESC`,
             [req.user.id]
         );
         res.json(rows);
     } catch (error) {
-        // Si la tabla no existe aún, devolver array vacío
         if (error.code === 'ER_NO_SUCH_TABLE') {
             return res.json([]);
         }
@@ -36,9 +37,21 @@ exports.getPaymentMethods = async (req, res) => {
 // POST /api/withdrawals/payment-methods
 exports.createPaymentMethod = async (req, res) => {
     try {
-        const { bankName, accountNumber, accountType, accountHolder, isDefault } = req.body;
-        if (!bankName || !accountNumber || !accountHolder) {
-            return res.status(400).json({ error: 'Banco, número de cuenta y titular son requeridos' });
+        const { type, label, phone, accountNumber, accountType, holderName, holderDocument, isDefault,
+                // Aliases del frontend corregido que mapea a bankName/accountHolder
+                bankName, accountHolder } = req.body;
+
+        // Resolver campos: aceptar tanto el esquema nativo como los aliases
+        const finalType  = type || (bankName === 'Nequi' ? 'nequi' : bankName === 'Daviplata' ? 'daviplata' : bankName === 'Bancolombia' ? 'bancolombia' : 'otro');
+        const finalLabel = label || bankName || '';
+        const finalPhone = phone || (finalType === 'nequi' || finalType === 'daviplata' ? accountNumber : null);
+        const finalAccountNumber = (finalType === 'bancolombia' || finalType === 'otro') ? (accountNumber || null) : null;
+        const finalAccountType   = accountType || 'savings';
+        const finalHolderName    = holderName || accountHolder || '';
+        const finalHolderDoc     = holderDocument || null;
+
+        if (!finalLabel && !finalType) {
+            return res.status(400).json({ error: 'Tipo y nombre del método son requeridos' });
         }
 
         // Si es default, quitar default de los demás
@@ -50,9 +63,9 @@ exports.createPaymentMethod = async (req, res) => {
         }
 
         const [result] = await pool.execute(
-            `INSERT INTO payment_methods (user_id, bank_name, account_number, account_type, account_holder, is_default)
-             VALUES (?, ?, ?, ?, ?, ?)`,
-            [req.user.id, bankName, accountNumber, accountType || 'savings', accountHolder, isDefault ? 1 : 0]
+            `INSERT INTO payment_methods (user_id, type, label, phone, account_number, account_type, holder_name, holder_document, is_default)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [req.user.id, finalType, finalLabel, finalPhone, finalAccountNumber, finalAccountType, finalHolderName, finalHolderDoc, isDefault ? 1 : 0]
         );
 
         res.status(201).json({ message: 'Método de pago creado', id: result.insertId });
@@ -84,19 +97,36 @@ exports.deletePaymentMethod = async (req, res) => {
 
 // ══════════════════════════════════════════════════════════════
 // POST /api/withdrawals/request
-// FIX: También exportado como createWithdrawalRequest (alias)
-//      para que routes/withdrawals.js funcione correctamente
+// Acepta AMBOS esquemas:
+//   - Directo: { bankName, accountNumber, accountType, accountHolder }
+//   - Via paymentMethodId: { paymentMethodId } → busca los datos en la tabla
 // ══════════════════════════════════════════════════════════════
 exports.requestWithdrawal = async (req, res) => {
     try {
         const userId = req.user.id;
         const amount = parseFloat(req.body.amount);
-        const { bankName, accountNumber, accountType, accountHolder } = req.body;
+        let { bankName, accountNumber, accountType, accountHolder, paymentMethodId } = req.body;
 
         if (!amount || isNaN(amount) || amount < 10000)
             return res.status(400).json({ error: 'Monto mínimo de retiro: $10.000 COP' });
+
+        // Si viene paymentMethodId, buscar los datos de la tabla
+        if (paymentMethodId && (!bankName || !accountNumber || !accountHolder)) {
+            const [pmRows] = await pool.execute(
+                `SELECT type, label, phone, account_number, account_type, holder_name FROM payment_methods WHERE id = ? AND user_id = ? AND is_active = 1`,
+                [paymentMethodId, userId]
+            );
+            if (pmRows.length) {
+                const pm = pmRows[0];
+                bankName      = bankName || pm.label || pm.type || 'Sin especificar';
+                accountNumber = accountNumber || pm.account_number || pm.phone || '';
+                accountType   = accountType || pm.account_type || 'savings';
+                accountHolder = accountHolder || pm.holder_name || pm.label || '';
+            }
+        }
+
         if (!bankName || !accountNumber || !accountHolder)
-            return res.status(400).json({ error: 'Datos bancarios incompletos' });
+            return res.status(400).json({ error: 'Datos bancarios incompletos. Selecciona un método de pago o ingresa los datos.' });
 
         // Balance disponible
         const [balRows] = await pool.execute(
@@ -159,7 +189,7 @@ exports.requestWithdrawal = async (req, res) => {
     }
 };
 
-// FIX: Alias para compatibilidad con routes/withdrawals.js
+// Alias para compatibilidad con routes/withdrawals.js
 exports.createWithdrawalRequest = exports.requestWithdrawal;
 
 // ══════════════════════════════════════════════════════════════
@@ -212,7 +242,6 @@ exports.adminGetWithdrawals = async (req, res) => {
 
 // ══════════════════════════════════════════════════════════════
 // ADMIN: POST /api/admin/withdrawals/:id/process
-// FIX: Usa balanceHelper centralizado
 // ══════════════════════════════════════════════════════════════
 exports.adminProcessWithdrawal = async (req, res) => {
     const connection = await pool.getConnection();
@@ -268,7 +297,6 @@ exports.adminProcessWithdrawal = async (req, res) => {
                 [notes || null, req.user.id, withdrawalId]
             );
 
-            // FIX: Usa balanceHelper centralizado
             const newBalance = await recalculateAndSaveBalance(connection, wr.user_id);
 
             const [userRows] = await connection.execute(`SELECT full_name FROM users WHERE id = ?`, [wr.user_id]);
