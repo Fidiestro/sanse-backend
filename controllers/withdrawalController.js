@@ -1,64 +1,59 @@
 // ══════════════════════════════════════════════════════════════
 // controllers/withdrawalController.js — Sanse Capital
-// FIXES:
-//  1. Usa balanceHelper centralizado
-//  2. getPaymentMethods, createPaymentMethod, deletePaymentMethod
-//     alineados con el esquema REAL de la tabla payment_methods:
-//     (user_id, type, label, phone, account_number, account_type,
-//      holder_name, holder_document, is_default, is_active)
-//  3. requestWithdrawal + alias createWithdrawalRequest
+// v4 — Alineado con esquema REAL de las tablas:
+//
+// withdrawal_requests: id, user_id, payment_method_id, amount, status,
+//   estimated_completion, admin_notes, ref_id, created_at, updated_at,
+//   processed_at, processed_by
+//
+// payment_methods: id, user_id, type, label, phone, account_number,
+//   account_type, holder_name, holder_document, is_default, is_active,
+//   updated_at
 // ══════════════════════════════════════════════════════════════
 const { pool }   = require('../config/database');
 const { notify } = require('../utils/telegram');
 const { recalculateAndSaveBalance } = require('../utils/balanceHelper');
 
 // ══════════════════════════════════════════════════════════════
-// MÉTODOS DE PAGO — Esquema real de la tabla payment_methods
-// ══════════════════════════════════════════════════════════════
-
 // GET /api/withdrawals/payment-methods
+// ══════════════════════════════════════════════════════════════
 exports.getPaymentMethods = async (req, res) => {
     try {
         const [rows] = await pool.execute(
-            `SELECT id, type, label, phone, account_number, account_type, holder_name, holder_document, is_default, created_at
-             FROM payment_methods WHERE user_id = ? AND is_active = 1 ORDER BY is_default DESC, created_at DESC`,
+            `SELECT id, type, label, phone, account_number, account_type,
+                    holder_name, holder_document, is_default, created_at
+             FROM payment_methods
+             WHERE user_id = ? AND is_active = 1
+             ORDER BY is_default DESC, created_at DESC`,
             [req.user.id]
         );
         res.json(rows);
     } catch (error) {
-        if (error.code === 'ER_NO_SUCH_TABLE') {
-            return res.json([]);
-        }
+        if (error.code === 'ER_NO_SUCH_TABLE') return res.json([]);
         console.error('Error getPaymentMethods:', error);
         res.status(500).json({ error: 'Error interno del servidor' });
     }
 };
 
+// ══════════════════════════════════════════════════════════════
 // POST /api/withdrawals/payment-methods
+// ══════════════════════════════════════════════════════════════
 exports.createPaymentMethod = async (req, res) => {
     try {
-        const { type, label, phone, accountNumber, accountType, holderName, holderDocument, isDefault,
-                // Aliases del frontend corregido que mapea a bankName/accountHolder
-                bankName, accountHolder } = req.body;
+        const { type, label, phone, accountNumber, accountType,
+                holderName, holderDocument, isDefault } = req.body;
 
-        // Resolver campos: aceptar tanto el esquema nativo como los aliases
-        const finalType  = type || (bankName === 'Nequi' ? 'nequi' : bankName === 'Daviplata' ? 'daviplata' : bankName === 'Bancolombia' ? 'bancolombia' : 'otro');
-        const finalLabel = label || bankName || '';
-        const finalPhone = phone || (finalType === 'nequi' || finalType === 'daviplata' ? accountNumber : null);
-        const finalAccountNumber = (finalType === 'bancolombia' || finalType === 'otro') ? (accountNumber || null) : null;
-        // FIX: account_type debe ser null para Nequi/Daviplata (no tienen cuenta bancaria)
-        // y para Bancolombia debe coincidir con los valores del ENUM de la tabla (ahorros/corriente)
-        const finalAccountType   = (finalType === 'nequi' || finalType === 'daviplata')
-            ? null
-            : (accountType || null);
-        const finalHolderName    = holderName || accountHolder || '';
-        const finalHolderDoc     = holderDocument || null;
-
-        if (!finalLabel && !finalType) {
+        if (!type || !label) {
             return res.status(400).json({ error: 'Tipo y nombre del método son requeridos' });
         }
 
-        // Si es default, quitar default de los demás
+        const finalPhone         = phone || null;
+        const finalAccountNumber = accountNumber || null;
+        // account_type: null para Nequi/Daviplata, valor real para Bancolombia
+        const finalAccountType   = (type === 'nequi' || type === 'daviplata') ? null : (accountType || null);
+        const finalHolderName    = holderName || null;
+        const finalHolderDoc     = holderDocument || null;
+
         if (isDefault) {
             await pool.execute(
                 `UPDATE payment_methods SET is_default = 0 WHERE user_id = ?`,
@@ -67,22 +62,26 @@ exports.createPaymentMethod = async (req, res) => {
         }
 
         const [result] = await pool.execute(
-            `INSERT INTO payment_methods (user_id, type, label, phone, account_number, account_type, holder_name, holder_document, is_default)
+            `INSERT INTO payment_methods
+             (user_id, type, label, phone, account_number, account_type, holder_name, holder_document, is_default)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            [req.user.id, finalType, finalLabel, finalPhone, finalAccountNumber, finalAccountType, finalHolderName, finalHolderDoc, isDefault ? 1 : 0]
+            [req.user.id, type, label, finalPhone, finalAccountNumber,
+             finalAccountType, finalHolderName, finalHolderDoc, isDefault ? 1 : 0]
         );
 
         res.status(201).json({ message: 'Método de pago creado', id: result.insertId });
     } catch (error) {
         if (error.code === 'ER_NO_SUCH_TABLE') {
-            return res.status(500).json({ error: 'Tabla payment_methods no configurada. Contacta al administrador.' });
+            return res.status(500).json({ error: 'Tabla payment_methods no configurada.' });
         }
         console.error('Error createPaymentMethod:', error);
         res.status(500).json({ error: 'Error interno del servidor' });
     }
 };
 
+// ══════════════════════════════════════════════════════════════
 // DELETE /api/withdrawals/payment-methods/:id
+// ══════════════════════════════════════════════════════════════
 exports.deletePaymentMethod = async (req, res) => {
     try {
         const [result] = await pool.execute(
@@ -101,36 +100,30 @@ exports.deletePaymentMethod = async (req, res) => {
 
 // ══════════════════════════════════════════════════════════════
 // POST /api/withdrawals/request
-// Acepta AMBOS esquemas:
-//   - Directo: { bankName, accountNumber, accountType, accountHolder }
-//   - Via paymentMethodId: { paymentMethodId } → busca los datos en la tabla
+// withdrawal_requests usa payment_method_id (FK), NO bank_name
 // ══════════════════════════════════════════════════════════════
 exports.requestWithdrawal = async (req, res) => {
     try {
         const userId = req.user.id;
         const amount = parseFloat(req.body.amount);
-        let { bankName, accountNumber, accountType, accountHolder, paymentMethodId } = req.body;
+        const { paymentMethodId } = req.body;
 
         if (!amount || isNaN(amount) || amount < 10000)
             return res.status(400).json({ error: 'Monto mínimo de retiro: $10.000 COP' });
 
-        // Si viene paymentMethodId, buscar los datos de la tabla
-        if (paymentMethodId && (!bankName || !accountNumber || !accountHolder)) {
-            const [pmRows] = await pool.execute(
-                `SELECT type, label, phone, account_number, account_type, holder_name FROM payment_methods WHERE id = ? AND user_id = ? AND is_active = 1`,
-                [paymentMethodId, userId]
-            );
-            if (pmRows.length) {
-                const pm = pmRows[0];
-                bankName      = bankName || pm.label || pm.type || 'Sin especificar';
-                accountNumber = accountNumber || pm.account_number || pm.phone || '';
-                accountType   = accountType || pm.account_type || 'savings';
-                accountHolder = accountHolder || pm.holder_name || pm.label || '';
-            }
-        }
+        if (!paymentMethodId)
+            return res.status(400).json({ error: 'Selecciona un método de pago' });
 
-        if (!bankName || !accountNumber || !accountHolder)
-            return res.status(400).json({ error: 'Datos bancarios incompletos. Selecciona un método de pago o ingresa los datos.' });
+        // Verificar que el payment method existe y es del usuario
+        const [pmRows] = await pool.execute(
+            `SELECT id, type, label, phone, account_number, holder_name
+             FROM payment_methods WHERE id = ? AND user_id = ? AND is_active = 1`,
+            [paymentMethodId, userId]
+        );
+        if (!pmRows.length)
+            return res.status(400).json({ error: 'Método de pago no encontrado o inactivo' });
+
+        const pm = pmRows[0];
 
         // Balance disponible
         const [balRows] = await pool.execute(
@@ -150,9 +143,9 @@ exports.requestWithdrawal = async (req, res) => {
             [userId]
         );
 
-        const investedAmount = parseFloat(investedRows[0].total);
+        const investedAmount     = parseFloat(investedRows[0].total);
         const pendingWithdrawals = parseFloat(pendingWR[0].total);
-        const availableBalance = currentBalance - investedAmount - pendingWithdrawals;
+        const availableBalance   = currentBalance - investedAmount - pendingWithdrawals;
 
         if (amount > availableBalance) {
             return res.status(400).json({
@@ -161,31 +154,40 @@ exports.requestWithdrawal = async (req, res) => {
             });
         }
 
+        // Calcular tiempo estimado
+        const estimatedCompletion = amount <= 2000000 ? '24 horas o menos' : 'Hasta 30 días hábiles';
+
         const refId = 'WR-' + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2, 5).toUpperCase();
+
+        // INSERT usa las columnas reales de withdrawal_requests
         const [result] = await pool.execute(
             `INSERT INTO withdrawal_requests
-             (user_id, amount, bank_name, account_number, account_type, account_holder, status, ref_id)
-             VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)`,
-            [userId, amount, bankName, accountNumber, accountType || null, accountHolder, refId]
+             (user_id, payment_method_id, amount, status, estimated_completion, ref_id)
+             VALUES (?, ?, ?, 'pending', ?, ?)`,
+            [userId, paymentMethodId, amount, estimatedCompletion, refId]
         );
 
         const [userRows] = await pool.execute(`SELECT full_name, email FROM users WHERE id = ?`, [userId]);
         const userName = userRows.length ? userRows[0].full_name : 'Usuario';
 
+        // Descripción legible del método de pago para Telegram
+        const pmTypeName = pm.type === 'nequi' ? 'Nequi' : pm.type === 'daviplata' ? 'Daviplata' : pm.type === 'bancolombia' ? 'Bancolombia' : pm.label;
+        const pmDetail   = pm.phone || pm.account_number || '';
+
         await notify(
             `💸 *SOLICITUD DE RETIRO — Sanse Capital*\n\n` +
             `👤 *${userName}*\n` +
             `💰 *$${Math.round(amount).toLocaleString('es-CO')} COP*\n` +
-            `🏦 ${bankName} — ${accountType || 'Ahorros'}\n` +
-            `📋 Titular: ${accountHolder}\n` +
-            `🔢 Cuenta: ${accountNumber}\n` +
-            `🔖 Ref: ${refId}\n\n` +
+            `🏦 ${pmTypeName} — ${pmDetail}\n` +
+            `📋 Titular: ${pm.holder_name || pm.label || '—'}\n` +
+            `🔖 Ref: ${refId}\n` +
+            `⏱️ Est: ${estimatedCompletion}\n\n` +
             `➡️ Revisa en el panel admin para aprobar o rechazar.`
         );
 
         res.status(201).json({
             message: 'Solicitud de retiro creada. Será procesada en 24-48 horas.',
-            withdrawal: { id: result.insertId, refId, amount },
+            withdrawal: { id: result.insertId, refId, amount, estimatedCompletion },
         });
     } catch (error) {
         console.error('Error solicitando retiro:', error);
@@ -198,25 +200,36 @@ exports.createWithdrawalRequest = exports.requestWithdrawal;
 
 // ══════════════════════════════════════════════════════════════
 // GET /api/withdrawals/my
+// JOIN con payment_methods para devolver datos legibles
 // ══════════════════════════════════════════════════════════════
 exports.getMyWithdrawals = async (req, res) => {
     try {
         const [rows] = await pool.execute(
-            `SELECT * FROM withdrawal_requests WHERE user_id = ? ORDER BY created_at DESC LIMIT 50`,
+            `SELECT wr.id, wr.amount, wr.status, wr.ref_id, wr.admin_notes,
+                    wr.estimated_completion, wr.created_at, wr.processed_at,
+                    pm.type as pm_type, pm.label as pm_label, pm.phone as pm_phone,
+                    pm.account_number as pm_account, pm.holder_name as pm_holder
+             FROM withdrawal_requests wr
+             LEFT JOIN payment_methods pm ON wr.payment_method_id = pm.id
+             WHERE wr.user_id = ?
+             ORDER BY wr.created_at DESC LIMIT 50`,
             [req.user.id]
         );
         res.json(rows.map(w => ({
             id: w.id,
             amount: parseFloat(w.amount),
-            bankName: w.bank_name,
-            accountNumber: w.account_number,
-            accountType: w.account_type,
-            accountHolder: w.account_holder,
             status: w.status,
             refId: w.ref_id,
             adminNotes: w.admin_notes,
+            estimatedCompletion: w.estimated_completion,
             createdAt: w.created_at,
             processedAt: w.processed_at,
+            // Datos del método de pago (desde JOIN)
+            pmType: w.pm_type,
+            pmLabel: w.pm_label,
+            pmPhone: w.pm_phone,
+            pmAccount: w.pm_account,
+            pmHolder: w.pm_holder,
         })));
     } catch (error) {
         console.error('Error obteniendo retiros:', error);
@@ -226,12 +239,19 @@ exports.getMyWithdrawals = async (req, res) => {
 
 // ══════════════════════════════════════════════════════════════
 // ADMIN: GET /api/admin/withdrawals
+// JOIN con payment_methods y users
 // ══════════════════════════════════════════════════════════════
 exports.adminGetWithdrawals = async (req, res) => {
     try {
         const status = req.query.status || 'all';
-        let query = `SELECT wr.*, u.full_name as user_name, u.email as user_email, u.phone as user_phone
-                     FROM withdrawal_requests wr LEFT JOIN users u ON wr.user_id = u.id`;
+        let query = `SELECT wr.*, 
+                            u.full_name as user_name, u.email as user_email, u.phone as user_phone,
+                            pm.type as pm_type, pm.label as pm_label, pm.phone as pm_phone,
+                            pm.account_number as pm_account, pm.account_type as pm_account_type,
+                            pm.holder_name as pm_holder, pm.holder_document as pm_holder_doc
+                     FROM withdrawal_requests wr
+                     LEFT JOIN users u ON wr.user_id = u.id
+                     LEFT JOIN payment_methods pm ON wr.payment_method_id = pm.id`;
         const params = [];
         if (status !== 'all') { query += ` WHERE wr.status = ?`; params.push(status); }
         query += ` ORDER BY wr.created_at DESC LIMIT 50`;
@@ -259,11 +279,22 @@ exports.adminProcessWithdrawal = async (req, res) => {
             return res.status(400).json({ error: 'Acción inválida. Usar: approve, reject, complete' });
         }
 
+        // JOIN para tener datos del método de pago en las notificaciones
         const [wrRows] = await connection.execute(
-            `SELECT * FROM withdrawal_requests WHERE id = ?`, [withdrawalId]
+            `SELECT wr.*, pm.type as pm_type, pm.label as pm_label,
+                    pm.phone as pm_phone, pm.account_number as pm_account,
+                    pm.holder_name as pm_holder
+             FROM withdrawal_requests wr
+             LEFT JOIN payment_methods pm ON wr.payment_method_id = pm.id
+             WHERE wr.id = ?`,
+            [withdrawalId]
         );
         if (!wrRows.length) return res.status(404).json({ error: 'Solicitud no encontrada' });
         const wr = wrRows[0];
+
+        // Descripción legible del método de pago
+        const pmDesc = wr.pm_label || wr.pm_type || '—';
+        const pmDetail = wr.pm_phone || wr.pm_account || '';
 
         if (action === 'approve') {
             if (wr.status !== 'pending')
@@ -280,7 +311,7 @@ exports.adminProcessWithdrawal = async (req, res) => {
                 `✅ *RETIRO APROBADO — Sanse Capital*\n\n` +
                 `👤 ${userRows[0]?.full_name || 'Usuario'}\n` +
                 `💰 $${Math.round(wr.amount).toLocaleString('es-CO')} COP\n` +
-                `🏦 ${wr.bank_name} — ${wr.account_number}\n` +
+                `🏦 ${pmDesc} — ${pmDetail}\n` +
                 `🔖 ${wr.ref_id}`
             );
 
@@ -292,7 +323,7 @@ exports.adminProcessWithdrawal = async (req, res) => {
             await connection.execute(
                 `INSERT INTO transactions (user_id, type, amount, description, ref_id, created_at)
                  VALUES (?, 'withdraw', ?, ?, ?, NOW())`,
-                [wr.user_id, wr.amount, `Retiro completado — Ref: ${wr.ref_id}`, refId]
+                [wr.user_id, wr.amount, `Retiro completado — ${pmDesc} ${pmDetail} — Ref: ${wr.ref_id}`, refId]
             );
 
             await connection.execute(
@@ -308,8 +339,8 @@ exports.adminProcessWithdrawal = async (req, res) => {
                 `✅ *RETIRO COMPLETADO — Sanse Capital*\n\n` +
                 `👤 ${userRows[0]?.full_name || 'Usuario'}\n` +
                 `💰 $${Math.round(wr.amount).toLocaleString('es-CO')} COP\n` +
-                `🏦 ${wr.bank_name} — ${wr.account_number}\n` +
-                `💳 Titular: ${wr.account_holder}\n` +
+                `🏦 ${pmDesc} — ${pmDetail}\n` +
+                `💳 Titular: ${wr.pm_holder || '—'}\n` +
                 `📊 Nuevo balance: $${Math.round(newBalance).toLocaleString('es-CO')}\n` +
                 `🔖 ${wr.ref_id}`
             );
