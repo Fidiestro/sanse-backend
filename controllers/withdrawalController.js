@@ -46,7 +46,11 @@ exports.createPaymentMethod = async (req, res) => {
         const finalLabel = label || bankName || '';
         const finalPhone = phone || (finalType === 'nequi' || finalType === 'daviplata' ? accountNumber : null);
         const finalAccountNumber = (finalType === 'bancolombia' || finalType === 'otro') ? (accountNumber || null) : null;
-        const finalAccountType   = accountType || 'savings';
+        // FIX: account_type debe ser null para Nequi/Daviplata (no tienen cuenta bancaria)
+        // y para Bancolombia debe coincidir con los valores del ENUM de la tabla (ahorros/corriente)
+        const finalAccountType   = (finalType === 'nequi' || finalType === 'daviplata')
+            ? null
+            : (accountType || null);
         const finalHolderName    = holderName || accountHolder || '';
         const finalHolderDoc     = holderDocument || null;
 
@@ -162,7 +166,7 @@ exports.requestWithdrawal = async (req, res) => {
             `INSERT INTO withdrawal_requests
              (user_id, amount, bank_name, account_number, account_type, account_holder, status, ref_id)
              VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)`,
-            [userId, amount, bankName, accountNumber, accountType || 'savings', accountHolder, refId]
+            [userId, amount, bankName, accountNumber, accountType || null, accountHolder, refId]
         );
 
         const [userRows] = await pool.execute(`SELECT full_name, email FROM users WHERE id = ?`, [userId]);
