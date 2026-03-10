@@ -22,6 +22,7 @@ router.get('/stats', adminController.getStats);
 
 // Transacciones
 router.get('/transactions/recent', adminController.getRecentTransactions);
+router.get('/transactions/all', adminController.getAllTransactions);
 router.post('/transactions', adminController.createTransaction);
 router.delete('/transactions/:id', adminController.deleteTransaction);
 

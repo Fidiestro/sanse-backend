@@ -44,7 +44,7 @@ exports.getStats = async (req, res) => {
     }
 };
 
-// GET /api/admin/transactions/recent
+// GET /api/admin/transactions/recent  (mantiene compatibilidad — últimas 30)
 exports.getRecentTransactions = async (req, res) => {
     try {
         const [rows] = await pool.execute(
@@ -55,6 +55,66 @@ exports.getRecentTransactions = async (req, res) => {
         res.json(rows);
     } catch (error) {
         console.error('Error recent transactions:', error);
+        res.status(500).json({ error: 'Error interno del servidor' });
+    }
+};
+
+// GET /api/admin/transactions/all — TODAS con filtros + paginación
+// Query params: page, limit, type, userId, search, dateFrom, dateTo
+exports.getAllTransactions = async (req, res) => {
+    try {
+        const page     = Math.max(1, parseInt(req.query.page)  || 1);
+        const limit    = Math.min(200, Math.max(1, parseInt(req.query.limit) || 50));
+        const offset   = (page - 1) * limit;
+        const type     = req.query.type     || '';
+        const userId   = req.query.userId   || '';
+        const search   = req.query.search   || '';
+        const dateFrom = req.query.dateFrom || '';   // YYYY-MM-DD
+        const dateTo   = req.query.dateTo   || '';   // YYYY-MM-DD
+
+        const conditions = [];
+        const params     = [];
+
+        if (type)     { conditions.push('t.type = ?');              params.push(type); }
+        if (userId)   { conditions.push('t.user_id = ?');           params.push(parseInt(userId)); }
+        if (dateFrom) { conditions.push('DATE(t.created_at) >= ?'); params.push(dateFrom); }
+        if (dateTo)   { conditions.push('DATE(t.created_at) <= ?'); params.push(dateTo); }
+        if (search) {
+            conditions.push('(u.full_name LIKE ? OR t.description LIKE ? OR t.ref_id LIKE ? OR CAST(t.id AS CHAR) LIKE ?)');
+            const like = `%${search}%`;
+            params.push(like, like, like, like);
+        }
+
+        const where = conditions.length ? 'WHERE ' + conditions.join(' AND ') : '';
+
+        // Total para paginación
+        const [countRows] = await pool.execute(
+            `SELECT COUNT(*) as total 
+             FROM transactions t LEFT JOIN users u ON t.user_id = u.id 
+             ${where}`,
+            params
+        );
+        const total = parseInt(countRows[0].total);
+
+        // Datos paginados
+        const [rows] = await pool.execute(
+            `SELECT t.*, u.full_name as user_name 
+             FROM transactions t LEFT JOIN users u ON t.user_id = u.id 
+             ${where}
+             ORDER BY t.created_at DESC
+             LIMIT ? OFFSET ?`,
+            [...params, limit, offset]
+        );
+
+        res.json({
+            transactions: rows,
+            total,
+            page,
+            limit,
+            pages: Math.ceil(total / limit),
+        });
+    } catch (error) {
+        console.error('Error getAllTransactions:', error);
         res.status(500).json({ error: 'Error interno del servidor' });
     }
 };
