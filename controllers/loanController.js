@@ -2,7 +2,8 @@
 // controllers/loanController.js — Sanse Capital
 // FIXES:
 //  1. Usa balanceHelper centralizado (elimina recalcBalance local)
-//  2. Resto de lógica sin cambios (ya estaba correcta)
+//  2. Registra pagos en loan_payments para control de ganancias admin
+//  3. Nuevos endpoints: adminGetLoanPayments, adminGetLoanProfitStats
 // ══════════════════════════════════════════════════════════════
 const { pool }   = require('../config/database');
 const { notify } = require('../utils/telegram');
@@ -316,6 +317,7 @@ exports.adminGetCreditScore = async (req, res) => {
 // ══════════════════════════════════════════════════════════════
 // POST /api/loans/pay — Abonar a un préstamo
 // FIX: Usa balanceHelper centralizado
+// NUEVO: Registra en loan_payments para control de ganancias
 // ══════════════════════════════════════════════════════════════
 exports.payLoan = async (req, res) => {
     const connection = await pool.getConnection();
@@ -385,6 +387,13 @@ exports.payLoan = async (req, res) => {
             [userId, amount,
              `Abono préstamo ${loan.ref_id} — Intereses: $${Math.round(interestCovered).toLocaleString('es-CO')} | Capital: $${Math.round(capitalReduced).toLocaleString('es-CO')} | Pendiente: $${Math.round(newPendingCapital).toLocaleString('es-CO')}`,
              refId]
+        );
+
+        // ── NUEVO: Registrar en loan_payments para control de ganancias admin ──
+        await connection.execute(
+            `INSERT INTO loan_payments (loan_id, user_id, amount, interest_amount, capital_amount, remaining_capital, loan_rate, ref_id, is_fully_paid, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())`,
+            [loanId, userId, amount, interestCovered, capitalReduced, newPendingCapital, loanRate, refId, isFullyPaid ? 1 : 0]
         );
 
         // Comisión al referidor
@@ -459,5 +468,99 @@ exports.payLoan = async (req, res) => {
         res.status(500).json({ error: 'Error interno del servidor' });
     } finally {
         connection.release();
+    }
+};
+
+// ══════════════════════════════════════════════════════════════
+// ADMIN: GET /api/admin/loans/payments — Todos los pagos de préstamos
+// ══════════════════════════════════════════════════════════════
+exports.adminGetLoanPayments = async (req, res) => {
+    try {
+        const [rows] = await pool.execute(
+            `SELECT lp.*, 
+                    u.full_name as user_name, 
+                    u.email as user_email,
+                    lr.ref_id as loan_ref_id,
+                    lr.amount as loan_original_amount,
+                    lr.term_months as loan_term,
+                    lr.status as loan_status
+             FROM loan_payments lp
+             LEFT JOIN users u ON lp.user_id = u.id
+             LEFT JOIN loan_requests lr ON lp.loan_id = lr.id
+             ORDER BY lp.created_at DESC
+             LIMIT 200`
+        );
+        res.json(rows);
+    } catch (error) {
+        console.error('Error obteniendo pagos de préstamos:', error);
+        res.status(500).json({ error: 'Error interno del servidor' });
+    }
+};
+
+// ══════════════════════════════════════════════════════════════
+// ADMIN: GET /api/admin/loans/profit-stats — KPIs de ganancias
+// ══════════════════════════════════════════════════════════════
+exports.adminGetLoanProfitStats = async (req, res) => {
+    try {
+        const [totalRows] = await pool.execute(
+            `SELECT COALESCE(SUM(interest_amount), 0) as totalInterestEarned,
+                    COALESCE(SUM(capital_amount), 0) as totalCapitalRecovered,
+                    COALESCE(SUM(amount), 0) as totalPaymentsReceived,
+                    COUNT(*) as totalPaymentCount
+             FROM loan_payments`
+        );
+
+        const [monthRows] = await pool.execute(
+            `SELECT COALESCE(SUM(interest_amount), 0) as monthInterest,
+                    COALESCE(SUM(capital_amount), 0) as monthCapital,
+                    COALESCE(SUM(amount), 0) as monthTotal,
+                    COUNT(*) as monthCount
+             FROM loan_payments
+             WHERE MONTH(created_at) = MONTH(NOW()) AND YEAR(created_at) = YEAR(NOW())`
+        );
+
+        const [activeRows] = await pool.execute(
+            `SELECT COALESCE(SUM(approved_amount), 0) as activeLoanCapital,
+                    COUNT(*) as activeLoanCount
+             FROM loan_requests
+             WHERE status IN ('active', 'overdue') AND approved_amount > 0`
+        );
+
+        const [paidRows] = await pool.execute(
+            `SELECT COUNT(*) as paidLoanCount FROM loan_requests WHERE status = 'paid'`
+        );
+
+        const [overdueRows] = await pool.execute(
+            `SELECT COUNT(*) as overdueLoanCount,
+                    COALESCE(SUM(approved_amount), 0) as overdueCapital
+             FROM loan_requests WHERE status = 'overdue'`
+        );
+
+        const [avgRateRows] = await pool.execute(
+            `SELECT COALESCE(
+                SUM(loan_rate * amount) / NULLIF(SUM(amount), 0), 0
+             ) as weightedAvgRate
+             FROM loan_payments WHERE loan_rate > 0`
+        );
+
+        res.json({
+            totalInterestEarned:   parseFloat(totalRows[0].totalInterestEarned),
+            totalCapitalRecovered: parseFloat(totalRows[0].totalCapitalRecovered),
+            totalPaymentsReceived: parseFloat(totalRows[0].totalPaymentsReceived),
+            totalPaymentCount:     parseInt(totalRows[0].totalPaymentCount),
+            monthInterest: parseFloat(monthRows[0].monthInterest),
+            monthCapital:  parseFloat(monthRows[0].monthCapital),
+            monthTotal:    parseFloat(monthRows[0].monthTotal),
+            monthCount:    parseInt(monthRows[0].monthCount),
+            activeLoanCapital: parseFloat(activeRows[0].activeLoanCapital),
+            activeLoanCount:   parseInt(activeRows[0].activeLoanCount),
+            paidLoanCount:    parseInt(paidRows[0].paidLoanCount),
+            overdueLoanCount: parseInt(overdueRows[0].overdueLoanCount),
+            overdueCapital:   parseFloat(overdueRows[0].overdueCapital),
+            weightedAvgRate: parseFloat(parseFloat(avgRateRows[0].weightedAvgRate).toFixed(2)),
+        });
+    } catch (error) {
+        console.error('Error stats ganancias préstamos:', error);
+        res.status(500).json({ error: 'Error interno del servidor' });
     }
 };

@@ -50,6 +50,9 @@ router.post('/users/:id/edit', adminController.editUser);
 // Crear préstamo directo para un usuario
 router.post('/loans/create', adminController.adminCreateLoan);
 
+// === GANANCIAS PRÉSTAMOS (ADMIN) — rutas específicas ANTES que /loans genérico ===
+router.get('/loans/payments', loanController.adminGetLoanPayments);
+router.get('/loans/profit-stats', loanController.adminGetLoanProfitStats);
 
 // === SOLICITUDES DE RETIRO (ADMIN) ===
 router.get('/withdrawals', withdrawalController.adminGetWithdrawals);
