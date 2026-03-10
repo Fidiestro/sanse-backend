@@ -103,7 +103,7 @@ exports.getAllTransactions = async (req, res) => {
              ${where}
              ORDER BY t.created_at DESC
              LIMIT ? OFFSET ?`,
-            [...params, limit, offset]
+            [...params, String(limit), String(offset)]
         );
 
         res.json({
