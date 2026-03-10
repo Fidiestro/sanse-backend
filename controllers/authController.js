@@ -25,6 +25,29 @@ exports.login = async (req, res) => {
             await logLoginAttempt(email, ip, false);
             return res.status(401).json({ error: 'Credenciales incorrectas' });
         }
+
+        // ═══ VALIDAR STATUS DEL USUARIO ═══
+        if (user.status === 'pending') {
+            await logLoginAttempt(email, ip, true);
+            return res.status(403).json({ 
+                error: 'Tu cuenta está pendiente de aprobación por un administrador. Te notificaremos cuando sea activada.',
+                pending: true 
+            });
+        }
+        if (user.status === 'blocked') {
+            await logLoginAttempt(email, ip, true);
+            return res.status(403).json({ 
+                error: 'Tu cuenta ha sido suspendida. Contacta al administrador para más información.',
+                blocked: true 
+            });
+        }
+        if (user.status !== 'active') {
+            await logLoginAttempt(email, ip, true);
+            return res.status(403).json({ 
+                error: 'Tu cuenta no está activa. Contacta al administrador.',
+            });
+        }
+
         await logLoginAttempt(email, ip, true);
         const tokens = generateTokens(user.id);
         await auditLog({ userId: user.id, action: 'login', entityType: 'user', entityId: user.id, details: { method: 'email_password' }, ipAddress: ip });
@@ -48,6 +71,15 @@ exports.refreshToken = async (req, res) => {
         if (decoded.type !== 'refresh') return res.status(401).json({ error: 'Token inválido' });
         const user = await User.findById(decoded.userId);
         if (!user) return res.status(401).json({ error: 'Usuario no encontrado' });
+        
+        // ═══ VALIDAR STATUS DEL USUARIO EN REFRESH ═══
+        if (user.status === 'pending') {
+            return res.status(403).json({ error: 'Tu cuenta está pendiente de aprobación.', pending: true });
+        }
+        if (user.status !== 'active') {
+            return res.status(403).json({ error: 'Tu cuenta no está activa. Contacta al administrador.', blocked: true });
+        }
+
         const tokens = generateTokens(user.id);
         res.json({ accessToken: tokens.accessToken, refreshToken: tokens.refreshToken });
     } catch (error) {

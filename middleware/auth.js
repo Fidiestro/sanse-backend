@@ -38,7 +38,13 @@ const authenticate = async (req, res, next) => {
 
         const user = users[0];
 
-        // Verificar si el usuario está bloqueado
+        // Verificar si el usuario está bloqueado o pendiente
+        if (user.status === 'pending') {
+            return res.status(403).json({ 
+                error: 'Tu cuenta está pendiente de aprobación por un administrador.',
+                pending: true 
+            });
+        }
         if (user.status === 'blocked') {
             return res.status(403).json({ 
                 error: 'Tu cuenta ha sido suspendida. Contacta al administrador para más información.',
