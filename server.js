@@ -11,8 +11,10 @@ app.use(helmet());
 
 // ═══ CORS — permitir frontend ═══
 const allowedOrigins = [
-    process.env.FRONTEND_URL || 'https://sansecapital.co',
-    'https://sansecapital.co',
+    process.env.FRONTEND_URL || 'https://sansecapital.com',
+    'https://sansecapital.com',       // ← nuevo
+    'https://www.sansecapital.com',   // ← nuevo
+    'https://sansecapital.co',        // puedes dejarlo o quitarlo
     'https://www.sansecapital.co',
     'http://localhost:3000',
     'http://localhost:5500',
