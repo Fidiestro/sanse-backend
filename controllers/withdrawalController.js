@@ -11,7 +11,7 @@
 //   updated_at
 // ══════════════════════════════════════════════════════════════
 const { pool }   = require('../config/database');
-const { notify } = require('../utils/telegram');
+const { sendTelegram } = require('../utils/telegram');
 const { recalculateAndSaveBalance } = require('../utils/balanceHelper');
 
 // ══════════════════════════════════════════════════════════════
@@ -174,7 +174,7 @@ exports.requestWithdrawal = async (req, res) => {
         const pmTypeName = pm.type === 'nequi' ? 'Nequi' : pm.type === 'daviplata' ? 'Daviplata' : pm.type === 'bancolombia' ? 'Bancolombia' : pm.label;
         const pmDetail   = pm.phone || pm.account_number || '';
 
-        await notify(
+        await sendTelegram(
             `💸 *SOLICITUD DE RETIRO — Sanse Capital*\n\n` +
             `👤 *${userName}*\n` +
             `💰 *$${Math.round(amount).toLocaleString('es-CO')} COP*\n` +
@@ -307,7 +307,7 @@ exports.adminProcessWithdrawal = async (req, res) => {
             );
 
             const [userRows] = await connection.execute(`SELECT full_name FROM users WHERE id = ?`, [wr.user_id]);
-            await notify(
+            await sendTelegram(
                 `✅ *RETIRO APROBADO — Sanse Capital*\n\n` +
                 `👤 ${userRows[0]?.full_name || 'Usuario'}\n` +
                 `💰 $${Math.round(wr.amount).toLocaleString('es-CO')} COP\n` +
@@ -335,7 +335,7 @@ exports.adminProcessWithdrawal = async (req, res) => {
             const newBalance = await recalculateAndSaveBalance(connection, wr.user_id);
 
             const [userRows] = await connection.execute(`SELECT full_name FROM users WHERE id = ?`, [wr.user_id]);
-            await notify(
+            await sendTelegram(
                 `✅ *RETIRO COMPLETADO — Sanse Capital*\n\n` +
                 `👤 ${userRows[0]?.full_name || 'Usuario'}\n` +
                 `💰 $${Math.round(wr.amount).toLocaleString('es-CO')} COP\n` +
@@ -356,7 +356,7 @@ exports.adminProcessWithdrawal = async (req, res) => {
             );
 
             const [userRows] = await connection.execute(`SELECT full_name FROM users WHERE id = ?`, [wr.user_id]);
-            await notify(
+            await sendTelegram(
                 `❌ *RETIRO RECHAZADO — Sanse Capital*\n\n` +
                 `👤 ${userRows[0]?.full_name || 'Usuario'}\n` +
                 `💰 $${Math.round(wr.amount).toLocaleString('es-CO')} COP\n` +

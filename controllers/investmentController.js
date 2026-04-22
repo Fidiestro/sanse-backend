@@ -1,5 +1,6 @@
 const { pool } = require('../config/database');
 const { auditLog } = require('../utils/helpers');
+const { INFLOW_TYPES, OUTFLOW_TYPES } = require('../utils/balanceHelper');
 
 // ═══════════════════════════════════════════════════════════════════════
 // GET /api/investments/available — Productos de inversión disponibles
@@ -77,11 +78,17 @@ exports.createUserInvestment = async (req, res) => {
             const formatDate = (d) => d.toISOString().slice(0, 10);
 
             // Verificar balance disponible
-            const [balanceRows] = await connection.execute(
-                `SELECT COALESCE(SUM(amount), 0) as amount FROM transactions WHERE user_id = ?`,
-                [userId]
+            const inflowPH = INFLOW_TYPES.map(() => '?').join(',');
+            const outflowPH = OUTFLOW_TYPES.map(() => '?').join(',');
+            const [inRows] = await connection.execute(
+                `SELECT COALESCE(SUM(amount), 0) as total FROM transactions WHERE user_id = ? AND type IN (${inflowPH})`,
+                [userId, ...INFLOW_TYPES]
             );
-            const totalBalance = balanceRows.length ? parseFloat(balanceRows[0].amount) : 0;
+            const [outRows] = await connection.execute(
+                `SELECT COALESCE(SUM(amount), 0) as total FROM transactions WHERE user_id = ? AND type IN (${outflowPH})`,
+                [userId, ...OUTFLOW_TYPES]
+            );
+            const totalBalance = parseFloat(inRows[0].total) - parseFloat(outRows[0].total);
 
             const [investedRows] = await connection.execute(
                 `SELECT COALESCE(SUM(amount), 0) as total FROM investments WHERE user_id = ? AND status IN ('active', 'pending_deposit')`,
@@ -95,7 +102,7 @@ exports.createUserInvestment = async (req, res) => {
             );
             const pendingWithdrawalAmount = parseFloat(pendingWithdrawals[0].total);
 
-            const availableBalance = totalBalance - totalInvested - pendingWithdrawalAmount;
+            const availableBalance = Math.max(0, totalBalance - totalInvested - pendingWithdrawalAmount);
 
             if (amount > availableBalance || availableBalance < amount) {
                 return res.status(400).json({
@@ -181,7 +188,7 @@ exports.createUserInvestment = async (req, res) => {
 
         // Verificar máximo 3 CDTC activas por usuario
         const [activeCountRows] = await connection.execute(
-            `SELECT COUNT(*) as c FROM investments WHERE user_id = ? AND status IN ('active', 'pending_deposit') AND (type = 'CDTC' OR type IS NULL)`,
+            `SELECT COUNT(*) as c FROM investments WHERE user_id = ? AND status IN ('active', 'pending_deposit') AND (LOWER(type) = 'cdtc' OR type IS NULL OR type NOT IN ('pool'))`,
             [userId]
         );
         if (activeCountRows[0].c >= 3) {
@@ -189,11 +196,17 @@ exports.createUserInvestment = async (req, res) => {
         }
 
         // Verificar balance disponible
-        const [balanceRows] = await connection.execute(
-            `SELECT COALESCE(SUM(amount), 0) as amount FROM transactions WHERE user_id = ?`,
-            [userId]
+        const inflowPH2 = INFLOW_TYPES.map(() => '?').join(',');
+        const outflowPH2 = OUTFLOW_TYPES.map(() => '?').join(',');
+        const [inRows2] = await connection.execute(
+            `SELECT COALESCE(SUM(amount), 0) as total FROM transactions WHERE user_id = ? AND type IN (${inflowPH2})`,
+            [userId, ...INFLOW_TYPES]
         );
-        const totalBalance = balanceRows.length ? parseFloat(balanceRows[0].amount) : 0;
+        const [outRows2] = await connection.execute(
+            `SELECT COALESCE(SUM(amount), 0) as total FROM transactions WHERE user_id = ? AND type IN (${outflowPH2})`,
+            [userId, ...OUTFLOW_TYPES]
+        );
+        const totalBalance = Math.max(0, parseFloat(inRows2[0].total) - parseFloat(outRows2[0].total));
 
         const [investedRows] = await connection.execute(
             `SELECT COALESCE(SUM(amount), 0) as total FROM investments WHERE user_id = ? AND status IN ('active', 'pending_deposit')`,
