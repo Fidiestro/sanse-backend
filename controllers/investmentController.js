@@ -1,7 +1,9 @@
 const { pool } = require('../config/database');
 const { auditLog } = require('../utils/helpers');
 
+// ═══════════════════════════════════════════════════════════════════════
 // GET /api/investments/available — Productos de inversión disponibles
+// ═══════════════════════════════════════════════════════════════════════
 exports.getAvailableProducts = async (req, res) => {
     try {
         const products = [
@@ -40,83 +42,189 @@ exports.getAvailableProducts = async (req, res) => {
     }
 };
 
-// POST /api/investments/create — Usuario crea inversión CDTC desde su balance disponible
+// ═══════════════════════════════════════════════════════════════════════
+// POST /api/investments/create — Usuario crea inversión CDTC o POOL
+// ═══════════════════════════════════════════════════════════════════════
 exports.createUserInvestment = async (req, res) => {
     const connection = await pool.getConnection();
     try {
         await connection.beginTransaction();
 
         const userId = req.user.id;
-        const { productId } = req.body;
+        const { productId, type, durationMonths } = req.body;
         const amount = parseFloat(req.body.amount);
 
-        if (!productId || !amount || isNaN(amount)) {
-            return res.status(400).json({ error: 'productId y amount son requeridos' });
+        if (!amount || isNaN(amount)) {
+            return res.status(400).json({ error: 'amount es requerido' });
+        }
+
+        // ============ POOL DE LIQUIDEZ ============
+        if (type === 'pool') {
+            // Validar monto mínimo
+            if (amount < 50000) {
+                return res.status(400).json({ error: 'Monto mínimo para Pool: $50,000 COP' });
+            }
+
+            // Calcular comisión de entrada (2%)
+            const entryFee = Math.round(amount * 0.02);
+            const netCapital = amount - entryFee;
+
+            // Fechas (bloqueado 12 meses)
+            const startDate = new Date();
+            const lockEndDate = new Date(startDate);
+            lockEndDate.setMonth(lockEndDate.getMonth() + 12);
+
+            const formatDate = (d) => d.toISOString().slice(0, 10);
+
+            // Verificar balance disponible
+            const [balanceRows] = await connection.execute(
+                `SELECT COALESCE(SUM(amount), 0) as amount FROM transactions WHERE user_id = ?`,
+                [userId]
+            );
+            const totalBalance = balanceRows.length ? parseFloat(balanceRows[0].amount) : 0;
+
+            const [investedRows] = await connection.execute(
+                `SELECT COALESCE(SUM(amount), 0) as total FROM investments WHERE user_id = ? AND status IN ('active', 'pending_deposit')`,
+                [userId]
+            );
+            const totalInvested = parseFloat(investedRows[0].total);
+
+            const [pendingWithdrawals] = await connection.execute(
+                `SELECT COALESCE(SUM(amount), 0) as total FROM withdrawal_requests WHERE user_id = ? AND status IN ('pending', 'approved')`,
+                [userId]
+            );
+            const pendingWithdrawalAmount = parseFloat(pendingWithdrawals[0].total);
+
+            const availableBalance = totalBalance - totalInvested - pendingWithdrawalAmount;
+
+            if (amount > availableBalance || availableBalance < amount) {
+                return res.status(400).json({
+                    error: `Saldo insuficiente. Disponible: $${Math.round(Math.max(0, availableBalance)).toLocaleString('es-CO')} COP`,
+                    available: Math.max(0, availableBalance),
+                });
+            }
+
+            // Crear inversión Pool
+            const [result] = await connection.execute(
+                `INSERT INTO investments 
+                 (user_id, type, amount, net_capital, entry_fee, duration_months, 
+                  start_date, lock_end_date, invested_from_balance, status, notes, withdrawable_earnings) 
+                 VALUES (?, 'pool', ?, ?, ?, 12, ?, ?, 1, 'active', ?, 0)`,
+                [
+                    userId,
+                    amount,
+                    netCapital,
+                    entryFee,
+                    formatDate(startDate),
+                    formatDate(lockEndDate),
+                    `Pool de Liquidez — Capital neto: $${netCapital.toLocaleString('es-CO')} (Comisión entrada: $${entryFee.toLocaleString('es-CO')}, 2%). Bloqueado hasta: ${formatDate(lockEndDate)}. Comisión retiro ganancias: 20%.`,
+                ]
+            );
+
+            const investmentId = result.insertId;
+
+            // Registrar transacción
+            const refId = 'POOL-' + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2, 5).toUpperCase();
+
+            await connection.execute(
+                `INSERT INTO transactions (user_id, investment_id, type, amount, description, ref_id, created_at) 
+                 VALUES (?, ?, 'investment', ?, ?, ?, NOW())`,
+                [userId, investmentId, -amount, `Inversión Pool de Liquidez — Capital neto: $${netCapital.toLocaleString('es-CO')} (Comisión: $${entryFee.toLocaleString('es-CO')})`, refId]
+            );
+
+            // Audit log
+            await auditLog({
+                userId,
+                action: 'create_pool_investment',
+                entityType: 'investment',
+                entityId: investmentId,
+                details: { type: 'pool', amount, netCapital, entryFee, lockEndDate: formatDate(lockEndDate) },
+                ipAddress: req.ip,
+            });
+
+            await connection.commit();
+
+            return res.status(201).json({
+                message: 'Inversión en Pool de Liquidez creada exitosamente',
+                investment: {
+                    id: investmentId,
+                    type: 'pool',
+                    amount,
+                    netCapital,
+                    entryFee,
+                    startDate: formatDate(startDate),
+                    lockEndDate: formatDate(lockEndDate),
+                    durationMonths: 12,
+                },
+            });
+        }
+
+        // ============ CDTC (Lógica original) ============
+        if (!productId) {
+            return res.status(400).json({ error: 'productId es requerido para CDTC' });
         }
 
         // Configuración por plan
         const PLANS = {
-            cdtc_3m:  { durationMonths: 3,  minRate: 2.0, maxRate: 3.0 },
-            cdtc_6m:  { durationMonths: 6,  minRate: 2.0, maxRate: 4.0 },
+            cdtc_3m: { durationMonths: 3, minRate: 2.0, maxRate: 3.0 },
+            cdtc_6m: { durationMonths: 6, minRate: 2.0, maxRate: 4.0 },
             cdtc_12m: { durationMonths: 12, minRate: 3.0, maxRate: 4.0 },
         };
         const plan = PLANS[productId];
         if (!plan) {
             return res.status(400).json({ error: 'Producto no disponible. Usa: cdtc_3m, cdtc_6m o cdtc_12m' });
         }
-        const { durationMonths, minRate, maxRate } = plan;
+        const { durationMonths: months, minRate, maxRate } = plan;
         if (amount < 100000 || !isFinite(amount)) {
             return res.status(400).json({ error: 'Monto mínimo de inversión: $100.000 COP' });
         }
 
         // Verificar máximo 3 CDTC activas por usuario
         const [activeCountRows] = await connection.execute(
-            `SELECT COUNT(*) as c FROM investments WHERE user_id = ? AND status IN ('active', 'pending_deposit')`,
+            `SELECT COUNT(*) as c FROM investments WHERE user_id = ? AND status IN ('active', 'pending_deposit') AND (type = 'CDTC' OR type IS NULL)`,
             [userId]
         );
         if (activeCountRows[0].c >= 3) {
-            return res.status(400).json({ error: 'Máximo 3 inversiones CDTC activas permitidas. Espera a que una termine o retírala para crear otra.' });
+            return res.status(400).json({ error: 'Máximo 3 inversiones CDTC activas simultáneamente' });
         }
 
-        // 1. Calcular balance disponible del usuario
+        // Verificar balance disponible
         const [balanceRows] = await connection.execute(
-            `SELECT amount FROM balance_history WHERE user_id = ? ORDER BY snapshot_date DESC LIMIT 1`,
+            `SELECT COALESCE(SUM(amount), 0) as amount FROM transactions WHERE user_id = ?`,
             [userId]
         );
-        const currentBalance = balanceRows.length > 0 ? parseFloat(balanceRows[0].amount) : 0;
+        const totalBalance = balanceRows.length ? parseFloat(balanceRows[0].amount) : 0;
 
-        // 2. Calcular total invertido activamente (incluye pending_deposit)
         const [investedRows] = await connection.execute(
             `SELECT COALESCE(SUM(amount), 0) as total FROM investments WHERE user_id = ? AND status IN ('active', 'pending_deposit')`,
             [userId]
         );
         const totalInvested = parseFloat(investedRows[0].total);
 
-        // 3. Restar retiros pendientes/aprobados (dinero comprometido)
-        const [pendingWR] = await connection.execute(
+        const [pendingWithdrawals] = await connection.execute(
             `SELECT COALESCE(SUM(amount), 0) as total FROM withdrawal_requests WHERE user_id = ? AND status IN ('pending', 'approved')`,
             [userId]
         );
-        const pendingWithdrawals = parseFloat(pendingWR[0].total);
+        const pendingWithdrawalAmount = parseFloat(pendingWithdrawals[0].total);
 
-        const availableBalance = currentBalance - totalInvested - pendingWithdrawals;
+        const availableBalance = totalBalance - totalInvested - pendingWithdrawalAmount;
 
-        if (amount > availableBalance) {
+        if (amount > availableBalance || availableBalance < amount) {
             return res.status(400).json({
-                error: `Saldo disponible insuficiente. Disponible: $${Math.round(Math.max(0, availableBalance)).toLocaleString('es-CO')} COP`,
+                error: `Saldo insuficiente. Disponible: $${Math.round(Math.max(0, availableBalance)).toLocaleString('es-CO')} COP`,
                 available: Math.max(0, availableBalance),
             });
         }
 
-        // 3. Calcular fechas
+        // Calcular fechas
         const startDate = new Date();
         const endDate = new Date();
-        endDate.setMonth(endDate.getMonth() + durationMonths);
+        endDate.setMonth(endDate.getMonth() + months);
         const lockEndDate = new Date(endDate);
 
         const formatDate = (d) => d.toISOString().slice(0, 10);
 
-        // 4. Crear la inversión en estado pending_deposit (12h para confirmar/cancelar)
+        // Crear la inversión en estado pending_deposit (12h para confirmar/cancelar)
         const depositDeadline = new Date();
         depositDeadline.setHours(depositDeadline.getHours() + 12);
 
@@ -128,55 +236,49 @@ exports.createUserInvestment = async (req, res) => {
             [
                 userId,
                 amount,
-                durationMonths,
+                months,
                 minRate,
                 maxRate,
                 formatDate(startDate),
                 formatDate(endDate),
                 formatDate(lockEndDate),
-                `Inversión CDTC ${durationMonths}m — Período de depósito hasta: ${depositDeadline.toISOString().slice(0,16).replace('T',' ')}. Desbloqueo: ${formatDate(lockEndDate)}`,
+                `Inversión CDTC ${months}m — Período de depósito hasta: ${depositDeadline.toISOString().slice(0, 16).replace('T', ' ')}. Desbloqueo: ${formatDate(lockEndDate)}`,
             ]
         );
 
         const investmentId = result.insertId;
 
-        // 5. Registrar transacción
-        // Unique ref_id using timestamp + random
-        const refId = 'INV-' + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2,5).toUpperCase();
+        // Registrar transacción
+        const refId = 'INV-' + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2, 5).toUpperCase();
 
         await connection.execute(
             `INSERT INTO transactions (user_id, investment_id, type, amount, description, ref_id, created_at) 
              VALUES (?, ?, 'investment', ?, ?, ?, NOW())`,
-            [userId, investmentId, amount, `Inversión CDTC a ${durationMonths} meses — Desbloqueo: ${formatDate(lockEndDate)}`, refId]
+            [userId, investmentId, -amount, `Inversión CDTC a ${months} meses — Desbloqueo: ${formatDate(lockEndDate)}`, refId]
         );
 
-        // 6. Audit log
+        // Audit log
         await auditLog({
             userId,
             action: 'create_investment',
             entityType: 'investment',
             entityId: investmentId,
-            details: { type: 'CDTC', amount, durationMonths, lockEndDate: formatDate(lockEndDate) },
+            details: { type: 'CDTC', amount, durationMonths: months, lockEndDate: formatDate(lockEndDate) },
             ipAddress: req.ip,
         });
 
         await connection.commit();
 
         res.status(201).json({
-            message: `Inversión CDTC a ${durationMonths} meses creada. Tienes 12 horas para confirmar o cancelar.`,
+            message: `Inversión CDTC a ${months} meses creada exitosamente`,
             investment: {
                 id: investmentId,
-                type: 'CDTC',
+                productId,
                 amount,
-                durationMonths,
+                durationMonths: months,
                 startDate: formatDate(startDate),
-                endDate: formatDate(endDate),
                 lockEndDate: formatDate(lockEndDate),
-                minMonthlyRate: minRate,
-                maxMonthlyRate: maxRate,
-                status: 'pending_deposit',
                 depositDeadline: depositDeadline.toISOString(),
-                refId,
             },
         });
     } catch (error) {
@@ -188,446 +290,18 @@ exports.createUserInvestment = async (req, res) => {
     }
 };
 
-// ══════════════════════════════════════════════════════════════
-// POST /api/investments/:id/cancel — Cancelar inversión en período de depósito (12h)
-// Solo funciona si status es 'pending_deposit'
-// ══════════════════════════════════════════════════════════════
-exports.cancelInvestment = async (req, res) => {
-    const connection = await pool.getConnection();
-    try {
-        await connection.beginTransaction();
-
-        const userId = req.user.id;
-        const investmentId = req.params.id;
-
-        const [invRows] = await connection.execute(
-            `SELECT * FROM investments WHERE id = ? AND user_id = ? AND status = 'pending_deposit'`,
-            [investmentId, userId]
-        );
-        if (!invRows.length) {
-            return res.status(404).json({ error: 'Inversión no encontrada o ya no se puede cancelar (período de 12 horas expirado)' });
-        }
-
-        // Verificar que aún estamos dentro de las 12h
-        const inv = invRows[0];
-        const createdAt = new Date(inv.created_at);
-        const deadline = new Date(createdAt.getTime() + 12 * 60 * 60 * 1000);
-        if (new Date() > deadline) {
-            // Auto-activar si expiró
-            await connection.execute(`UPDATE investments SET status = 'active' WHERE id = ?`, [investmentId]);
-            await connection.commit();
-            return res.status(400).json({ error: 'El período de cancelación de 12 horas ya expiró. La inversión ahora está activa.' });
-        }
-
-        // Cancelar: cambiar status a cancelled (no eliminar para mantener audit trail)
-        await connection.execute(`UPDATE investments SET status = 'cancelled' WHERE id = ? AND user_id = ?`, [investmentId, userId]);
-        
-        // Eliminar la transacción de inversión asociada (para que no cuente en balance)
-        await connection.execute(`DELETE FROM transactions WHERE investment_id = ? AND user_id = ? AND type = 'investment'`, [investmentId, userId]);
-
-        await auditLog({
-            userId,
-            action: 'cancel_investment',
-            entityType: 'investment',
-            entityId: parseInt(investmentId),
-            details: { amount: parseFloat(inv.amount), reason: 'Cancelado dentro de 12h' },
-            ipAddress: req.ip,
-        });
-
-        await connection.commit();
-
-        res.json({
-            message: 'Inversión cancelada exitosamente. El capital vuelve a tu saldo disponible.',
-            refundedAmount: parseFloat(inv.amount),
-        });
-    } catch (error) {
-        await connection.rollback();
-        console.error('Error cancelando inversión:', error);
-        res.status(500).json({ error: 'Error interno del servidor' });
-    } finally {
-        connection.release();
-    }
-};
-
-// ══════════════════════════════════════════════════════════════
-// POST /api/investments/:id/confirm — Confirmar inversión (activa inmediatamente)
-// ══════════════════════════════════════════════════════════════
-exports.confirmInvestment = async (req, res) => {
-    try {
-        const userId = req.user.id;
-        const investmentId = req.params.id;
-
-        const [invRows] = await pool.execute(
-            `SELECT * FROM investments WHERE id = ? AND user_id = ? AND status = 'pending_deposit'`,
-            [investmentId, userId]
-        );
-        if (!invRows.length) {
-            return res.status(404).json({ error: 'Inversión no encontrada o ya está activa' });
-        }
-
-        await pool.execute(`UPDATE investments SET status = 'active' WHERE id = ?`, [investmentId]);
-
-        res.json({ message: 'Inversión confirmada y activada.', investmentId: parseInt(investmentId) });
-    } catch (error) {
-        console.error('Error confirmando inversión:', error);
-        res.status(500).json({ error: 'Error interno del servidor' });
-    }
-};
-
-// ══════════════════════════════════════════════════════════════
-// POST /api/investments/:id/add-capital — Agregar capital a inversión existente
-// La fecha de vencimiento NO cambia, solo aumenta el monto invertido
-// ══════════════════════════════════════════════════════════════
-exports.addCapitalToInvestment = async (req, res) => {
-    const connection = await pool.getConnection();
-    try {
-        await connection.beginTransaction();
-
-        const userId = req.user.id;
-        const investmentId = req.params.id;
-        const { amount: rawAmount } = req.body;
-        const amount = parseFloat(rawAmount);
-
-        if (!amount || isNaN(amount) || !isFinite(amount) || amount < 50000) {
-            return res.status(400).json({ error: 'Monto mínimo para agregar: $50.000 COP' });
-        }
-
-        // 1. Verificar que la inversión existe, es del usuario, y está activa
-        const [invRows] = await connection.execute(
-            `SELECT * FROM investments WHERE id = ? AND user_id = ? AND status = 'active'`,
-            [investmentId, userId]
-        );
-        if (!invRows.length) {
-            return res.status(404).json({ error: 'Inversión no encontrada o no está activa' });
-        }
-        const inv = invRows[0];
-
-        // 2. Verificar que no haya vencido
-        const now = new Date();
-        const lockEnd = new Date(inv.lock_end_date || inv.end_date);
-        if (now >= lockEnd) {
-            return res.status(400).json({ error: 'No se puede agregar capital a una inversión vencida. Retírala y crea una nueva.' });
-        }
-
-        // 3. Verificar balance disponible
-        const [balanceRows] = await connection.execute(
-            `SELECT amount FROM balance_history WHERE user_id = ? ORDER BY snapshot_date DESC LIMIT 1`,
-            [userId]
-        );
-        const currentBalance = balanceRows.length > 0 ? parseFloat(balanceRows[0].amount) : 0;
-
-        const [investedRows] = await connection.execute(
-            `SELECT COALESCE(SUM(amount), 0) as total FROM investments WHERE user_id = ? AND status IN ('active', 'pending_deposit')`,
-            [userId]
-        );
-        const totalInvested = parseFloat(investedRows[0].total);
-
-        const [pendingWR] = await connection.execute(
-            `SELECT COALESCE(SUM(amount), 0) as total FROM withdrawal_requests WHERE user_id = ? AND status IN ('pending', 'approved')`,
-            [userId]
-        );
-        const pendingWithdrawals = parseFloat(pendingWR[0].total);
-
-        const availableBalance = currentBalance - totalInvested - pendingWithdrawals;
-
-        if (amount > availableBalance) {
-            return res.status(400).json({
-                error: `Saldo disponible insuficiente. Disponible: $${Math.round(Math.max(0, availableBalance)).toLocaleString('es-CO')} COP`,
-                available: Math.max(0, availableBalance),
-            });
-        }
-
-        // 4. Actualizar monto (NO cambia lock_end_date ni end_date)
-        const previousAmount = parseFloat(inv.amount);
-        const newAmount = previousAmount + amount;
-        const addedDate = now.toISOString().slice(0, 10);
-
-        await connection.execute(
-            `UPDATE investments SET amount = ? WHERE id = ?`,
-            [newAmount, investmentId]
-        );
-
-        // 5. Registrar transacción
-        // Unique ref_id using timestamp + random
-        const refId = 'ADD-' + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2,5).toUpperCase();
-
-        const lockDateStr = (inv.lock_end_date || inv.end_date).toString().slice(0, 10);
-
-        await connection.execute(
-            `INSERT INTO transactions (user_id, investment_id, type, amount, description, ref_id, created_at) 
-             VALUES (?, ?, 'investment', ?, ?, ?, NOW())`,
-            [userId, investmentId, amount, `Capital adicional CDTC #${investmentId} — Mismo vencimiento: ${lockDateStr}`, refId]
-        );
-
-        // 6. Audit log
-        await auditLog({
-            userId,
-            action: 'add_capital',
-            entityType: 'investment',
-            entityId: parseInt(investmentId),
-            details: { previousAmount, addedAmount: amount, newAmount, lockEndDate: lockDateStr },
-            ipAddress: req.ip,
-        });
-
-        await connection.commit();
-
-        res.json({
-            message: 'Capital agregado exitosamente',
-            investment: {
-                id: parseInt(investmentId),
-                previousAmount,
-                addedAmount: amount,
-                newAmount,
-                lockEndDate: lockDateStr,
-                refId,
-            },
-        });
-    } catch (error) {
-        await connection.rollback();
-        console.error('Error agregando capital:', error);
-        res.status(500).json({ error: 'Error interno del servidor' });
-    } finally {
-        connection.release();
-    }
-};
-
-// ══════════════════════════════════════════════════════════════
-// POST /api/investments/:id/withdraw — Retirar inversión vencida
-// Solo funciona si lock_end_date ya pasó
-// Cambia status a 'completed' y el capital vuelve al disponible
-// ══════════════════════════════════════════════════════════════
-exports.withdrawInvestment = async (req, res) => {
-    const connection = await pool.getConnection();
-    try {
-        await connection.beginTransaction();
-
-        const userId = req.user.id;
-        const investmentId = req.params.id;
-
-        // 1. Verificar inversión
-        const [invRows] = await connection.execute(
-            `SELECT * FROM investments WHERE id = ? AND user_id = ? AND status = 'active'`,
-            [investmentId, userId]
-        );
-        if (!invRows.length) {
-            return res.status(404).json({ error: 'Inversión no encontrada o no está activa' });
-        }
-        const inv = invRows[0];
-
-        // 2. Verificar que ya venció
-        const now = new Date();
-        const lockEnd = new Date(inv.lock_end_date || inv.end_date);
-        if (now < lockEnd) {
-            const daysLeft = Math.ceil((lockEnd - now) / (1000 * 60 * 60 * 24));
-            return res.status(400).json({
-                error: `La inversión aún no ha vencido. Faltan ${daysLeft} días para el desbloqueo.`,
-                daysRemaining: daysLeft,
-                lockEndDate: lockEnd.toISOString().slice(0, 10),
-            });
-        }
-
-        // 3. Capital a devolver
-        const capitalAmount = parseFloat(inv.amount);
-
-        // 4. Marcar inversión como completada
-        await connection.execute(
-            `UPDATE investments SET status = 'completed' WHERE id = ?`,
-            [investmentId]
-        );
-
-        // 5. NO necesita transacción extra: al cambiar a completed, el amount
-        // ya no se cuenta como "invertido", así que automáticamente vuelve al disponible
-        // Pero registramos una transacción informativa
-        // Unique ref_id using timestamp + random
-        const refId = 'WDR-' + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2,5).toUpperCase();
-
-        await connection.execute(
-            `INSERT INTO transactions (user_id, investment_id, type, amount, description, ref_id, created_at) 
-             VALUES (?, ?, 'investment_withdrawal', ?, ?, ?, NOW())`,
-            [userId, investmentId, capitalAmount, `Retiro inversión CDTC #${investmentId} — Capital liberado`, refId]
-        );
-
-        // 6. Audit log
-        await auditLog({
-            userId,
-            action: 'withdraw_investment',
-            entityType: 'investment',
-            entityId: parseInt(investmentId),
-            details: { capitalReturned: capitalAmount },
-            ipAddress: req.ip,
-        });
-
-        await connection.commit();
-
-        res.json({
-            message: 'Inversión retirada exitosamente. El capital ha vuelto a tu saldo disponible.',
-            investment: {
-                id: parseInt(investmentId),
-                capitalReturned: capitalAmount,
-                refId,
-            },
-        });
-    } catch (error) {
-        await connection.rollback();
-        console.error('Error retirando inversión:', error);
-        res.status(500).json({ error: 'Error interno del servidor' });
-    } finally {
-        connection.release();
-    }
-};
-
-// GET /api/investments/my — Inversiones del usuario con detalle
-exports.getMyInvestments = async (req, res) => {
-    try {
-        const userId = req.user.id;
-
-        const [investments] = await pool.execute(
-            `SELECT id, type, amount, annual_rate, duration_months, min_monthly_rate, max_monthly_rate,
-                    start_date, end_date, lock_end_date, status, notes, created_at
-             FROM investments WHERE user_id = ? ORDER BY created_at DESC`,
-            [userId]
-        );
-
-        const results = await Promise.all(
-            investments.map(async (inv) => {
-                const [returns] = await pool.execute(
-                    `SELECT period_month, rate_applied, amount_earned, status 
-                     FROM investment_returns WHERE investment_id = ? ORDER BY period_month ASC`,
-                    [inv.id]
-                );
-
-                const totalEarned = returns.reduce((sum, r) => sum + parseFloat(r.amount_earned), 0);
-                const now = new Date();
-                const end = new Date(inv.lock_end_date || inv.end_date);
-                const start = new Date(inv.start_date);
-                const totalDays = Math.max(1, (end - start) / (1000 * 60 * 60 * 24));
-                const elapsedDays = Math.max(0, (now - start) / (1000 * 60 * 60 * 24));
-                const progressPct = Math.min(100, Math.round((elapsedDays / totalDays) * 100));
-                const daysRemaining = Math.max(0, Math.ceil((end - now) / (1000 * 60 * 60 * 24)));
-                const isMatured = now >= end;
-                const isPendingDeposit = inv.status === 'pending_deposit';
-                const createdAt = new Date(inv.created_at);
-                const depositDeadline = isPendingDeposit ? new Date(createdAt.getTime() + 12 * 60 * 60 * 1000) : null;
-                const canCancel = isPendingDeposit && now < depositDeadline;
-
-                // Auto-activate if pending_deposit and 12h passed
-                if (isPendingDeposit && !canCancel) {
-                    await pool.execute(`UPDATE investments SET status = 'active' WHERE id = ? AND status = 'pending_deposit'`, [inv.id]);
-                    inv.status = 'active';
-                }
-
-                return {
-                    id: inv.id,
-                    type: inv.type,
-                    amount: parseFloat(inv.amount),
-                    annualRate: parseFloat(inv.annual_rate),
-                    durationMonths: inv.duration_months,
-                    minMonthlyRate: parseFloat(inv.min_monthly_rate || 0),
-                    maxMonthlyRate: parseFloat(inv.max_monthly_rate || 0),
-                    startDate: inv.start_date,
-                    endDate: inv.end_date,
-                    lockEndDate: inv.lock_end_date,
-                    status: inv.status,
-                    notes: inv.notes,
-                    progressPct,
-                    daysRemaining,
-                    totalEarned,
-                    isMatured,
-                    isPendingDeposit: inv.status === 'pending_deposit',
-                    canCancel: inv.status === 'pending_deposit',
-                    depositDeadline: depositDeadline ? depositDeadline.toISOString() : null,
-                    returns: returns.map((r) => ({
-                        month: r.period_month,
-                        rate: parseFloat(r.rate_applied),
-                        earned: parseFloat(r.amount_earned),
-                        status: r.status,
-                    })),
-                };
-            })
-        );
-
-        res.json(results);
-    } catch (error) {
-        console.error('Error obteniendo inversiones:', error);
-        res.status(500).json({ error: 'Error interno del servidor' });
-    }
-};
-
-// GET /api/investments/:id — Detalle de una inversión específica
-exports.getInvestmentDetail = async (req, res) => {
-    try {
-        const userId = req.user.id;
-        const investmentId = req.params.id;
-
-        const [rows] = await pool.execute(
-            `SELECT * FROM investments WHERE id = ? AND user_id = ?`,
-            [investmentId, userId]
-        );
-        if (!rows.length) return res.status(404).json({ error: 'Inversión no encontrada' });
-
-        const inv = rows[0];
-        const now = new Date();
-        const end = new Date(inv.lock_end_date || inv.end_date);
-        const isMatured = now >= end;
-
-        const [returns] = await pool.execute(
-            `SELECT period_month, rate_applied, amount_earned, status, notes 
-             FROM investment_returns WHERE investment_id = ? ORDER BY period_month ASC`,
-            [investmentId]
-        );
-
-        const [transactions] = await pool.execute(
-            `SELECT type, amount, description, ref_id, created_at 
-             FROM transactions WHERE investment_id = ? ORDER BY created_at ASC`,
-            [investmentId]
-        );
-
-        res.json({
-            investment: {
-                id: inv.id,
-                type: inv.type,
-                amount: parseFloat(inv.amount),
-                durationMonths: inv.duration_months,
-                minMonthlyRate: parseFloat(inv.min_monthly_rate || 0),
-                maxMonthlyRate: parseFloat(inv.max_monthly_rate || 0),
-                startDate: inv.start_date,
-                endDate: inv.end_date,
-                lockEndDate: inv.lock_end_date,
-                status: inv.status,
-                notes: inv.notes,
-                isMatured,
-            },
-            returns: returns.map((r) => ({
-                month: r.period_month,
-                rate: parseFloat(r.rate_applied),
-                earned: parseFloat(r.amount_earned),
-                status: r.status,
-                notes: r.notes,
-            })),
-            transactions: transactions.map((t) => ({
-                type: t.type,
-                amount: parseFloat(t.amount),
-                description: t.description,
-                refId: t.ref_id,
-                date: t.created_at,
-            })),
-        });
-    } catch (error) {
-        console.error('Error obteniendo detalle:', error);
-        res.status(500).json({ error: 'Error interno del servidor' });
-    }
-};
-
-// GET /api/investments/balance-summary — Resumen de balance para el dashboard
+// ═══════════════════════════════════════════════════════════════════════
+// GET /api/investments/balance-summary
+// ═══════════════════════════════════════════════════════════════════════
 exports.getBalanceSummary = async (req, res) => {
     try {
         const userId = req.user.id;
 
         const [balanceRows] = await pool.execute(
-            `SELECT amount FROM balance_history WHERE user_id = ? ORDER BY snapshot_date DESC LIMIT 1`,
+            `SELECT COALESCE(SUM(amount), 0) as amount FROM transactions WHERE user_id = ?`,
             [userId]
         );
-        const totalBalance = balanceRows.length > 0 ? parseFloat(balanceRows[0].amount) : 0;
+        const totalBalance = balanceRows.length ? parseFloat(balanceRows[0].amount) : 0;
 
         const [investedRows] = await pool.execute(
             `SELECT COALESCE(SUM(amount), 0) as total FROM investments WHERE user_id = ? AND status IN ('active', 'pending_deposit')`,
@@ -635,7 +309,6 @@ exports.getBalanceSummary = async (req, res) => {
         );
         const totalInvested = parseFloat(investedRows[0].total);
 
-        // Restar retiros pendientes y aprobados (dinero ya comprometido)
         const [pendingWithdrawals] = await pool.execute(
             `SELECT COALESCE(SUM(amount), 0) as total FROM withdrawal_requests WHERE user_id = ? AND status IN ('pending', 'approved')`,
             [userId]
@@ -663,10 +336,11 @@ exports.getBalanceSummary = async (req, res) => {
     }
 };
 
-// GET /api/investments/global-stats — Estadísticas globales de CDTC (público para usuarios)
+// ═══════════════════════════════════════════════════════════════════════
+// GET /api/investments/global-stats
+// ═══════════════════════════════════════════════════════════════════════
 exports.getGlobalStats = async (req, res) => {
     try {
-        // 1. Total capital bloqueado en CDTC activas (todos los usuarios)
         const [lockedRows] = await pool.execute(
             `SELECT COALESCE(SUM(amount), 0) as total, COUNT(*) as count 
              FROM investments WHERE status IN ('active', 'pending_deposit')`
@@ -674,46 +348,456 @@ exports.getGlobalStats = async (req, res) => {
         const totalLocked = parseFloat(lockedRows[0].total);
         const totalActiveInvestments = parseInt(lockedRows[0].count);
 
-        // 2. Total usuarios invirtiendo
         const [usersRows] = await pool.execute(
             `SELECT COUNT(DISTINCT user_id) as count FROM investments WHERE status IN ('active', 'pending_deposit')`
         );
         const totalInvestors = parseInt(usersRows[0].count);
 
-        // 3. Calcular APY real basado en rendimientos pagados
-        // APY = ((1 + tasa_mensual_promedio)^12 - 1) × 100
         const [returnsRows] = await pool.execute(
-            `SELECT AVG(rate_applied) as avgMonthlyRate, 
-                    SUM(amount_earned) as totalEarned,
-                    COUNT(*) as totalPayments
-             FROM investment_returns WHERE status = 'paid'`
+            `SELECT AVG(rate_applied) as avg FROM investment_returns WHERE status = 'paid' AND rate_applied > 0`
         );
-        const avgMonthlyRate = parseFloat(returnsRows[0].avgMonthlyRate) || 0;
-        const totalEarnedGlobal = parseFloat(returnsRows[0].totalEarned) || 0;
-        const totalPayments = parseInt(returnsRows[0].totalPayments) || 0;
-
-        // APY compuesto: ((1 + r/100)^12 - 1) × 100
-        const apyReal = avgMonthlyRate > 0 
-            ? ((Math.pow(1 + avgMonthlyRate / 100, 12) - 1) * 100).toFixed(1)
-            : 0;
-
-        // APY rango (basado en min 2% y max 4% mensual)
-        const apyMin = ((Math.pow(1.02, 12) - 1) * 100).toFixed(1); // ~26.8%
-        const apyMax = ((Math.pow(1.04, 12) - 1) * 100).toFixed(1); // ~60.1%
+        const avgAPY = returnsRows[0].avg ? parseFloat(returnsRows[0].avg) : 0;
 
         res.json({
-            totalLocked,
+            totalLockedCapital: totalLocked,
             totalActiveInvestments,
             totalInvestors,
-            avgMonthlyRate: parseFloat(avgMonthlyRate.toFixed(2)),
-            apyReal: parseFloat(apyReal),
-            apyMin: parseFloat(apyMin),
-            apyMax: parseFloat(apyMax),
-            totalEarnedGlobal,
-            totalPayments,
+            avgMonthlyAPY: avgAPY,
         });
     } catch (error) {
         console.error('Error global stats:', error);
         res.status(500).json({ error: 'Error interno del servidor' });
+    }
+};
+
+// ═══════════════════════════════════════════════════════════════════════
+// GET /api/investments/my
+// ═══════════════════════════════════════════════════════════════════════
+exports.getMyInvestments = async (req, res) => {
+    try {
+        const userId = req.user.id;
+
+        const [investments] = await pool.execute(
+            `SELECT id, type, amount, net_capital, entry_fee, withdrawable_earnings, annual_rate, duration_months, 
+                    min_monthly_rate, max_monthly_rate, start_date, end_date, lock_end_date, status, notes, created_at
+             FROM investments WHERE user_id = ? ORDER BY created_at DESC`,
+            [userId]
+        );
+
+        const results = await Promise.all(
+            investments.map(async (inv) => {
+                const [returns] = await pool.execute(
+                    `SELECT period_month, rate_applied, amount_earned, status 
+                     FROM investment_returns WHERE investment_id = ? ORDER BY period_month ASC`,
+                    [inv.id]
+                );
+
+                const now = new Date();
+                const depositDeadlineMatch = inv.notes?.match(/Período de depósito hasta: ([\d-: ]+)/);
+                const depositDeadline = depositDeadlineMatch ? new Date(depositDeadlineMatch[1].replace(' ', 'T')) : null;
+
+                return {
+                    id: inv.id,
+                    type: inv.type || 'CDTC',
+                    amount: parseFloat(inv.amount),
+                    netCapital: inv.net_capital ? parseFloat(inv.net_capital) : null,
+                    entryFee: inv.entry_fee ? parseFloat(inv.entry_fee) : null,
+                    withdrawableEarnings: inv.withdrawable_earnings ? parseFloat(inv.withdrawable_earnings) : null,
+                    durationMonths: inv.duration_months,
+                    minMonthlyRate: inv.min_monthly_rate ? parseFloat(inv.min_monthly_rate) : null,
+                    maxMonthlyRate: inv.max_monthly_rate ? parseFloat(inv.max_monthly_rate) : null,
+                    startDate: inv.start_date,
+                    endDate: inv.end_date,
+                    lockEndDate: inv.lock_end_date,
+                    status: inv.status,
+                    notes: inv.notes,
+                    createdAt: inv.created_at,
+                    totalEarned: returns.reduce((sum, r) => sum + parseFloat(r.amount_earned), 0),
+                    canCancel: inv.status === 'pending_deposit' && depositDeadline && now < depositDeadline,
+                    depositDeadline: inv.status === 'pending_deposit' && depositDeadline ? depositDeadline.toISOString() : null,
+                    returns: returns.map((r) => ({
+                        month: r.period_month,
+                        rate: parseFloat(r.rate_applied),
+                        earned: parseFloat(r.amount_earned),
+                        status: r.status,
+                    })),
+                };
+            })
+        );
+
+        res.json(results);
+    } catch (error) {
+        console.error('Error obteniendo inversiones:', error);
+        res.status(500).json({ error: 'Error interno del servidor' });
+    }
+};
+
+// ═══════════════════════════════════════════════════════════════════════
+// GET /api/investments/:id
+// ═══════════════════════════════════════════════════════════════════════
+exports.getInvestmentDetail = async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const investmentId = req.params.id;
+
+        const [rows] = await pool.execute(
+            `SELECT * FROM investments WHERE id = ? AND user_id = ?`,
+            [investmentId, userId]
+        );
+        if (!rows.length) return res.status(404).json({ error: 'Inversión no encontrada' });
+
+        const inv = rows[0];
+        const now = new Date();
+        const end = new Date(inv.lock_end_date || inv.end_date);
+        const isMatured = now >= end;
+
+        const [returns] = await pool.execute(
+            `SELECT period_month, rate_applied, amount_earned, status, notes 
+             FROM investment_returns WHERE investment_id = ? ORDER BY period_month ASC`,
+            [investmentId]
+        );
+
+        const [transactions] = await pool.execute(
+            `SELECT type, amount, description, ref_id, created_at 
+             FROM transactions WHERE investment_id = ? ORDER BY created_at DESC`,
+            [investmentId]
+        );
+
+        res.json({
+            investment: {
+                id: inv.id,
+                type: inv.type || 'CDTC',
+                amount: parseFloat(inv.amount),
+                netCapital: inv.net_capital ? parseFloat(inv.net_capital) : null,
+                entryFee: inv.entry_fee ? parseFloat(inv.entry_fee) : null,
+                withdrawableEarnings: inv.withdrawable_earnings ? parseFloat(inv.withdrawable_earnings) : null,
+                durationMonths: inv.duration_months,
+                minMonthlyRate: inv.min_monthly_rate ? parseFloat(inv.min_monthly_rate) : null,
+                maxMonthlyRate: inv.max_monthly_rate ? parseFloat(inv.max_monthly_rate) : null,
+                startDate: inv.start_date,
+                endDate: inv.end_date,
+                lockEndDate: inv.lock_end_date,
+                status: inv.status,
+                notes: inv.notes,
+                createdAt: inv.created_at,
+                isMatured,
+            },
+            returns: returns.map((r) => ({
+                month: r.period_month,
+                rate: parseFloat(r.rate_applied),
+                earned: parseFloat(r.amount_earned),
+                status: r.status,
+                notes: r.notes,
+            })),
+            transactions: transactions.map((t) => ({
+                type: t.type,
+                amount: parseFloat(t.amount),
+                description: t.description,
+                refId: t.ref_id,
+                createdAt: t.created_at,
+            })),
+        });
+    } catch (error) {
+        console.error('Error obteniendo detalle de inversión:', error);
+        res.status(500).json({ error: 'Error interno del servidor' });
+    }
+};
+
+// ═══════════════════════════════════════════════════════════════════════
+// POST /api/investments/:id/add-capital
+// ═══════════════════════════════════════════════════════════════════════
+exports.addCapitalToInvestment = async (req, res) => {
+    const connection = await pool.getConnection();
+    try {
+        await connection.beginTransaction();
+
+        const userId = req.user.id;
+        const investmentId = req.params.id;
+        const addAmount = parseFloat(req.body.amount);
+
+        if (!addAmount || addAmount <= 0) {
+            return res.status(400).json({ error: 'Monto inválido' });
+        }
+
+        const [invRows] = await connection.execute(
+            `SELECT * FROM investments WHERE id = ? AND user_id = ?`,
+            [investmentId, userId]
+        );
+        if (!invRows.length) {
+            return res.status(404).json({ error: 'Inversión no encontrada' });
+        }
+
+        const inv = invRows[0];
+        if (inv.status !== 'active') {
+            return res.status(400).json({ error: 'Solo se puede agregar capital a inversiones activas' });
+        }
+
+        // Verificar balance disponible
+        const [balanceRows] = await connection.execute(
+            `SELECT COALESCE(SUM(amount), 0) as amount FROM transactions WHERE user_id = ?`,
+            [userId]
+        );
+        const totalBalance = parseFloat(balanceRows[0].amount);
+
+        const [investedRows] = await connection.execute(
+            `SELECT COALESCE(SUM(amount), 0) as total FROM investments WHERE user_id = ? AND status IN ('active', 'pending_deposit')`,
+            [userId]
+        );
+        const totalInvested = parseFloat(investedRows[0].total);
+
+        const [pendingWithdrawals] = await connection.execute(
+            `SELECT COALESCE(SUM(amount), 0) as total FROM withdrawal_requests WHERE user_id = ? AND status IN ('pending', 'approved')`,
+            [userId]
+        );
+        const pendingWithdrawalAmount = parseFloat(pendingWithdrawals[0].total);
+
+        const availableBalance = totalBalance - totalInvested - pendingWithdrawalAmount;
+
+        if (addAmount > availableBalance) {
+            return res.status(400).json({
+                error: `Saldo insuficiente. Disponible: $${Math.round(Math.max(0, availableBalance)).toLocaleString('es-CO')} COP`,
+            });
+        }
+
+        // Actualizar monto de la inversión
+        const newAmount = parseFloat(inv.amount) + addAmount;
+        await connection.execute(
+            `UPDATE investments SET amount = ? WHERE id = ?`,
+            [newAmount, investmentId]
+        );
+
+        // Registrar transacción
+        const refId = 'ADD-' + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2, 5).toUpperCase();
+        await connection.execute(
+            `INSERT INTO transactions (user_id, investment_id, type, amount, description, ref_id, created_at) 
+             VALUES (?, ?, 'investment', ?, ?, ?, NOW())`,
+            [userId, investmentId, -addAmount, `Adición de capital a inversión #${investmentId}`, refId]
+        );
+
+        await auditLog({
+            userId,
+            action: 'add_capital_to_investment',
+            entityType: 'investment',
+            entityId: parseInt(investmentId),
+            details: { addedAmount: addAmount, newTotalAmount: newAmount },
+            ipAddress: req.ip,
+        });
+
+        await connection.commit();
+
+        res.json({
+            message: 'Capital agregado exitosamente',
+            investment: {
+                id: parseInt(investmentId),
+                previousAmount: parseFloat(inv.amount),
+                addedAmount: addAmount,
+                newAmount,
+            },
+        });
+    } catch (error) {
+        await connection.rollback();
+        console.error('Error agregando capital:', error);
+        res.status(500).json({ error: 'Error interno del servidor' });
+    } finally {
+        connection.release();
+    }
+};
+
+// ═══════════════════════════════════════════════════════════════════════
+// POST /api/investments/:id/cancel
+// ═══════════════════════════════════════════════════════════════════════
+exports.cancelInvestment = async (req, res) => {
+    const connection = await pool.getConnection();
+    try {
+        await connection.beginTransaction();
+
+        const userId = req.user.id;
+        const investmentId = req.params.id;
+
+        const [invRows] = await connection.execute(
+            `SELECT * FROM investments WHERE id = ? AND user_id = ?`,
+            [investmentId, userId]
+        );
+        if (!invRows.length) {
+            return res.status(404).json({ error: 'Inversión no encontrada' });
+        }
+
+        const inv = invRows[0];
+        if (inv.status !== 'pending_deposit') {
+            return res.status(400).json({ error: 'Solo se pueden cancelar inversiones en período de depósito' });
+        }
+
+        const depositDeadlineMatch = inv.notes?.match(/Período de depósito hasta: ([\d-: ]+)/);
+        const depositDeadline = depositDeadlineMatch ? new Date(depositDeadlineMatch[1].replace(' ', 'T')) : null;
+
+        if (!depositDeadline || new Date() > depositDeadline) {
+            return res.status(400).json({ error: 'El período de cancelación ha expirado' });
+        }
+
+        await connection.execute(
+            `UPDATE investments SET status = 'cancelled' WHERE id = ?`,
+            [investmentId]
+        );
+
+        const refId = 'CAN-' + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2, 5).toUpperCase();
+        await connection.execute(
+            `INSERT INTO transactions (user_id, investment_id, type, amount, description, ref_id, created_at) 
+             VALUES (?, ?, 'investment_cancellation', ?, ?, ?, NOW())`,
+            [userId, investmentId, parseFloat(inv.amount), `Cancelación inversión #${investmentId}`, refId]
+        );
+
+        await auditLog({
+            userId,
+            action: 'cancel_investment',
+            entityType: 'investment',
+            entityId: parseInt(investmentId),
+            details: { cancelledAmount: parseFloat(inv.amount) },
+            ipAddress: req.ip,
+        });
+
+        await connection.commit();
+
+        res.json({
+            message: 'Inversión cancelada. El capital ha sido devuelto a tu saldo disponible.',
+            investment: { id: parseInt(investmentId), cancelledAmount: parseFloat(inv.amount) },
+        });
+    } catch (error) {
+        await connection.rollback();
+        console.error('Error cancelando inversión:', error);
+        res.status(500).json({ error: 'Error interno del servidor' });
+    } finally {
+        connection.release();
+    }
+};
+
+// ═══════════════════════════════════════════════════════════════════════
+// POST /api/investments/:id/confirm
+// ═══════════════════════════════════════════════════════════════════════
+exports.confirmInvestment = async (req, res) => {
+    const connection = await pool.getConnection();
+    try {
+        await connection.beginTransaction();
+
+        const userId = req.user.id;
+        const investmentId = req.params.id;
+
+        const [invRows] = await connection.execute(
+            `SELECT * FROM investments WHERE id = ? AND user_id = ?`,
+            [investmentId, userId]
+        );
+        if (!invRows.length) {
+            return res.status(404).json({ error: 'Inversión no encontrada' });
+        }
+
+        const inv = invRows[0];
+        if (inv.status !== 'pending_deposit') {
+            return res.status(400).json({ error: 'Solo se pueden confirmar inversiones pendientes' });
+        }
+
+        await connection.execute(
+            `UPDATE investments SET status = 'active' WHERE id = ?`,
+            [investmentId]
+        );
+
+        await auditLog({
+            userId,
+            action: 'confirm_investment',
+            entityType: 'investment',
+            entityId: parseInt(investmentId),
+            details: { amount: parseFloat(inv.amount) },
+            ipAddress: req.ip,
+        });
+
+        await connection.commit();
+
+        res.json({
+            message: 'Inversión confirmada y activada exitosamente',
+            investment: { id: parseInt(investmentId), status: 'active' },
+        });
+    } catch (error) {
+        await connection.rollback();
+        console.error('Error confirmando inversión:', error);
+        res.status(500).json({ error: 'Error interno del servidor' });
+    } finally {
+        connection.release();
+    }
+};
+
+// ═══════════════════════════════════════════════════════════════════════
+// POST /api/investments/:id/withdraw
+// ═══════════════════════════════════════════════════════════════════════
+exports.withdrawInvestment = async (req, res) => {
+    const connection = await pool.getConnection();
+    try {
+        await connection.beginTransaction();
+
+        const userId = req.user.id;
+        const investmentId = req.params.id;
+
+        const [invRows] = await connection.execute(
+            `SELECT * FROM investments WHERE id = ? AND user_id = ?`,
+            [investmentId, userId]
+        );
+        if (!invRows.length) {
+            return res.status(404).json({ error: 'Inversión no encontrada' });
+        }
+
+        const inv = invRows[0];
+        if (inv.status !== 'active') {
+            return res.status(400).json({ error: 'Solo se pueden retirar inversiones activas' });
+        }
+
+        const now = new Date();
+        const lockEnd = new Date(inv.lock_end_date || inv.end_date);
+
+        if (now < lockEnd) {
+            const daysLeft = Math.ceil((lockEnd - now) / (1000 * 60 * 60 * 24));
+            return res.status(400).json({
+                error: `La inversión aún está bloqueada. Faltan ${daysLeft} días para el desbloqueo.`,
+                daysRemaining: daysLeft,
+                lockEndDate: lockEnd.toISOString().slice(0, 10),
+            });
+        }
+
+        const capitalAmount = parseFloat(inv.amount);
+
+        await connection.execute(
+            `UPDATE investments SET status = 'completed' WHERE id = ?`,
+            [investmentId]
+        );
+
+        const refId = 'WDR-' + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2, 5).toUpperCase();
+
+        await connection.execute(
+            `INSERT INTO transactions (user_id, investment_id, type, amount, description, ref_id, created_at) 
+             VALUES (?, ?, 'investment_withdrawal', ?, ?, ?, NOW())`,
+            [userId, investmentId, capitalAmount, `Retiro inversión ${inv.type || 'CDTC'} #${investmentId} — Capital liberado`, refId]
+        );
+
+        await auditLog({
+            userId,
+            action: 'withdraw_investment',
+            entityType: 'investment',
+            entityId: parseInt(investmentId),
+            details: { capitalReturned: capitalAmount },
+            ipAddress: req.ip,
+        });
+
+        await connection.commit();
+
+        res.json({
+            message: 'Inversión retirada exitosamente. El capital ha vuelto a tu saldo disponible.',
+            investment: {
+                id: parseInt(investmentId),
+                capitalReturned: capitalAmount,
+                refId,
+            },
+        });
+    } catch (error) {
+        await connection.rollback();
+        console.error('Error retirando inversión:', error);
+        res.status(500).json({ error: 'Error interno del servidor' });
+    } finally {
+        connection.release();
     }
 };
