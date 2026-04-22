@@ -814,3 +814,41 @@ exports.withdrawInvestment = async (req, res) => {
         connection.release();
     }
 };
+// ═══════════════════════════════════════════════════════════════════════
+// GET /api/investments/pool-stats
+// Estadísticas del Pool de Liquidez para el dashboard
+// ═══════════════════════════════════════════════════════════════════════
+exports.getPoolStats = async (req, res) => {
+    try {
+        // APY real calculado desde rendimientos históricos pagados del pool
+        const [returnsRows] = await pool.execute(
+            `SELECT AVG(ir.rate_applied) as avg_rate, COUNT(DISTINCT ir.period_month) as months
+             FROM investment_returns ir
+             JOIN investments i ON ir.investment_id = i.id
+             WHERE i.type = 'pool' AND ir.status = 'paid' AND ir.rate_applied > 0`
+        );
+
+        const avgMonthly = returnsRows[0].avg_rate ? parseFloat(returnsRows[0].avg_rate) : 2.0;
+        const monthsTracked = returnsRows[0].months ? parseInt(returnsRows[0].months) : 0;
+        // APY anual compuesto
+        const annualAPY = (Math.pow(1 + avgMonthly / 100, 12) - 1) * 100;
+
+        // Capital total activo en el pool
+        const [capitalRows] = await pool.execute(
+            `SELECT COALESCE(SUM(amount), 0) as total, COUNT(*) as count
+             FROM investments WHERE type = 'pool' AND status = 'active'`
+        );
+
+        res.json({
+            monthlyAPY:    parseFloat(avgMonthly.toFixed(4)),
+            annualAPY:     parseFloat(annualAPY.toFixed(2)),
+            monthsTracked,
+            totalCapital:  parseFloat(capitalRows[0].total),
+            activeCount:   parseInt(capitalRows[0].count),
+        });
+    } catch (error) {
+        console.error('Error pool stats:', error);
+        // Fallback con valores por defecto — no romper el dashboard
+        res.json({ monthlyAPY: 2.0, annualAPY: 26.82, monthsTracked: 0, totalCapital: 0, activeCount: 0 });
+    }
+};

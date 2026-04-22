@@ -18,6 +18,9 @@ router.get('/global-stats', investmentController.getGlobalStats);
 // Mis inversiones
 router.get('/my', investmentController.getMyInvestments);
 
+// Estadísticas del Pool de Liquidez
+router.get('/pool-stats', investmentController.getPoolStats);
+
 // Detalle de una inversión
 router.get('/:id', investmentController.getInvestmentDetail);
 
