@@ -1,19 +1,15 @@
-const router  = require('express').Router();
-const ctrl    = require('../controllers/depositController');
-const auth    = require('../middleware/auth');       // tu middleware JWT existente
-// Si tienes middleware de admin, importalo así:
-// const isAdmin = require('../middleware/isAdmin');
+const express = require('express');
+const router = express.Router();
+const depositController = require('../controllers/depositController');
+const { authenticate } = require('../middleware/auth');
 
-// ── Rutas de usuario ──────────────────────────
-// POST /api/deposits/create  → registra nuevo depósito pendiente
-router.post('/create', auth, ctrl.create);
+// Todas las rutas requieren autenticación
+router.use(authenticate);
 
-// GET /api/deposits/my  → lista depósitos del usuario autenticado
-router.get('/my', auth, ctrl.myDeposits);
+// POST /api/deposits/create → registra nuevo depósito pendiente + notifica Telegram
+router.post('/create', depositController.create);
 
-// ── Rutas de admin ────────────────────────────
-// PUT /api/deposits/:id/approve  → aprobar un depósito
-// router.put('/:id/approve', auth, isAdmin, ctrl.approve);
-// (descomenta cuando tengas middleware de admin listo)
+// GET /api/deposits/my → lista depósitos del usuario autenticado
+router.get('/my', depositController.myDeposits);
 
 module.exports = router;
