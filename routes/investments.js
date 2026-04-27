@@ -21,6 +21,9 @@ router.get('/my', investmentController.getMyInvestments);
 // Estadísticas del Pool de Liquidez
 router.get('/pool-stats', investmentController.getPoolStats);
 
+// Retirar ganancias del Pool (comisión 20%)
+router.post('/:id/withdraw-earnings', investmentController.withdrawPoolEarnings);
+
 // Detalle de una inversión
 router.get('/:id', investmentController.getInvestmentDetail);
 
