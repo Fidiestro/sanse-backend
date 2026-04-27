@@ -309,37 +309,51 @@ exports.createUserInvestment = async (req, res) => {
 exports.getBalanceSummary = async (req, res) => {
     try {
         const userId = req.user.id;
+        const { INFLOW_TYPES, OUTFLOW_TYPES } = require('../utils/balanceHelper');
 
-        const [balanceRows] = await pool.execute(
-            `SELECT COALESCE(SUM(amount), 0) as amount FROM transactions WHERE user_id = ?`,
-            [userId]
+        // Entradas (depósitos, pagos, intereses, ganancias, retornos de inversión, etc.)
+        const inflowPH = INFLOW_TYPES.map(() => '?').join(',');
+        const [inRows] = await pool.execute(
+            `SELECT COALESCE(SUM(amount), 0) as total FROM transactions WHERE user_id = ? AND type IN (${inflowPH})`,
+            [userId, ...INFLOW_TYPES]
         );
-        const totalBalance = balanceRows.length ? parseFloat(balanceRows[0].amount) : 0;
 
+        // Salidas (retiros)
+        const outflowPH = OUTFLOW_TYPES.map(() => '?').join(',');
+        const [outRows] = await pool.execute(
+            `SELECT COALESCE(SUM(amount), 0) as total FROM transactions WHERE user_id = ? AND type IN (${outflowPH})`,
+            [userId, ...OUTFLOW_TYPES]
+        );
+
+        const totalBalance = Math.max(0, parseFloat(inRows[0].total) - parseFloat(outRows[0].total));
+
+        // Capital actualmente invertido
         const [investedRows] = await pool.execute(
             `SELECT COALESCE(SUM(amount), 0) as total FROM investments WHERE user_id = ? AND status IN ('active', 'pending_deposit')`,
             [userId]
         );
         const totalInvested = parseFloat(investedRows[0].total);
 
+        // Retiros pendientes
         const [pendingWithdrawals] = await pool.execute(
             `SELECT COALESCE(SUM(amount), 0) as total FROM withdrawal_requests WHERE user_id = ? AND status IN ('pending', 'approved')`,
             [userId]
         );
         const pendingWithdrawalAmount = parseFloat(pendingWithdrawals[0].total);
 
+        // Ganancias totales pagadas
         const [earningsRows] = await pool.execute(
-            `SELECT COALESCE(SUM(amount_earned), 0) as total FROM investment_returns WHERE user_id = ?`,
+            `SELECT COALESCE(SUM(amount), 0) as total FROM transactions WHERE user_id = ? AND type IN ('profit','interest','investment_return')`,
             [userId]
         );
         const totalEarnings = parseFloat(earningsRows[0].total);
 
-        const availableBalance = totalBalance - totalInvested - pendingWithdrawalAmount;
+        const availableBalance = Math.max(0, totalBalance - totalInvested - pendingWithdrawalAmount);
 
         res.json({
             totalBalance,
             totalInvested,
-            availableBalance: Math.max(0, availableBalance),
+            availableBalance,
             totalEarnings,
             pendingWithdrawals: pendingWithdrawalAmount,
         });
@@ -850,80 +864,5 @@ exports.getPoolStats = async (req, res) => {
         console.error('Error pool stats:', error);
         // Fallback con valores por defecto — no romper el dashboard
         res.json({ monthlyAPY: 2.0, annualAPY: 26.82, monthsTracked: 0, totalCapital: 0, activeCount: 0 });
-    }
-};
-// ══════════════════════════════════════════════════════════════
-// POST /api/investments/:id/withdraw-earnings
-// Retirar ganancias del Pool de Liquidez (comisión 20%)
-// ══════════════════════════════════════════════════════════════
-exports.withdrawPoolEarnings = async (req, res) => {
-    try {
-        const { id } = req.params;
-        const userId = req.user.id;
-
-        // Verificar que la inversión existe y pertenece al usuario
-        const [rows] = await pool.execute(
-            `SELECT * FROM investments
-             WHERE id = ? AND user_id = ? AND type = 'pool' AND status = 'active'`,
-            [id, userId]
-        );
-
-        if (!rows.length) {
-            return res.status(404).json({ error: 'Inversión en Pool no encontrada' });
-        }
-
-        const inv = rows[0];
-        const grossEarnings = parseFloat(inv.withdrawable_earnings) || 0;
-
-        if (grossEarnings <= 0) {
-            return res.status(400).json({ error: 'No hay ganancias disponibles para retirar' });
-        }
-
-        const commission = Math.round(grossEarnings * 0.20);
-        const netAmount  = grossEarnings - commission;
-
-        // Resetear ganancias retirables de la inversión
-        await pool.execute(
-            'UPDATE investments SET withdrawable_earnings = 0 WHERE id = ?',
-            [id]
-        );
-
-        // Registrar transacción de ingreso por el neto
-        await pool.execute(
-            `INSERT INTO transactions (user_id, type, amount, description, created_at)
-             VALUES (?, 'investment_return', ?, ?, NOW())`,
-            [
-                userId,
-                netAmount,
-                `Retiro ganancias Pool ID ${id} — Bruto: $${grossEarnings.toLocaleString('es-CO')} · Comisión 20%: -$${commission.toLocaleString('es-CO')}`
-            ]
-        );
-
-        // Recalcular balance
-        const { recalculateAndSaveBalance } = require('../utils/balanceHelper');
-        await recalculateAndSaveBalance(pool, userId);
-
-        // Notificación Telegram
-        try {
-            const { sendTelegram } = require('../utils/telegram');
-            const [userRows] = await pool.execute(
-                'SELECT full_name, email FROM users WHERE id = ?', [userId]
-            );
-            const userName = userRows[0]?.full_name || userRows[0]?.email || `ID ${userId}`;
-            await sendTelegram(
-                `💰 <b>Retiro Ganancias Pool</b>\n\n` +
-                `👤 <b>Usuario:</b> ${userName}\n` +
-                `🆔 <b>Inversión:</b> #${id}\n` +
-                `💵 <b>Bruto:</b> $${grossEarnings.toLocaleString('es-CO')} COP\n` +
-                `📉 <b>Comisión 20%:</b> -$${commission.toLocaleString('es-CO')} COP\n` +
-                `✅ <b>Neto acreditado:</b> $${netAmount.toLocaleString('es-CO')} COP`
-            );
-        } catch (_) {}
-
-        return res.json({ success: true, grossEarnings, commission, netAmount });
-
-    } catch (e) {
-        console.error('[investmentController.withdrawPoolEarnings]', e);
-        return res.status(500).json({ error: 'Error al retirar ganancias del pool' });
     }
 };
