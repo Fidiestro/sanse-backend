@@ -6,40 +6,22 @@ const { authenticate } = require('../middleware/auth');
 // Todas requieren autenticación
 router.use(authenticate);
 
-// Productos disponibles
-router.get('/available', investmentController.getAvailableProducts);
-
-// Resumen de balance (total, invertido, disponible)
+// ── Rutas GET sin parámetro (van PRIMERO) ──────────────────
+router.get('/available',       investmentController.getAvailableProducts);
 router.get('/balance-summary', investmentController.getBalanceSummary);
+router.get('/global-stats',    investmentController.getGlobalStats);
+router.get('/my',              investmentController.getMyInvestments);
+router.get('/pool-stats',      investmentController.getPoolStats);
 
-// Estadísticas globales SDTC (total bloqueado, APY)
-router.get('/global-stats', investmentController.getGlobalStats);
+// ── Rutas POST sin parámetro (van ANTES de /:id) ───────────
+router.post('/create',         investmentController.createUserInvestment);
 
-// Mis inversiones
-router.get('/my', investmentController.getMyInvestments);
-
-// Estadísticas del Pool de Liquidez
-router.get('/pool-stats', investmentController.getPoolStats);
-
-// Retirar ganancias del Pool (comisión 20%)
-router.post('/:id/withdraw-earnings', investmentController.withdrawPoolEarnings);
-
-// Detalle de una inversión
-router.get('/:id', investmentController.getInvestmentDetail);
-
-// Crear inversión SDTC desde balance
-router.post('/create', investmentController.createUserInvestment);
-
-// Agregar capital a una inversión existente (sin cambiar fecha de vencimiento)
-router.post('/:id/add-capital', investmentController.addCapitalToInvestment);
-
-// Cancelar inversión en período de depósito (12h)
-router.post('/:id/cancel', investmentController.cancelInvestment);
-
-// Confirmar inversión (activar inmediatamente)
-router.post('/:id/confirm', investmentController.confirmInvestment);
-
-// Retirar inversión vencida (devuelve capital al disponible)
-router.post('/:id/withdraw', investmentController.withdrawInvestment);
+// ── Rutas con parámetro /:id ───────────────────────────────
+router.get( '/:id',                  investmentController.getInvestmentDetail);
+router.post('/:id/add-capital',      investmentController.addCapitalToInvestment);
+router.post('/:id/cancel',           investmentController.cancelInvestment);
+router.post('/:id/confirm',          investmentController.confirmInvestment);
+router.post('/:id/withdraw',         investmentController.withdrawInvestment);
+router.post('/:id/withdraw-earnings',investmentController.withdrawPoolEarnings);
 
 module.exports = router;

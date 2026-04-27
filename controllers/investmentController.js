@@ -866,3 +866,72 @@ exports.getPoolStats = async (req, res) => {
         res.json({ monthlyAPY: 2.0, annualAPY: 26.82, monthsTracked: 0, totalCapital: 0, activeCount: 0 });
     }
 };
+// ══════════════════════════════════════════════════════════════
+// POST /api/investments/:id/withdraw-earnings
+// Retirar ganancias del Pool de Liquidez (comisión 20%)
+// ══════════════════════════════════════════════════════════════
+exports.withdrawPoolEarnings = async (req, res) => {
+    try {
+        const { id } = req.params;
+        const userId = req.user.id;
+
+        const [rows] = await pool.execute(
+            `SELECT * FROM investments
+             WHERE id = ? AND user_id = ? AND LOWER(type) = 'pool' AND status = 'active'`,
+            [id, userId]
+        );
+
+        if (!rows.length) {
+            return res.status(404).json({ error: 'Inversión en Pool no encontrada' });
+        }
+
+        const inv = rows[0];
+        const grossEarnings = parseFloat(inv.withdrawable_earnings) || 0;
+
+        if (grossEarnings <= 0) {
+            return res.status(400).json({ error: 'No hay ganancias disponibles para retirar' });
+        }
+
+        const commission = Math.round(grossEarnings * 0.20);
+        const netAmount  = grossEarnings - commission;
+
+        // Resetear ganancias retirables
+        await pool.execute(
+            'UPDATE investments SET withdrawable_earnings = 0 WHERE id = ?',
+            [id]
+        );
+
+        // Registrar transacción
+        await pool.execute(
+            `INSERT INTO transactions (user_id, type, amount, description, created_at)
+             VALUES (?, 'investment_return', ?, ?, NOW())`,
+            [userId, netAmount,
+             `Retiro ganancias Pool #${id} — Bruto: $${grossEarnings.toLocaleString('es-CO')} · Comisión 20%: -$${commission.toLocaleString('es-CO')}`]
+        );
+
+        // Recalcular balance
+        const { recalculateAndSaveBalance } = require('../utils/balanceHelper');
+        await recalculateAndSaveBalance(pool, userId);
+
+        // Telegram
+        try {
+            const { sendTelegram } = require('../utils/telegram');
+            const [userRows] = await pool.execute('SELECT full_name, email FROM users WHERE id = ?', [userId]);
+            const userName = userRows[0]?.full_name || userRows[0]?.email || `ID ${userId}`;
+            await sendTelegram(
+                `💰 <b>Retiro Ganancias Pool</b>\n\n` +
+                `👤 <b>Usuario:</b> ${userName}\n` +
+                `🆔 <b>Inversión:</b> #${id}\n` +
+                `💵 <b>Bruto:</b> $${grossEarnings.toLocaleString('es-CO')} COP\n` +
+                `📉 <b>Comisión 20%:</b> -$${commission.toLocaleString('es-CO')} COP\n` +
+                `✅ <b>Neto:</b> $${netAmount.toLocaleString('es-CO')} COP`
+            );
+        } catch (_) {}
+
+        return res.json({ success: true, grossEarnings, commission, netAmount });
+
+    } catch (e) {
+        console.error('[withdrawPoolEarnings]', e);
+        return res.status(500).json({ error: 'Error al retirar ganancias del pool' });
+    }
+};
