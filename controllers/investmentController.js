@@ -901,15 +901,39 @@ exports.withdrawPoolEarnings = async (req, res) => {
             [id]
         );
 
-        // Registrar transacción
+        const refId = 'PWR-' + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2,5).toUpperCase();
+
+        // Transacción al balance del usuario (neto después del 20%)
         await pool.execute(
-            `INSERT INTO transactions (user_id, type, amount, description, created_at)
-             VALUES (?, 'investment_return', ?, ?, NOW())`,
+            `INSERT INTO transactions (user_id, type, amount, description, ref_id, created_at)
+             VALUES (?, 'investment_return', ?, ?, ?, NOW())`,
             [userId, netAmount,
-             `Retiro ganancias Pool #${id} — Bruto: $${grossEarnings.toLocaleString('es-CO')} · Comisión 20%: -$${commission.toLocaleString('es-CO')}`]
+             `Retiro ganancias Pool #${id} — Bruto: $${grossEarnings.toLocaleString('es-CO')} · Comisión 20%: -$${commission.toLocaleString('es-CO')}`,
+             refId]
         );
 
-        // Recalcular balance
+        // Registro contable en pool_withdrawals (incluye comisión para Sanse)
+        try {
+            await pool.execute(
+                `INSERT INTO pool_withdrawals
+                    (investment_id, user_id, gross_amount, commission, net_amount, withdrawal_date)
+                 VALUES (?, ?, ?, ?, ?, NOW())`,
+                [id, userId, grossEarnings, commission, netAmount]
+            );
+        } catch (e) {
+            // Si la tabla no tiene exactamente esas columnas, intentar versión simplificada
+            try {
+                await pool.execute(
+                    `INSERT INTO pool_withdrawals (investment_id, user_id, gross_amount, commission, net_amount)
+                     VALUES (?, ?, ?, ?, ?)`,
+                    [id, userId, grossEarnings, commission, netAmount]
+                );
+            } catch (_) {
+                console.warn('[withdrawPoolEarnings] pool_withdrawals insert falló — revisar schema');
+            }
+        }
+
+        // Recalcular balance del usuario
         const { recalculateAndSaveBalance } = require('../utils/balanceHelper');
         await recalculateAndSaveBalance(pool, userId);
 

@@ -67,6 +67,43 @@ router.get('/users/:userId/credit-score', loanController.adminGetCreditScore);
 router.get('/deposits', depositController.adminGetDeposits);
 router.post('/deposits/:id/process', depositController.adminProcessDeposit);
 
+// === REGISTRO CONTABLE POOL — comisiones 20% ===
+router.get('/pool/withdrawals', async (req, res) => {
+    const { pool: db } = require('../config/database');
+    try {
+        const [rows] = await db.execute(
+            `SELECT pw.*, u.full_name as user_name, u.email as user_email
+             FROM pool_withdrawals pw
+             JOIN users u ON pw.user_id = u.id
+             ORDER BY pw.withdrawal_date DESC, pw.id DESC
+             LIMIT 200`
+        );
+        res.json(rows);
+    } catch (e) {
+        console.error('[admin/pool/withdrawals]', e);
+        res.json([]); // Si la tabla no existe aún, devolver vacío
+    }
+});
+
+// === REGISTRO CONTABLE POOL ===
+router.get('/pool/withdrawals', async (req, res) => {
+    const { pool: db } = require('../config/database');
+    try {
+        const [rows] = await db.execute(
+            `SELECT pw.*, u.full_name as user_name, u.email as user_email
+             FROM pool_withdrawals pw
+             JOIN users u ON pw.user_id = u.id
+             ORDER BY pw.withdrawal_date DESC, pw.id DESC
+             LIMIT 200`
+        );
+        res.json(rows);
+    } catch (e) {
+        console.error('[admin/pool/withdrawals]', e);
+        // Si la tabla no existe aún, devolver array vacío
+        res.json([]);
+    }
+});
+
 // === SOLICITUDES DE REGISTRO (ADMIN) ===
 const referralController = require('../controllers/referralController');
 router.get('/registrations', referralController.adminGetRegistrations);
