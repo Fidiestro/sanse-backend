@@ -224,13 +224,28 @@ exports.registerInvestmentReturn = async (req, res) => {
         // FIX: refId basado en timestamp+random (sin colisión por concurrencia)
         const refId = 'RET-' + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2, 5).toUpperCase();
 
-        await connection.execute(
-            `INSERT INTO transactions (user_id, investment_id, type, amount, description, ref_id, created_at)
-             VALUES (?, ?, 'investment_return', ?, ?, ?, NOW())`,
-            [investment.user_id, investmentId, amountEarned,
-             `Rendimiento CDTC ${rate}% — ${periodMonth} — Capital: $${capitalBase.toLocaleString('es-CO')}${referralCommission ? ' (neto, -$' + referralCommission.toLocaleString('es-CO') + ' comisión referido)' : ''}`,
-             refId]
-        );
+        // Determinar tipo de inversión para descripción correcta
+        const invTypeLower = (investment.type || 'cdtc').toLowerCase();
+        const isPool       = invTypeLower === 'pool' || invTypeLower.includes('pool');
+        const prodLabel    = isPool ? 'Pool de Liquidez' : 'CDTC';
+
+        if (isPool) {
+            // POOL: acumular en withdrawable_earnings — NO va al balance hasta que el usuario retire
+            await connection.execute(
+                `UPDATE investments SET withdrawable_earnings = COALESCE(withdrawable_earnings, 0) + ? WHERE id = ?`,
+                [amountEarned, investmentId]
+            );
+            // Solo registrar en investment_returns, sin transacción al balance
+        } else {
+            // CDTC: acreditar directamente al balance del usuario
+            await connection.execute(
+                `INSERT INTO transactions (user_id, investment_id, type, amount, description, ref_id, created_at)
+                 VALUES (?, ?, 'investment_return', ?, ?, ?, NOW())`,
+                [investment.user_id, investmentId, amountEarned,
+                 `Rendimiento ${prodLabel} ${rate}% — ${periodMonth} — Capital: $${capitalBase.toLocaleString('es-CO')}${referralCommission ? ' (neto, -$' + referralCommission.toLocaleString('es-CO') + ' comisión referido)' : ''}`,
+                 refId]
+            );
+        }
 
         let referralRefId = null;
         if (referrerId && referralCommission >= 100) {
@@ -245,18 +260,18 @@ exports.registerInvestmentReturn = async (req, res) => {
 
             await connection.execute(
                 `INSERT INTO transactions (user_id, type, amount, description, ref_id, created_at) VALUES (?, 'profit', ?, ?, ?, NOW())`,
-                [referrerId, referralCommission, `Comisión referido — 5% de rendimiento CDTC`, referralRefId]
+                [referrerId, referralCommission, `Comisión referido — 5% de rendimiento ${prodLabel}`, referralRefId]
             );
             // FIX: Usa balanceHelper centralizado
             await recalculateAndSaveBalance(connection, referrerId);
         }
 
-        // FIX: Usa balanceHelper centralizado
-        const newBalance = await recalculateAndSaveBalance(connection, investment.user_id);
+        // Recalcular balance: CDTC afecta balance, Pool no (queda pendiente de retiro)
+        const newBalance = isPool ? null : await recalculateAndSaveBalance(connection, investment.user_id);
         await connection.commit();
 
         res.status(201).json({
-            message: `Rendimiento registrado exitosamente${referralCommission ? ' (5% comisión referido descontada)' : ''}`,
+            message: `Rendimiento ${prodLabel} registrado${isPool ? ' — pendiente de retiro por el usuario (20% comisión)' : ' exitosamente'}${referralCommission ? ' (5% comisión referido descontada)' : ''}`,
             return: {
                 id: returnResult.insertId, investmentId, userId: investment.user_id,
                 periodMonth, rate, grossAmountEarned, referralCommission, amountEarned,
