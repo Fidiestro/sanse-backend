@@ -11,6 +11,8 @@
 //  6. listAllUsers       → GET  /admin/users
 //  7. createUserByAdmin  → POST /admin/users/create
 //  8. savePoolConfig     → POST /admin/pool/config
+//  9. registerInvestmentReturn: normaliza periodMonth "YYYY-MM" → "YYYY-MM-DD"
+//     (fix Error: Incorrect date value para columna DATE)
 // ══════════════════════════════════════════════════════════════
 const { pool } = require('../config/database');
 const { auditLog } = require('../utils/helpers');
@@ -237,6 +239,17 @@ exports.registerInvestmentReturn = async (req, res) => {
         if (!rate || !periodMonth) return res.status(400).json({ error: 'rate y periodMonth son requeridos' });
         if (rate < 0 || rate > 100) return res.status(400).json({ error: 'La tasa debe estar entre 0 y 100' });
 
+        // FIX: el input <input type="month"> manda "YYYY-MM" pero la columna
+        // period_month es DATE en MySQL, que exige "YYYY-MM-DD".
+        // Normalizamos a primer día del mes. Si ya viene en formato fecha
+        // completo lo dejamos tal cual.
+        let periodMonthDB = String(periodMonth).trim();
+        if (/^\d{4}-\d{2}$/.test(periodMonthDB)) {
+            periodMonthDB = periodMonthDB + '-01';
+        } else if (!/^\d{4}-\d{2}-\d{2}$/.test(periodMonthDB)) {
+            return res.status(400).json({ error: `Formato de mes inválido: "${periodMonth}". Usa YYYY-MM o YYYY-MM-DD` });
+        }
+
         const [invRows] = await connection.execute(
             `SELECT id, user_id, amount, status, type FROM investments WHERE id = ?`, [investmentId]
         );
@@ -245,7 +258,7 @@ exports.registerInvestmentReturn = async (req, res) => {
         if (investment.status !== 'active') { await connection.rollback(); return res.status(400).json({ error: 'La inversión no está activa' }); }
 
         const [existingReturn] = await connection.execute(
-            `SELECT id FROM investment_returns WHERE investment_id = ? AND period_month = ?`, [investmentId, periodMonth]
+            `SELECT id FROM investment_returns WHERE investment_id = ? AND period_month = ?`, [investmentId, periodMonthDB]
         );
         if (existingReturn.length > 0) { await connection.rollback(); return res.status(400).json({ error: `Ya existe un rendimiento registrado para el mes ${periodMonth}` }); }
 
@@ -264,7 +277,7 @@ exports.registerInvestmentReturn = async (req, res) => {
         const [returnResult] = await connection.execute(
             `INSERT INTO investment_returns (investment_id, user_id, period_month, rate_applied, amount_earned, status, notes)
              VALUES (?, ?, ?, ?, ?, 'paid', ?)`,
-            [investmentId, investment.user_id, periodMonth, rate, amountEarned, notes || `Rendimiento ${rate}% mes ${periodMonth}${referralCommission ? ' (neto -5% referido)' : ''}`]
+            [investmentId, investment.user_id, periodMonthDB, rate, amountEarned, notes || `Rendimiento ${rate}% mes ${periodMonth}${referralCommission ? ' (neto -5% referido)' : ''}`]
         );
 
         // FIX: refId basado en timestamp+random (sin colisión por concurrencia)
