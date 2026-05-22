@@ -1,11 +1,16 @@
 // ══════════════════════════════════════════════════════════════
 // controllers/adminController.js — Sanse Capital
-// FIXES:
+// FIXES PREVIOS:
 //  1. Usa balanceHelper centralizado (fuente única de verdad)
 //  2. getStats ahora incluye TODOS los tipos de ingreso/egreso
 //  3. createTransaction valida tipos de transacción
 //  4. editUser valida que referredBy exista en la DB
 //  5. registerInvestmentReturn usa refId basado en timestamp (sin colisión)
+//
+// FIXES NUEVOS (panel admin):
+//  6. listAllUsers       → GET  /admin/users
+//  7. createUserByAdmin  → POST /admin/users/create
+//  8. savePoolConfig     → POST /admin/pool/config
 // ══════════════════════════════════════════════════════════════
 const { pool } = require('../config/database');
 const { auditLog } = require('../utils/helpers');
@@ -641,6 +646,193 @@ exports.editUser = async (req, res) => {
         res.json({ message: 'Usuario actualizado correctamente' });
     } catch (error) {
         console.error('Error editUser:', error);
+        res.status(500).json({ error: 'Error interno del servidor' });
+    }
+};
+
+// ──────────────────────────────────────────────────────────────
+// GET /api/admin/users
+// Lista todos los usuarios con balance, total invertido y estado.
+// Esto es lo que admin.html necesita para llenar el <select> de
+// transacciones, la tabla de usuarios, y el dropdown de préstamos.
+// ──────────────────────────────────────────────────────────────
+exports.listAllUsers = async (req, res) => {
+    try {
+        // Una sola query con subconsultas para no hacer N+1.
+        // Balance: último snapshot por usuario (o 0 si no tiene).
+        // totalInvested: suma de inversiones activas/pendientes.
+        const [rows] = await pool.execute(
+            `SELECT
+                u.id,
+                u.email,
+                u.full_name,
+                u.phone,
+                u.document_number,
+                u.role,
+                u.status,
+                u.referral_code,
+                u.referred_by,
+                u.created_at,
+                COALESCE((
+                    SELECT bh.amount
+                    FROM balance_history bh
+                    WHERE bh.user_id = u.id
+                    ORDER BY bh.snapshot_date DESC, bh.id DESC
+                    LIMIT 1
+                ), 0) AS balance,
+                COALESCE((
+                    SELECT SUM(i.amount)
+                    FROM investments i
+                    WHERE i.user_id = u.id
+                      AND i.status IN ('active', 'pending_deposit')
+                ), 0) AS totalInvested
+             FROM users u
+             WHERE u.is_active = 1
+             ORDER BY u.created_at DESC`
+        );
+
+        // Convertimos numéricos a Number y agregamos `is_blocked` derivado
+        // para que el frontend siga funcionando con su lógica actual.
+        const users = rows.map(u => ({
+            id: u.id,
+            email: u.email,
+            full_name: u.full_name,
+            phone: u.phone,
+            document_number: u.document_number,
+            role: u.role,
+            status: u.status,
+            is_blocked: u.status === 'blocked',
+            referral_code: u.referral_code,
+            referred_by: u.referred_by,
+            created_at: u.created_at,
+            balance: parseFloat(u.balance) || 0,
+            totalInvested: parseFloat(u.totalInvested) || 0,
+        }));
+
+        res.json(users);
+    } catch (error) {
+        console.error('Error listAllUsers:', error);
+        res.status(500).json({ error: 'Error interno del servidor' });
+    }
+};
+
+// ──────────────────────────────────────────────────────────────
+// POST /api/admin/users/create
+// Crea un usuario directamente desde el panel admin (sin pasar
+// por el flujo de registro público + aprobación).
+// ──────────────────────────────────────────────────────────────
+exports.createUserByAdmin = async (req, res) => {
+    try {
+        const { fullName, email, password, phone, documentNumber, role } = req.body;
+
+        if (!fullName || !email || !password) {
+            return res.status(400).json({ error: 'fullName, email y password son requeridos' });
+        }
+        if (password.length < 8) {
+            return res.status(400).json({ error: 'La contraseña debe tener mínimo 8 caracteres' });
+        }
+
+        // ¿Email ya existe?
+        const [existing] = await pool.execute(
+            `SELECT id FROM users WHERE email = ?`,
+            [email.toLowerCase().trim()]
+        );
+        if (existing.length) {
+            return res.status(409).json({ error: 'Ya existe un usuario con ese email' });
+        }
+
+        const bcrypt = require('bcryptjs');
+        const passwordHash = await bcrypt.hash(password, 12);
+
+        // Generar referral_code corto y único
+        const referralCode = (fullName.replace(/\s+/g, '').slice(0, 4).toUpperCase()
+            + Math.random().toString(36).slice(2, 6).toUpperCase());
+
+        const [result] = await pool.execute(
+            `INSERT INTO users
+             (full_name, email, password_hash, phone, document_number, role, referral_code, status, is_active, email_verified, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, 'active', 1, 1, NOW())`,
+            [
+                fullName.trim(),
+                email.toLowerCase().trim(),
+                passwordHash,
+                phone || null,
+                documentNumber || null,
+                role || 'client',
+                referralCode,
+            ]
+        );
+
+        // Audit log (si está disponible — no rompe si falla)
+        try {
+            await auditLog({
+                userId: req.user?.id || null,
+                action: 'admin_create_user',
+                entityType: 'user',
+                entityId: result.insertId,
+                details: { email: email.toLowerCase().trim(), role: role || 'client' },
+                ipAddress: req.ip,
+            });
+        } catch (e) { /* opcional */ }
+
+        res.status(201).json({
+            message: 'Usuario creado exitosamente',
+            userId: result.insertId,
+            referralCode,
+        });
+    } catch (error) {
+        console.error('Error createUserByAdmin:', error);
+        res.status(500).json({ error: 'Error interno del servidor' });
+    }
+};
+
+// ──────────────────────────────────────────────────────────────
+// POST /api/admin/pool/config
+// Guarda la configuración del Pool (APY, capital, distribución, mínimo).
+// Antes vivía en routes/pool-routes.js que NO estaba montado.
+// ──────────────────────────────────────────────────────────────
+exports.savePoolConfig = async (req, res) => {
+    try {
+        const { monthlyAPY, annualAPY, totalCapital, distribution, minAmount } = req.body;
+
+        const mAPY = parseFloat(monthlyAPY);
+        if (!isFinite(mAPY) || mAPY <= 0 || mAPY > 100) {
+            return res.status(400).json({ error: 'APY mensual inválido (0-100)' });
+        }
+        const aAPY = isFinite(parseFloat(annualAPY))
+            ? parseFloat(annualAPY)
+            : ((Math.pow(1 + mAPY / 100, 12) - 1) * 100);
+        const tCap = parseFloat(totalCapital) || 0;
+        const dist = parseFloat(distribution);
+        if (!isFinite(dist) || dist < 0 || dist > 100) {
+            return res.status(400).json({ error: 'Distribución inválida (0-100)' });
+        }
+        const mAmt = parseFloat(minAmount) || 50000;
+
+        // Upsert: si no hay fila, la crea; si hay, la actualiza.
+        const [existing] = await pool.execute(`SELECT id FROM pool_config LIMIT 1`);
+        if (existing.length) {
+            await pool.execute(
+                `UPDATE pool_config
+                 SET monthly_apy = ?, annual_apy = ?, total_capital = ?,
+                     distribution = ?, min_amount = ?, updated_at = NOW()
+                 WHERE id = ?`,
+                [mAPY, aAPY, tCap, dist, mAmt, existing[0].id]
+            );
+        } else {
+            await pool.execute(
+                `INSERT INTO pool_config (monthly_apy, annual_apy, total_capital, distribution, min_amount, months_tracked, created_at, updated_at)
+                 VALUES (?, ?, ?, ?, ?, 0, NOW(), NOW())`,
+                [mAPY, aAPY, tCap, dist, mAmt]
+            );
+        }
+
+        res.json({
+            message: 'Configuración del Pool actualizada',
+            config: { monthlyAPY: mAPY, annualAPY: aAPY, totalCapital: tCap, distribution: dist, minAmount: mAmt },
+        });
+    } catch (error) {
+        console.error('Error savePoolConfig:', error);
         res.status(500).json({ error: 'Error interno del servidor' });
     }
 };
