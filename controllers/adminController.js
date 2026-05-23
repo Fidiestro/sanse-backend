@@ -13,6 +13,10 @@
 //  8. savePoolConfig     → POST /admin/pool/config
 //  9. registerInvestmentReturn: normaliza periodMonth "YYYY-MM" → "YYYY-MM-DD"
 //     (fix Error: Incorrect date value para columna DATE)
+// 10. registerInvestmentReturn: bifurca POOL vs CDTC.
+//     - POOL: acumula en withdrawable_earnings, NO toca balance.
+//             Comisión referido se procesa al hacer claim del cliente.
+//     - CDTC: flujo original sin cambios.
 // ══════════════════════════════════════════════════════════════
 const { pool } = require('../config/database');
 const { auditLog } = require('../utils/helpers');
@@ -265,6 +269,46 @@ exports.registerInvestmentReturn = async (req, res) => {
         const capitalBase       = parseFloat(investment.amount);
         const grossAmountEarned = Math.round(capitalBase * (rate / 100));
 
+        // FIX POOL: detectar tipo de inversión.
+        // POOL  → solo acumula en withdrawable_earnings; no toca transacciones ni comisiones de referido (esas se procesan al hacer claim).
+        // CDTC  → flujo original: acredita al balance + paga comisión referido inmediatamente.
+        const isPool = (investment.type || '').toLowerCase() === 'pool';
+
+        if (isPool) {
+            // Registrar el período como pagado, con monto BRUTO (la comisión se calcula al hacer claim).
+            const [returnResult] = await connection.execute(
+                `INSERT INTO investment_returns (investment_id, user_id, period_month, rate_applied, amount_earned, status, notes)
+                 VALUES (?, ?, ?, ?, ?, 'paid', ?)`,
+                [investmentId, investment.user_id, periodMonthDB, rate, grossAmountEarned,
+                 notes || `Rendimiento Pool ${rate}% mes ${periodMonth} — Acumulado para claim`]
+            );
+
+            // Acumular en withdrawable_earnings (el claim del cliente descuenta 20% + comisión referido).
+            await connection.execute(
+                `UPDATE investments
+                 SET withdrawable_earnings = COALESCE(withdrawable_earnings, 0) + ?
+                 WHERE id = ?`,
+                [grossAmountEarned, investmentId]
+            );
+
+            await connection.commit();
+            return res.status(201).json({
+                message: `Rendimiento Pool acumulado ($${grossAmountEarned.toLocaleString('es-CO')}). El cliente verá "Por retirar" en su dashboard.`,
+                return: {
+                    id: returnResult.insertId,
+                    investmentId,
+                    userId: investment.user_id,
+                    periodMonth,
+                    rate,
+                    grossAmountEarned,
+                    accrued: true,        // ← señal para el frontend
+                    creditedToBalance: false,
+                    capitalBase,
+                },
+            });
+        }
+
+        // ── CDTC: flujo original (acredita inmediato + comisión referido) ──
         let referralCommission = 0;
         let referrerId         = null;
         const [refRows] = await connection.execute('SELECT referred_by FROM users WHERE id = ?', [investment.user_id]);
