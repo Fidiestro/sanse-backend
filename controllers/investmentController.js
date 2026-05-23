@@ -404,6 +404,33 @@ exports.getMyInvestments = async (req, res) => {
     try {
         const userId = req.user.id;
 
+        // ── AUTO-CANCEL: marca como 'cancelled' las inversiones que pasaron
+        // su deadline de confirmación (12h). Esto evita cron jobs externos.
+        // Se hace al leer porque la app consulta esta ruta frecuentemente.
+        try {
+            const [stale] = await pool.execute(
+                `SELECT id, amount, notes FROM investments
+                 WHERE user_id = ? AND status = 'pending_deposit'`,
+                [userId]
+            );
+            for (const inv of stale) {
+                const m = inv.notes ? inv.notes.match(/Período de depósito hasta: ([\d-: ]+)/) : null;
+                if (!m) continue;
+                const deadline = new Date(m[1].replace(' ', 'T'));
+                if (isNaN(deadline) || new Date() <= deadline) continue;
+                // Vencida → cancelar y devolver capital con transacción
+                await pool.execute(`UPDATE investments SET status = 'cancelled' WHERE id = ?`, [inv.id]);
+                const refId = 'AUTO-' + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2, 5).toUpperCase();
+                await pool.execute(
+                    `INSERT INTO transactions (user_id, investment_id, type, amount, description, ref_id, created_at)
+                     VALUES (?, ?, 'investment_cancellation', ?, ?, ?, NOW())`,
+                    [userId, inv.id, parseFloat(inv.amount), `Cancelación automática inversión #${inv.id} — Depósito no confirmado en 12h`, refId]
+                );
+            }
+        } catch (e) {
+            console.warn('[getMyInvestments auto-cancel]', e.message);
+        }
+
         const [investments] = await pool.execute(
             `SELECT id, type, amount, net_capital, entry_fee, withdrawable_earnings, annual_rate, duration_months, 
                     min_monthly_rate, max_monthly_rate, start_date, end_date, lock_end_date, status, notes, created_at
@@ -786,6 +813,16 @@ exports.withdrawInvestment = async (req, res) => {
             });
         }
 
+        // FIX: si hay ganancias pendientes (withdrawable_earnings), forzar claim primero
+        // para que no se pierdan al marcar la inversión como completed.
+        const pendingEarnings = parseFloat(inv.withdrawable_earnings) || 0;
+        if (pendingEarnings > 0) {
+            return res.status(400).json({
+                error: `Tienes $${pendingEarnings.toLocaleString('es-CO')} en ganancias pendientes. Retíralas primero (botón "Retirar Ganancias") antes de retirar el capital.`,
+                pendingEarnings,
+            });
+        }
+
         const capitalAmount = parseFloat(inv.amount);
 
         await connection.execute(
@@ -868,11 +905,11 @@ exports.getPoolStats = async (req, res) => {
 };
 // ══════════════════════════════════════════════════════════════
 // POST /api/investments/:id/withdraw-earnings
-// Retirar ganancias del Pool de Liquidez.
-// Descuentos aplicados sobre el bruto, en este orden:
-//   1. 20% comisión Sanse  (siempre)
-//   2. 5%  comisión referido (solo si el usuario tiene referrer)
-// El cliente recibe: gross - 20% - 5% (si aplica)
+// Retirar ganancias acumuladas (Pool o CDTC).
+// Descuentos sobre el bruto:
+//   - Pool: 20% Sanse + 5% referido (si aplica)
+//   - CDTC: solo 5% referido (si aplica), sin comisión Sanse
+// El cliente recibe: gross - sanse - referral
 // ══════════════════════════════════════════════════════════════
 exports.withdrawPoolEarnings = async (req, res) => {
     const connection = await pool.getConnection();
@@ -884,16 +921,20 @@ exports.withdrawPoolEarnings = async (req, res) => {
 
         const [rows] = await connection.execute(
             `SELECT * FROM investments
-             WHERE id = ? AND user_id = ? AND LOWER(type) = 'pool' AND status = 'active'`,
+             WHERE id = ? AND user_id = ? AND status = 'active'`,
             [id, userId]
         );
 
         if (!rows.length) {
             await connection.rollback();
-            return res.status(404).json({ error: 'Inversión en Pool no encontrada' });
+            return res.status(404).json({ error: 'Inversión no encontrada' });
         }
 
         const inv = rows[0];
+        const invType = (inv.type || '').toLowerCase();
+        const isPool  = invType === 'pool';
+        const label   = isPool ? 'Pool' : 'CDTC';
+
         const grossEarnings = parseFloat(inv.withdrawable_earnings) || 0;
 
         if (grossEarnings <= 0) {
@@ -901,8 +942,9 @@ exports.withdrawPoolEarnings = async (req, res) => {
             return res.status(400).json({ error: 'No hay ganancias disponibles para retirar' });
         }
 
-        // ── Cálculos de comisiones ──
-        const sanseCommission = Math.round(grossEarnings * 0.20);
+        // ── Cálculos de comisiones según tipo ──
+        // Pool: 20% Sanse + 5% referido. CDTC: 0% Sanse + 5% referido.
+        const sanseCommission = isPool ? Math.round(grossEarnings * 0.20) : 0;
 
         let referrerId = null;
         let referralCommission = 0;
@@ -924,9 +966,16 @@ exports.withdrawPoolEarnings = async (req, res) => {
 
         // ── 2. Crear transacción del retiro neto al usuario ──
         const refId = 'PWR-' + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2, 5).toUpperCase();
-        const description = referralCommission > 0
-            ? `Retiro ganancias Pool #${id} — Bruto: $${grossEarnings.toLocaleString('es-CO')} · Comisión Sanse 20%: -$${sanseCommission.toLocaleString('es-CO')} · Comisión referido 5%: -$${referralCommission.toLocaleString('es-CO')}`
-            : `Retiro ganancias Pool #${id} — Bruto: $${grossEarnings.toLocaleString('es-CO')} · Comisión 20%: -$${sanseCommission.toLocaleString('es-CO')}`;
+
+        // Armado dinámico de la descripción según comisiones aplicadas
+        const descParts = [`Retiro ganancias ${label} #${id} — Bruto: $${grossEarnings.toLocaleString('es-CO')}`];
+        if (sanseCommission > 0) {
+            descParts.push(`Comisión Sanse 20%: -$${sanseCommission.toLocaleString('es-CO')}`);
+        }
+        if (referralCommission > 0) {
+            descParts.push(`Comisión referido 5%: -$${referralCommission.toLocaleString('es-CO')}`);
+        }
+        const description = descParts.join(' · ');
 
         await connection.execute(
             `INSERT INTO transactions (user_id, investment_id, type, amount, description, ref_id, created_at)
@@ -934,23 +983,25 @@ exports.withdrawPoolEarnings = async (req, res) => {
             [userId, id, netAmount, description, refId]
         );
 
-        // ── 3. Registro contable en pool_withdrawals ──
-        try {
-            await connection.execute(
-                `INSERT INTO pool_withdrawals
-                    (investment_id, user_id, gross_amount, commission, net_amount, withdrawal_date)
-                 VALUES (?, ?, ?, ?, ?, NOW())`,
-                [id, userId, grossEarnings, sanseCommission, netAmount]
-            );
-        } catch (e) {
+        // ── 3. Registro contable en pool_withdrawals (solo Pool) ──
+        if (isPool) {
             try {
                 await connection.execute(
-                    `INSERT INTO pool_withdrawals (investment_id, user_id, gross_amount, commission, net_amount)
-                     VALUES (?, ?, ?, ?, ?)`,
+                    `INSERT INTO pool_withdrawals
+                        (investment_id, user_id, gross_amount, commission, net_amount, withdrawal_date)
+                     VALUES (?, ?, ?, ?, ?, NOW())`,
                     [id, userId, grossEarnings, sanseCommission, netAmount]
                 );
-            } catch (_) {
-                console.warn('[withdrawPoolEarnings] pool_withdrawals insert falló — revisar schema');
+            } catch (e) {
+                try {
+                    await connection.execute(
+                        `INSERT INTO pool_withdrawals (investment_id, user_id, gross_amount, commission, net_amount)
+                         VALUES (?, ?, ?, ?, ?)`,
+                        [id, userId, grossEarnings, sanseCommission, netAmount]
+                    );
+                } catch (_) {
+                    console.warn('[withdrawPoolEarnings] pool_withdrawals insert falló — revisar schema');
+                }
             }
         }
 
@@ -958,23 +1009,24 @@ exports.withdrawPoolEarnings = async (req, res) => {
         let referralRefId = null;
         if (referrerId && referralCommission >= 100) {
             referralRefId = 'REF-' + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2, 5).toUpperCase();
+            const refSourceType = isPool ? 'pool_withdrawal' : 'cdtc_withdrawal';
 
             try {
                 await connection.execute(
                     `INSERT INTO referral_commissions
                         (referrer_id, referred_id, source_type, source_id, source_amount, commission_rate, commission_amount, status, ref_id)
-                     VALUES (?, ?, 'pool_withdrawal', ?, ?, 0.05, ?, 'paid', ?)`,
-                    [referrerId, userId, id, grossEarnings, referralCommission, referralRefId]
+                     VALUES (?, ?, ?, ?, ?, 0.05, ?, 'paid', ?)`,
+                    [referrerId, userId, refSourceType, id, grossEarnings, referralCommission, referralRefId]
                 );
             } catch (e) {
-                console.error('Error registrando comisión referido pool:', e.message);
+                console.error('Error registrando comisión referido:', e.message);
             }
 
             await connection.execute(
                 `INSERT INTO transactions (user_id, type, amount, description, ref_id, created_at)
                  VALUES (?, 'profit', ?, ?, ?, NOW())`,
                 [referrerId, referralCommission,
-                 `Comisión referido — 5% de retiro Pool (Bruto: $${grossEarnings.toLocaleString('es-CO')})`,
+                 `Comisión referido — 5% de retiro ${label} (Bruto: $${grossEarnings.toLocaleString('es-CO')})`,
                  referralRefId]
             );
 
@@ -992,11 +1044,13 @@ exports.withdrawPoolEarnings = async (req, res) => {
             const [userRows] = await pool.execute('SELECT full_name, email FROM users WHERE id = ?', [userId]);
             const userName = userRows[0]?.full_name || userRows[0]?.email || `ID ${userId}`;
             await sendTelegram(
-                `💰 <b>Retiro Ganancias Pool</b>\n\n` +
+                `💰 <b>Retiro Ganancias ${label}</b>\n\n` +
                 `👤 <b>Usuario:</b> ${userName}\n` +
                 `🆔 <b>Inversión:</b> #${id}\n` +
                 `💵 <b>Bruto:</b> $${grossEarnings.toLocaleString('es-CO')} COP\n` +
-                `📉 <b>Comisión Sanse 20%:</b> -$${sanseCommission.toLocaleString('es-CO')} COP\n` +
+                (sanseCommission > 0
+                    ? `📉 <b>Comisión Sanse 20%:</b> -$${sanseCommission.toLocaleString('es-CO')} COP\n`
+                    : '') +
                 (referralCommission > 0
                     ? `🤝 <b>Comisión Referido 5%:</b> -$${referralCommission.toLocaleString('es-CO')} COP\n`
                     : '') +
@@ -1006,6 +1060,7 @@ exports.withdrawPoolEarnings = async (req, res) => {
 
         return res.json({
             success: true,
+            type: invType,
             grossEarnings,
             sanseCommission,
             commission: sanseCommission,    // alias retro-compat con frontend antiguo
@@ -1019,7 +1074,7 @@ exports.withdrawPoolEarnings = async (req, res) => {
     } catch (e) {
         await connection.rollback();
         console.error('[withdrawPoolEarnings]', e);
-        return res.status(500).json({ error: 'Error al retirar ganancias del pool' });
+        return res.status(500).json({ error: 'Error al retirar ganancias' });
     } finally {
         connection.release();
     }

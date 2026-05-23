@@ -13,10 +13,11 @@
 //  8. savePoolConfig     → POST /admin/pool/config
 //  9. registerInvestmentReturn: normaliza periodMonth "YYYY-MM" → "YYYY-MM-DD"
 //     (fix Error: Incorrect date value para columna DATE)
-// 10. registerInvestmentReturn: bifurca POOL vs CDTC.
-//     - POOL: acumula en withdrawable_earnings, NO toca balance.
-//             Comisión referido se procesa al hacer claim del cliente.
-//     - CDTC: flujo original sin cambios.
+// 10. registerInvestmentReturn: UNIFICADO Pool + CDTC.
+//     Ambos acumulan en withdrawable_earnings, no acreditan balance.
+//     Comisiones se procesan al hacer claim:
+//       - Pool: 20% Sanse + 5% referido (si aplica)
+//       - CDTC: solo 5% referido (si aplica)
 // ══════════════════════════════════════════════════════════════
 const { pool } = require('../config/database');
 const { auditLog } = require('../utils/helpers');
@@ -269,102 +270,44 @@ exports.registerInvestmentReturn = async (req, res) => {
         const capitalBase       = parseFloat(investment.amount);
         const grossAmountEarned = Math.round(capitalBase * (rate / 100));
 
-        // FIX POOL: detectar tipo de inversión.
-        // POOL  → solo acumula en withdrawable_earnings; no toca transacciones ni comisiones de referido (esas se procesan al hacer claim).
-        // CDTC  → flujo original: acredita al balance + paga comisión referido inmediatamente.
-        const isPool = (investment.type || '').toLowerCase() === 'pool';
-
-        if (isPool) {
-            // Registrar el período como pagado, con monto BRUTO (la comisión se calcula al hacer claim).
-            const [returnResult] = await connection.execute(
-                `INSERT INTO investment_returns (investment_id, user_id, period_month, rate_applied, amount_earned, status, notes)
-                 VALUES (?, ?, ?, ?, ?, 'paid', ?)`,
-                [investmentId, investment.user_id, periodMonthDB, rate, grossAmountEarned,
-                 notes || `Rendimiento Pool ${rate}% mes ${periodMonth} — Acumulado para claim`]
-            );
-
-            // Acumular en withdrawable_earnings (el claim del cliente descuenta 20% + comisión referido).
-            await connection.execute(
-                `UPDATE investments
-                 SET withdrawable_earnings = COALESCE(withdrawable_earnings, 0) + ?
-                 WHERE id = ?`,
-                [grossAmountEarned, investmentId]
-            );
-
-            await connection.commit();
-            return res.status(201).json({
-                message: `Rendimiento Pool acumulado ($${grossAmountEarned.toLocaleString('es-CO')}). El cliente verá "Por retirar" en su dashboard.`,
-                return: {
-                    id: returnResult.insertId,
-                    investmentId,
-                    userId: investment.user_id,
-                    periodMonth,
-                    rate,
-                    grossAmountEarned,
-                    accrued: true,        // ← señal para el frontend
-                    creditedToBalance: false,
-                    capitalBase,
-                },
-            });
-        }
-
-        // ── CDTC: flujo original (acredita inmediato + comisión referido) ──
-        let referralCommission = 0;
-        let referrerId         = null;
-        const [refRows] = await connection.execute('SELECT referred_by FROM users WHERE id = ?', [investment.user_id]);
-        if (refRows.length && refRows[0].referred_by) {
-            referrerId         = refRows[0].referred_by;
-            referralCommission = Math.round(grossAmountEarned * 0.05);
-        }
-        const amountEarned = grossAmountEarned - referralCommission;
+        // FIX UNIFICADO (Pool + CDTC):
+        // Ambos tipos acumulan el rendimiento BRUTO en withdrawable_earnings.
+        // El cliente decide cuándo hacer claim, y allí se aplican los descuentos:
+        //   - Pool: 20% Sanse + 5% referido (si aplica)
+        //   - CDTC: solo 5% referido (si aplica)
+        // El admin NO acredita al balance al registrar, NO procesa referidos.
+        const invType = (investment.type || '').toLowerCase();
+        const isPool = invType === 'pool';
+        const label  = isPool ? 'Pool' : 'CDTC';
 
         const [returnResult] = await connection.execute(
             `INSERT INTO investment_returns (investment_id, user_id, period_month, rate_applied, amount_earned, status, notes)
              VALUES (?, ?, ?, ?, ?, 'paid', ?)`,
-            [investmentId, investment.user_id, periodMonthDB, rate, amountEarned, notes || `Rendimiento ${rate}% mes ${periodMonth}${referralCommission ? ' (neto -5% referido)' : ''}`]
+            [investmentId, investment.user_id, periodMonthDB, rate, grossAmountEarned,
+             notes || `Rendimiento ${label} ${rate}% mes ${periodMonth} — Acumulado para claim`]
         );
-
-        // FIX: refId basado en timestamp+random (sin colisión por concurrencia)
-        const refId = 'RET-' + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2, 5).toUpperCase();
 
         await connection.execute(
-            `INSERT INTO transactions (user_id, investment_id, type, amount, description, ref_id, created_at)
-             VALUES (?, ?, 'investment_return', ?, ?, ?, NOW())`,
-            [investment.user_id, investmentId, amountEarned,
-             `Rendimiento CDTC ${rate}% — ${periodMonth} — Capital: $${capitalBase.toLocaleString('es-CO')}${referralCommission ? ' (neto, -$' + referralCommission.toLocaleString('es-CO') + ' comisión referido)' : ''}`,
-             refId]
+            `UPDATE investments
+             SET withdrawable_earnings = COALESCE(withdrawable_earnings, 0) + ?
+             WHERE id = ?`,
+            [grossAmountEarned, investmentId]
         );
 
-        let referralRefId = null;
-        if (referrerId && referralCommission >= 100) {
-            referralRefId = 'REF-' + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2, 5).toUpperCase();
-            try {
-                await connection.execute(
-                    `INSERT INTO referral_commissions (referrer_id, referred_id, source_type, source_id, source_amount, commission_rate, commission_amount, status, ref_id) 
-                     VALUES (?, ?, 'investment_return', ?, ?, 0.05, ?, 'paid', ?)`,
-                    [referrerId, investment.user_id, returnResult.insertId, grossAmountEarned, referralCommission, referralRefId]
-                );
-            } catch (e) { console.error('Error registrando comisión en tabla:', e.message); }
-
-            await connection.execute(
-                `INSERT INTO transactions (user_id, type, amount, description, ref_id, created_at) VALUES (?, 'profit', ?, ?, ?, NOW())`,
-                [referrerId, referralCommission, `Comisión referido — 5% de rendimiento CDTC`, referralRefId]
-            );
-            // FIX: Usa balanceHelper centralizado
-            await recalculateAndSaveBalance(connection, referrerId);
-        }
-
-        // FIX: Usa balanceHelper centralizado
-        const newBalance = await recalculateAndSaveBalance(connection, investment.user_id);
         await connection.commit();
-
-        res.status(201).json({
-            message: `Rendimiento registrado exitosamente${referralCommission ? ' (5% comisión referido descontada)' : ''}`,
+        return res.status(201).json({
+            message: `Rendimiento ${label} acumulado ($${grossAmountEarned.toLocaleString('es-CO')}). El cliente verá "Por retirar" en su dashboard.`,
             return: {
-                id: returnResult.insertId, investmentId, userId: investment.user_id,
-                periodMonth, rate, grossAmountEarned, referralCommission, amountEarned,
-                capitalBase, refId, newBalance,
-                referral: referrerId ? { referrerId, commission: referralCommission, refId: referralRefId } : null,
+                id: returnResult.insertId,
+                investmentId,
+                userId: investment.user_id,
+                periodMonth,
+                rate,
+                grossAmountEarned,
+                accrued: true,
+                creditedToBalance: false,
+                capitalBase,
+                type: invType,
             },
         });
     } catch (error) {
