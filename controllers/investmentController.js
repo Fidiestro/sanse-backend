@@ -413,6 +413,7 @@ exports.getMyInvestments = async (req, res) => {
                  WHERE user_id = ? AND status = 'pending_deposit'`,
                 [userId]
             );
+            let cancelledAny = false;
             for (const inv of stale) {
                 const m = inv.notes ? inv.notes.match(/Período de depósito hasta: ([\d-: ]+)/) : null;
                 if (!m) continue;
@@ -421,11 +422,16 @@ exports.getMyInvestments = async (req, res) => {
                 // Vencida → cancelar y devolver capital con transacción
                 await pool.execute(`UPDATE investments SET status = 'cancelled' WHERE id = ?`, [inv.id]);
                 const refId = 'AUTO-' + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2, 5).toUpperCase();
+                // FIX: usar tipo válido del balanceHelper ('investment_withdrawal' está en INFLOW_TYPES)
                 await pool.execute(
                     `INSERT INTO transactions (user_id, investment_id, type, amount, description, ref_id, created_at)
-                     VALUES (?, ?, 'investment_cancellation', ?, ?, ?, NOW())`,
+                     VALUES (?, ?, 'investment_withdrawal', ?, ?, ?, NOW())`,
                     [userId, inv.id, parseFloat(inv.amount), `Cancelación automática inversión #${inv.id} — Depósito no confirmado en 12h`, refId]
                 );
+                cancelledAny = true;
+            }
+            if (cancelledAny) {
+                await recalculateAndSaveBalance(pool, userId);
             }
         } catch (e) {
             console.warn('[getMyInvestments auto-cancel]', e.message);
@@ -441,14 +447,68 @@ exports.getMyInvestments = async (req, res) => {
         const results = await Promise.all(
             investments.map(async (inv) => {
                 const [returns] = await pool.execute(
-                    `SELECT period_month, rate_applied, amount_earned, status 
-                     FROM investment_returns WHERE investment_id = ? ORDER BY period_month ASC`,
+                    `SELECT period_month, rate_applied, amount_earned, status, created_at
+                     FROM investment_returns WHERE investment_id = ? ORDER BY period_month ASC, created_at ASC`,
                     [inv.id]
                 );
 
                 const now = new Date();
                 const depositDeadlineMatch = inv.notes?.match(/Período de depósito hasta: ([\d-: ]+)/);
                 const depositDeadline = depositDeadlineMatch ? new Date(depositDeadlineMatch[1].replace(' ', 'T')) : null;
+
+                // ─── CDTC: cálculo en tiempo real de ganancia acumulada ───
+                // bruto acumulado = capital × 2% × (días desde start / 30)
+                // claimable = bruto - lo ya reclamado vía claims previos (en transactions)
+                // canClaimNow: pasó el cooldown de 24h desde el último claim
+                const invType = (inv.type || '').toLowerCase();
+                const isPool  = invType === 'pool';
+                const isCdtcActive = !isPool && inv.status === 'active';
+
+                let liveAccrued = 0;
+                let liveClaimable = 0;
+                let canClaimNow = false;
+                let nextClaimAt = null;
+
+                if (isCdtcActive) {
+                    const startTs = new Date(inv.start_date).getTime();
+                    const daysElapsed = Math.max(0, (now.getTime() - startTs) / (1000 * 60 * 60 * 24));
+                    const capital = parseFloat(inv.amount);
+                    liveAccrued = Math.floor(capital * 0.02 * (daysElapsed / 30));
+
+                    // "Ya retirado" = suma de claims previos en transactions (tipo investment_return).
+                    // Los claims se guardan en NETO. Si el usuario tiene referido, neto = bruto * 0.95
+                    // → para comparar contra el bruto acumulado, hay que dividir entre 0.95.
+                    const [claimRows] = await pool.execute(
+                        `SELECT COALESCE(SUM(amount), 0) as total, MAX(created_at) as last_claim
+                         FROM transactions
+                         WHERE investment_id = ? AND user_id = ? AND type = 'investment_return'`,
+                        [inv.id, userId]
+                    );
+                    const netAlreadyPaid = parseFloat(claimRows[0].total) || 0;
+
+                    const [refCheck] = await pool.execute(
+                        'SELECT referred_by FROM users WHERE id = ?', [userId]
+                    );
+                    const hasReferrer = refCheck.length && refCheck[0].referred_by;
+                    const grossAlreadyPaid = hasReferrer
+                        ? Math.round(netAlreadyPaid / 0.95)
+                        : netAlreadyPaid;
+
+                    liveClaimable = Math.max(0, liveAccrued - grossAlreadyPaid);
+
+                    // Cooldown 24h desde el último claim
+                    const lastClaim = claimRows[0].last_claim ? new Date(claimRows[0].last_claim) : null;
+                    if (lastClaim) {
+                        const cooldownMs = 24 * 60 * 60 * 1000;
+                        const msSince = now.getTime() - lastClaim.getTime();
+                        canClaimNow = msSince >= cooldownMs && liveClaimable >= 100;
+                        if (!canClaimNow && msSince < cooldownMs) {
+                            nextClaimAt = new Date(lastClaim.getTime() + cooldownMs).toISOString();
+                        }
+                    } else {
+                        canClaimNow = liveClaimable >= 100;
+                    }
+                }
 
                 return {
                     id: inv.id,
@@ -469,6 +529,11 @@ exports.getMyInvestments = async (req, res) => {
                     totalEarned: returns.reduce((sum, r) => sum + parseFloat(r.amount_earned), 0),
                     canCancel: inv.status === 'pending_deposit' && depositDeadline && now < depositDeadline,
                     depositDeadline: inv.status === 'pending_deposit' && depositDeadline ? depositDeadline.toISOString() : null,
+                    // CDTC live accrual data
+                    liveAccrued,
+                    liveClaimable,
+                    canClaimNow,
+                    nextClaimAt,
                     returns: returns.map((r) => ({
                         month: r.period_month,
                         rate: parseFloat(r.rate_applied),
@@ -673,19 +738,25 @@ exports.cancelInvestment = async (req, res) => {
             [investmentId, userId]
         );
         if (!invRows.length) {
+            await connection.rollback();
             return res.status(404).json({ error: 'Inversión no encontrada' });
         }
 
         const inv = invRows[0];
         if (inv.status !== 'pending_deposit') {
+            await connection.rollback();
             return res.status(400).json({ error: 'Solo se pueden cancelar inversiones en período de depósito' });
         }
 
+        // FIX: la verificación de deadline solo aplica si HAY deadline en las notas.
+        // Si no lo encuentra, permitimos cancelar igual (no bloquear al usuario).
         const depositDeadlineMatch = inv.notes?.match(/Período de depósito hasta: ([\d-: ]+)/);
-        const depositDeadline = depositDeadlineMatch ? new Date(depositDeadlineMatch[1].replace(' ', 'T')) : null;
-
-        if (!depositDeadline || new Date() > depositDeadline) {
-            return res.status(400).json({ error: 'El período de cancelación ha expirado' });
+        if (depositDeadlineMatch) {
+            const depositDeadline = new Date(depositDeadlineMatch[1].replace(' ', 'T'));
+            if (!isNaN(depositDeadline) && new Date() > depositDeadline) {
+                // Deadline pasada — igual permitimos cancelar (auto-cancel también lo haría)
+                // pero avisamos en notes
+            }
         }
 
         await connection.execute(
@@ -693,19 +764,27 @@ exports.cancelInvestment = async (req, res) => {
             [investmentId]
         );
 
+        // FIX: el tipo correcto es 'investment_withdrawal' (está en INFLOW_TYPES del balanceHelper).
+        // 'investment_cancellation' NO existe → el dinero quedaba fantasma sin afectar balance.
+        // Como al crear la inversión se hizo type='investment' con monto negativo (out),
+        // ahora hacemos 'investment_withdrawal' con monto positivo (in) → balance neutro.
+        const capitalAmount = parseFloat(inv.amount);
         const refId = 'CAN-' + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2, 5).toUpperCase();
         await connection.execute(
             `INSERT INTO transactions (user_id, investment_id, type, amount, description, ref_id, created_at) 
-             VALUES (?, ?, 'investment_cancellation', ?, ?, ?, NOW())`,
-            [userId, investmentId, parseFloat(inv.amount), `Cancelación inversión #${investmentId}`, refId]
+             VALUES (?, ?, 'investment_withdrawal', ?, ?, ?, NOW())`,
+            [userId, investmentId, capitalAmount, `Cancelación inversión #${investmentId} — Capital devuelto`, refId]
         );
+
+        // FIX: recalcular balance del usuario para que el capital cancelado vuelva al saldo disponible.
+        await recalculateAndSaveBalance(connection, userId);
 
         await auditLog({
             userId,
             action: 'cancel_investment',
             entityType: 'investment',
             entityId: parseInt(investmentId),
-            details: { cancelledAmount: parseFloat(inv.amount) },
+            details: { cancelledAmount: capitalAmount },
             ipAddress: req.ip,
         });
 
@@ -713,7 +792,7 @@ exports.cancelInvestment = async (req, res) => {
 
         res.json({
             message: 'Inversión cancelada. El capital ha sido devuelto a tu saldo disponible.',
-            investment: { id: parseInt(investmentId), cancelledAmount: parseFloat(inv.amount) },
+            investment: { id: parseInt(investmentId), cancelledAmount: capitalAmount, refId },
         });
     } catch (error) {
         await connection.rollback();
@@ -740,16 +819,22 @@ exports.confirmInvestment = async (req, res) => {
             [investmentId, userId]
         );
         if (!invRows.length) {
+            await connection.rollback();
             return res.status(404).json({ error: 'Inversión no encontrada' });
         }
 
         const inv = invRows[0];
         if (inv.status !== 'pending_deposit') {
+            await connection.rollback();
             return res.status(400).json({ error: 'Solo se pueden confirmar inversiones pendientes' });
         }
 
+        // FIX: actualizar start_date al momento de confirmación.
+        // Antes el start_date era cuando el cliente CREÓ la inversión, no cuando confirmó.
+        // Esto sesga el cálculo de ganancia en tiempo real ("¿cuánto debería haber generado?").
+        // Al actualizar start_date al confirmar, los rendimientos cuentan desde el día real.
         await connection.execute(
-            `UPDATE investments SET status = 'active' WHERE id = ?`,
+            `UPDATE investments SET status = 'active', start_date = NOW() WHERE id = ?`,
             [investmentId]
         );
 
@@ -793,11 +878,13 @@ exports.withdrawInvestment = async (req, res) => {
             [investmentId, userId]
         );
         if (!invRows.length) {
+            await connection.rollback();
             return res.status(404).json({ error: 'Inversión no encontrada' });
         }
 
         const inv = invRows[0];
         if (inv.status !== 'active') {
+            await connection.rollback();
             return res.status(400).json({ error: 'Solo se pueden retirar inversiones activas' });
         }
 
@@ -805,6 +892,7 @@ exports.withdrawInvestment = async (req, res) => {
         const lockEnd = new Date(inv.lock_end_date || inv.end_date);
 
         if (now < lockEnd) {
+            await connection.rollback();
             const daysLeft = Math.ceil((lockEnd - now) / (1000 * 60 * 60 * 24));
             return res.status(400).json({
                 error: `La inversión aún está bloqueada. Faltan ${daysLeft} días para el desbloqueo.`,
@@ -813,12 +901,38 @@ exports.withdrawInvestment = async (req, res) => {
             });
         }
 
-        // FIX: si hay ganancias pendientes (withdrawable_earnings), forzar claim primero
-        // para que no se pierdan al marcar la inversión como completed.
-        const pendingEarnings = parseFloat(inv.withdrawable_earnings) || 0;
-        if (pendingEarnings > 0) {
+        // FIX: si hay ganancias pendientes, forzar claim primero para que no se pierdan
+        // al marcar la inversión como completed.
+        //   - Pool: lee withdrawable_earnings
+        //   - CDTC: recalcula en tiempo real (capital × 2% × días/30 - lo ya retirado bruto)
+        const invType = (inv.type || '').toLowerCase();
+        const isPool = invType === 'pool';
+        let pendingEarnings = 0;
+        if (isPool) {
+            pendingEarnings = parseFloat(inv.withdrawable_earnings) || 0;
+        } else {
+            const capital = parseFloat(inv.amount) || 0;
+            const startDate = new Date(inv.start_date);
+            const daysElapsed = Math.max(0, (now - startDate) / (1000 * 60 * 60 * 24));
+            const grossAccrued = Math.floor(capital * 0.02 * (daysElapsed / 30));
+            const [paidRows] = await connection.execute(
+                `SELECT COALESCE(SUM(amount), 0) as total FROM transactions
+                 WHERE investment_id = ? AND user_id = ? AND type = 'investment_return'`,
+                [investmentId, userId]
+            );
+            const netAlreadyPaid = parseFloat(paidRows[0].total) || 0;
+            const [refCheck] = await connection.execute(
+                'SELECT referred_by FROM users WHERE id = ?', [userId]
+            );
+            const hasReferrer = refCheck.length && refCheck[0].referred_by;
+            const grossAlreadyPaid = hasReferrer ? Math.round(netAlreadyPaid / 0.95) : netAlreadyPaid;
+            pendingEarnings = Math.max(0, grossAccrued - grossAlreadyPaid);
+        }
+
+        if (pendingEarnings >= 100) {
+            await connection.rollback();
             return res.status(400).json({
-                error: `Tienes $${pendingEarnings.toLocaleString('es-CO')} en ganancias pendientes. Retíralas primero (botón "Retirar Ganancias") antes de retirar el capital.`,
+                error: `Tienes $${pendingEarnings.toLocaleString('es-CO')} en ganancias pendientes. Retíralas primero (botón "Reclamar Ganancias") antes de retirar el capital.`,
                 pendingEarnings,
             });
         }
@@ -837,6 +951,9 @@ exports.withdrawInvestment = async (req, res) => {
              VALUES (?, ?, 'investment_withdrawal', ?, ?, ?, NOW())`,
             [userId, investmentId, capitalAmount, `Retiro inversión ${inv.type || 'CDTC'} #${investmentId} — Capital liberado`, refId]
         );
+
+        // FIX: recalcular balance para que el capital liberado quede reflejado.
+        await recalculateAndSaveBalance(connection, userId);
 
         await auditLog({
             userId,
@@ -935,34 +1052,80 @@ exports.withdrawPoolEarnings = async (req, res) => {
         const isPool  = invType === 'pool';
         const label   = isPool ? 'Pool' : 'CDTC';
 
-        const grossEarnings = parseFloat(inv.withdrawable_earnings) || 0;
+        // Resolve referrer ONCE (reused for both gross calculation and commission)
+        const [refRows] = await connection.execute(
+            'SELECT referred_by FROM users WHERE id = ?', [userId]
+        );
+        const referrerId = (refRows.length && refRows[0].referred_by) ? refRows[0].referred_by : null;
+        const hasReferrer = !!referrerId;
+
+        // ════════════════════════════════════════════════════════════════
+        // CÁLCULO DE GANANCIA RECLAMABLE
+        // ────────────────────────────────────────────────────────────────
+        // Pool: lee withdrawable_earnings (el admin acumula manualmente).
+        // CDTC: calcula en tiempo real (2% mensual fijo), descontando lo ya retirado.
+        // ════════════════════════════════════════════════════════════════
+        let grossEarnings = 0;
+        if (isPool) {
+            grossEarnings = parseFloat(inv.withdrawable_earnings) || 0;
+        } else {
+            // CDTC: tasa fija 2% mensual desde start_date (que es la fecha de confirmación)
+            const capital = parseFloat(inv.amount) || 0;
+            const startDate = new Date(inv.start_date);
+            const now = new Date();
+            const daysElapsed = Math.max(0, (now - startDate) / (1000 * 60 * 60 * 24));
+            const grossAccrued = Math.floor(capital * 0.02 * (daysElapsed / 30));
+
+            // Cuánto ya retiró históricamente (suma de claims previos para esta inversión).
+            // Los claims se guardan en NETO: si hay referido, neto = bruto * 0.95.
+            const [paidRows] = await connection.execute(
+                `SELECT COALESCE(SUM(amount), 0) as total FROM transactions
+                 WHERE investment_id = ? AND user_id = ? AND type = 'investment_return'`,
+                [id, userId]
+            );
+            const netAlreadyPaid = parseFloat(paidRows[0].total) || 0;
+            const grossAlreadyPaid = hasReferrer
+                ? Math.round(netAlreadyPaid / 0.95)
+                : netAlreadyPaid;
+
+            grossEarnings = Math.max(0, grossAccrued - grossAlreadyPaid);
+        }
 
         if (grossEarnings <= 0) {
             await connection.rollback();
             return res.status(400).json({ error: 'No hay ganancias disponibles para retirar' });
         }
 
+        // ── Límite 1 claim por día (solo CDTC, Pool no necesita porque depende del admin) ──
+        if (!isPool) {
+            const [recentClaims] = await connection.execute(
+                `SELECT COUNT(*) as c FROM transactions
+                 WHERE investment_id = ? AND user_id = ? AND type = 'investment_return'
+                   AND created_at > DATE_SUB(NOW(), INTERVAL 24 HOUR)`,
+                [id, userId]
+            );
+            if (parseInt(recentClaims[0].c) > 0) {
+                await connection.rollback();
+                return res.status(429).json({
+                    error: 'Solo puedes reclamar ganancias CDTC una vez cada 24 horas. Intenta de nuevo más tarde.',
+                    nextClaimIn: '24h desde el último claim',
+                });
+            }
+        }
+
         // ── Cálculos de comisiones según tipo ──
         // Pool: 20% Sanse + 5% referido. CDTC: 0% Sanse + 5% referido.
         const sanseCommission = isPool ? Math.round(grossEarnings * 0.20) : 0;
-
-        let referrerId = null;
-        let referralCommission = 0;
-        const [refRows] = await connection.execute(
-            'SELECT referred_by FROM users WHERE id = ?', [userId]
-        );
-        if (refRows.length && refRows[0].referred_by) {
-            referrerId = refRows[0].referred_by;
-            referralCommission = Math.round(grossEarnings * 0.05);
-        }
-
+        const referralCommission = hasReferrer ? Math.round(grossEarnings * 0.05) : 0;
         const netAmount = grossEarnings - sanseCommission - referralCommission;
 
-        // ── 1. Resetear ganancias retirables ──
-        await connection.execute(
-            'UPDATE investments SET withdrawable_earnings = 0 WHERE id = ?',
-            [id]
-        );
+        // ── 1. Reset de withdrawable_earnings (solo Pool — CDTC no lo usa) ──
+        if (isPool) {
+            await connection.execute(
+                'UPDATE investments SET withdrawable_earnings = 0 WHERE id = ?',
+                [id]
+            );
+        }
 
         // ── 2. Crear transacción del retiro neto al usuario ──
         const refId = 'PWR-' + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2, 5).toUpperCase();

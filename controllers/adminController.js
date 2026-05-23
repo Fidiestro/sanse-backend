@@ -262,6 +262,17 @@ exports.registerInvestmentReturn = async (req, res) => {
         const investment = invRows[0];
         if (investment.status !== 'active') { await connection.rollback(); return res.status(400).json({ error: 'La inversión no está activa' }); }
 
+        // FIX: CDTC ya no se registra manualmente — su rendimiento es automático
+        // (2% mensual fijo, cliente hace claim desde el dashboard cada 24h).
+        // Este endpoint queda solo para Pool, cuya tasa es variable.
+        const adminInvType = (investment.type || '').toLowerCase();
+        if (adminInvType !== 'pool') {
+            await connection.rollback();
+            return res.status(400).json({
+                error: 'Las inversiones CDTC ya no requieren registro manual. Generan 2% mensual automático y el cliente reclama desde su dashboard.',
+            });
+        }
+
         const [existingReturn] = await connection.execute(
             `SELECT id FROM investment_returns WHERE investment_id = ? AND period_month = ?`, [investmentId, periodMonthDB]
         );
