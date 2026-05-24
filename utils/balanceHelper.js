@@ -3,6 +3,9 @@
 // FUENTE ÚNICA DE VERDAD para recálculo de balance de usuario.
 // Todos los controllers deben importar esta función en lugar de
 // tener su propia implementación.
+//
+// FIX 2026-05-24: Agregado 'fee' a OUTFLOW_TYPES para soportar
+// comisiones de entrada al Pool (2%) como transacción separada.
 // ══════════════════════════════════════════════════════════════
 
 // Tipos de transacción que SUMAN al balance del usuario
@@ -19,6 +22,7 @@ const INFLOW_TYPES = [
 // Tipos de transacción que RESTAN del balance del usuario
 const OUTFLOW_TYPES = [
     'withdraw',
+    'fee',              // FIX: comisión de entrada al Pool (2%) — descuenta del balance
 ];
 
 // Todos los tipos válidos reconocidos por el sistema
@@ -26,7 +30,7 @@ const ALL_VALID_TYPES = [...INFLOW_TYPES, ...OUTFLOW_TYPES, 'investment'];
 
 /**
  * Recalcula y guarda el balance de un usuario en balance_history.
- * 
+ *
  * @param {object} connection - Conexión MySQL (pool.getConnection() o pool)
  * @param {number} userId - ID del usuario
  * @returns {number} El nuevo balance calculado
@@ -73,7 +77,7 @@ async function recalculateAndSaveBalance(connection, userId) {
 
 /**
  * Valida que un tipo de transacción sea reconocido por el sistema.
- * 
+ *
  * @param {string} type - Tipo de transacción
  * @returns {boolean}
  */

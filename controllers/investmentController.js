@@ -112,6 +112,8 @@ exports.createUserInvestment = async (req, res) => {
             }
 
             // Crear inversión Pool
+            // IMPORTANTE: investments.amount conserva el BRUTO ($1M) para mostrar correctamente en UI,
+            // pero net_capital ($980k) es el monto que realmente entra al pool y se devuelve al vencer.
             const [result] = await connection.execute(
                 `INSERT INTO investments 
                  (user_id, type, amount, net_capital, entry_fee, duration_months, 
@@ -130,14 +132,30 @@ exports.createUserInvestment = async (req, res) => {
 
             const investmentId = result.insertId;
 
-            // Registrar transacción
-            const refId = 'POOL-' + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2, 5).toUpperCase();
+            // ── 2 TRANSACCIONES SEPARADAS para que el cliente vea el desglose ──
+            // Suma: -netCapital + -entryFee = -amount (el balance baja igual)
+            const baseRef = Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2, 5).toUpperCase();
+            const invRefId = 'POOL-' + baseRef;
+            const feeRefId = 'FEE-' + baseRef;
 
+            // 1) Capital neto que entra al pool
             await connection.execute(
                 `INSERT INTO transactions (user_id, investment_id, type, amount, description, ref_id, created_at) 
                  VALUES (?, ?, 'investment', ?, ?, ?, NOW())`,
-                [userId, investmentId, -amount, `Inversión Pool de Liquidez — Capital neto: $${netCapital.toLocaleString('es-CO')} (Comisión: $${entryFee.toLocaleString('es-CO')})`, refId]
+                [userId, investmentId, -netCapital,
+                 `Inversión Pool #${investmentId} — Capital neto al pool`, invRefId]
             );
+
+            // 2) Comisión de entrada 2% (transacción separada para que se vea explícita)
+            await connection.execute(
+                `INSERT INTO transactions (user_id, investment_id, type, amount, description, ref_id, created_at) 
+                 VALUES (?, ?, 'fee', ?, ?, ?, NOW())`,
+                [userId, investmentId, entryFee,
+                 `Comisión de entrada Pool #${investmentId} — 2% del capital ($${amount.toLocaleString('es-CO')})`, feeRefId]
+            );
+
+            // Recalcular balance (refleja el descuento total: netCapital + fee = amount)
+            await recalculateAndSaveBalance(connection, userId);
 
             // Audit log
             await auditLog({
@@ -937,7 +955,10 @@ exports.withdrawInvestment = async (req, res) => {
             });
         }
 
-        const capitalAmount = parseFloat(inv.amount);
+        // FIX: Pool devuelve net_capital (descontó 2% al entrar). CDTC devuelve amount completo.
+        const capitalAmount = isPool
+            ? (parseFloat(inv.net_capital) || parseFloat(inv.amount))
+            : parseFloat(inv.amount);
 
         await connection.execute(
             `UPDATE investments SET status = 'completed' WHERE id = ?`,
@@ -946,10 +967,14 @@ exports.withdrawInvestment = async (req, res) => {
 
         const refId = 'WDR-' + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2, 5).toUpperCase();
 
+        const desc = isPool
+            ? `Retiro Pool #${investmentId} — Capital neto liberado ($${capitalAmount.toLocaleString('es-CO')}). Comisión de entrada 2% no reembolsable.`
+            : `Retiro inversión ${inv.type || 'CDTC'} #${investmentId} — Capital liberado`;
+
         await connection.execute(
             `INSERT INTO transactions (user_id, investment_id, type, amount, description, ref_id, created_at) 
              VALUES (?, ?, 'investment_withdrawal', ?, ?, ?, NOW())`,
-            [userId, investmentId, capitalAmount, `Retiro inversión ${inv.type || 'CDTC'} #${investmentId} — Capital liberado`, refId]
+            [userId, investmentId, capitalAmount, desc, refId]
         );
 
         // FIX: recalcular balance para que el capital liberado quede reflejado.
