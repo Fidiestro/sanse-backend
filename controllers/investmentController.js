@@ -519,12 +519,12 @@ exports.getMyInvestments = async (req, res) => {
                     if (lastClaim) {
                         const cooldownMs = 24 * 60 * 60 * 1000;
                         const msSince = now.getTime() - lastClaim.getTime();
-                        canClaimNow = msSince >= cooldownMs && liveClaimable >= 100;
+                        canClaimNow = msSince >= cooldownMs && liveClaimable >= 10;
                         if (!canClaimNow && msSince < cooldownMs) {
                             nextClaimAt = new Date(lastClaim.getTime() + cooldownMs).toISOString();
                         }
                     } else {
-                        canClaimNow = liveClaimable >= 100;
+                        canClaimNow = liveClaimable >= 10;
                     }
                 }
 
@@ -947,7 +947,7 @@ exports.withdrawInvestment = async (req, res) => {
             pendingEarnings = Math.max(0, grossAccrued - grossAlreadyPaid);
         }
 
-        if (pendingEarnings >= 100) {
+        if (pendingEarnings >= 10) {
             await connection.rollback();
             return res.status(400).json({
                 error: `Tienes $${pendingEarnings.toLocaleString('es-CO')} en ganancias pendientes. Retíralas primero (botón "Reclamar Ganancias") antes de retirar el capital.`,
