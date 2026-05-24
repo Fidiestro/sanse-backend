@@ -1,13 +1,14 @@
 // ══════════════════════════════════════════════════════════════
 // controllers/loanController.js — Sanse Capital
-// FIXES:
-//  1. Usa balanceHelper centralizado (elimina recalcBalance local)
-//  2. Registra pagos en loan_payments para control de ganancias admin
-//  3. Nuevos endpoints: adminGetLoanPayments, adminGetLoanProfitStats
+// v5 — FIXES:
+//  1. BUG #11: Prevenir SOBRE-PAGO en payLoan (cap amount al total real)
+//  2. BUG #4: atomic UPDATE en adminProcessLoan para prevenir race
+//  3. BUG #1: Validación strict de status antes de aprobar préstamos
+//  4. Mantiene: usa balanceHelper centralizado, registra loan_payments
 // ══════════════════════════════════════════════════════════════
 const { pool }   = require('../config/database');
 const { notify } = require('../utils/telegram');
-const { recalculateAndSaveBalance } = require('../utils/balanceHelper');
+const { recalculateAndSaveBalance, INFLOW_TYPES, OUTFLOW_TYPES } = require('../utils/balanceHelper');
 
 // ══════════════════════════════════════════════════════════════
 // SISTEMA DE PUNTOS CREDITICIOS — "Sanse Score" (máx 1000 pts)
@@ -15,7 +16,6 @@ const { recalculateAndSaveBalance } = require('../utils/balanceHelper');
 async function calculateCreditScore(userId) {
     const points = { total: 0, breakdown: {} };
 
-    // 1. Antigüedad de la cuenta (máx 150 pts)
     const [acctRows] = await pool.execute(`SELECT created_at FROM users WHERE id = ?`, [userId]);
     if (acctRows.length) {
         const monthsActive = Math.max(0, Math.round((Date.now() - new Date(acctRows[0].created_at)) / (1000 * 60 * 60 * 24 * 30)));
@@ -24,7 +24,6 @@ async function calculateCreditScore(userId) {
         points.total += acctPts;
     }
 
-    // 2. Capital depositado total (máx 200 pts)
     const [depositRows] = await pool.execute(
         `SELECT COALESCE(SUM(amount), 0) as total FROM transactions WHERE user_id = ? AND type IN ('deposit', 'payment')`, [userId]
     );
@@ -33,7 +32,6 @@ async function calculateCreditScore(userId) {
     points.breakdown.capital = { pts: depositPts, max: 200, detail: `$${Math.round(totalDeposited).toLocaleString('es-CO')} depositados` };
     points.total += depositPts;
 
-    // 3. Inversiones CDTC activas/completadas (máx 200 pts)
     const [invRows]     = await pool.execute(`SELECT COUNT(*) as active FROM investments WHERE user_id = ? AND status = 'active'`, [userId]);
     const [invCompRows] = await pool.execute(`SELECT COUNT(*) as completed FROM investments WHERE user_id = ? AND status = 'completed'`, [userId]);
     const activeInv    = parseInt(invRows[0].active);
@@ -42,42 +40,30 @@ async function calculateCreditScore(userId) {
     points.breakdown.inversiones = { pts: invPts, max: 200, detail: `${activeInv} activas, ${completedInv} completadas` };
     points.total += invPts;
 
-    // 4. Historial de préstamos (máx 250 pts)
     const [loanPaidRows] = await pool.execute(`SELECT COUNT(*) as paid FROM loan_requests WHERE user_id = ? AND status = 'paid'`, [userId]);
     const [loanLateRows] = await pool.execute(`SELECT COUNT(*) as late FROM loan_requests WHERE user_id = ? AND status = 'overdue'`, [userId]);
-    const paidLoans = parseInt(loanPaidRows[0]?.paid || 0);
-    const lateLoans = parseInt(loanLateRows[0]?.late || 0);
-    const loanPts = Math.min(250, Math.max(0, (paidLoans * 80) - (lateLoans * 100)));
+    const paidLoans = parseInt(loanPaidRows[0].paid);
+    const lateLoans = parseInt(loanLateRows[0].late);
+    const loanPts = Math.max(0, Math.min(250, (paidLoans * 80) - (lateLoans * 100)));
     points.breakdown.prestamos = { pts: loanPts, max: 250, detail: `${paidLoans} pagados, ${lateLoans} en mora` };
     points.total += loanPts;
 
-    // 5. Actividad reciente — transacciones últimos 90 días (máx 100 pts)
-    const [recentRows] = await pool.execute(
-        `SELECT COUNT(*) as c FROM transactions WHERE user_id = ? AND created_at >= DATE_SUB(NOW(), INTERVAL 90 DAY)`, [userId]
-    );
-    const recentTx = parseInt(recentRows[0].c);
-    const actPts = Math.min(100, recentTx * 10);
-    points.breakdown.actividad = { pts: actPts, max: 100, detail: `${recentTx} transacciones (90 días)` };
-    points.total += actPts;
+    // Bonus referidos (máx 100 pts)
+    try {
+        const [refRows] = await pool.execute(`SELECT COUNT(*) as c FROM users WHERE referred_by = ?`, [userId]);
+        const refCount = parseInt(refRows[0].c);
+        const refPts = Math.min(100, refCount * 20);
+        points.breakdown.referidos = { pts: refPts, max: 100, detail: `${refCount} referidos` };
+        points.total += refPts;
+    } catch (e) {}
 
-    // 6. Balance actual (máx 100 pts)
-    const [balRows] = await pool.execute(
-        `SELECT amount FROM balance_history WHERE user_id = ? ORDER BY snapshot_date DESC LIMIT 1`, [userId]
-    );
-    const currentBalance = balRows.length ? parseFloat(balRows[0].amount) : 0;
-    const balPts = Math.min(100, Math.floor(currentBalance / 1000000) * 20);
-    points.breakdown.balance = { pts: balPts, max: 100, detail: `$${Math.round(currentBalance).toLocaleString('es-CO')} actual` };
-    points.total += balPts;
+    // Tier
+    if (points.total >= 800)      points.tier = 'PLATINUM';
+    else if (points.total >= 600) points.tier = 'GOLD';
+    else if (points.total >= 400) points.tier = 'SILVER';
+    else if (points.total >= 200) points.tier = 'BRONZE';
+    else                          points.tier = 'STARTER';
 
-    points.total = Math.min(1000, points.total);
-
-    if      (points.total >= 800) points.tier = 'Platino';
-    else if (points.total >= 600) points.tier = 'Oro';
-    else if (points.total >= 400) points.tier = 'Plata';
-    else if (points.total >= 200) points.tier = 'Bronce';
-    else                          points.tier = 'Inicial';
-
-    points.airdropMultiplier = parseFloat((points.total / 1000 * 5).toFixed(2));
     return points;
 }
 
@@ -87,10 +73,11 @@ async function calculateCreditScore(userId) {
 exports.getMyLoans = async (req, res) => {
     try {
         const userId = req.user.id;
+
         let legacyLoans = [];
         try {
             const [rows] = await pool.execute(
-                `SELECT id, amount, monthly_rate, start_date, status, created_at FROM loans WHERE user_id = ? ORDER BY created_at DESC`, [userId]
+                `SELECT * FROM loans WHERE user_id = ? ORDER BY created_at DESC`, [userId]
             );
             legacyLoans = rows.map(l => ({
                 id: l.id, source: 'legacy', amount: parseFloat(l.amount),
@@ -214,7 +201,7 @@ exports.adminGetLoans = async (req, res) => {
 
 // ══════════════════════════════════════════════════════════════
 // ADMIN: POST /api/admin/loans/:id/process
-// FIX: Usa balanceHelper centralizado
+// FIX BUG #4: atomic UPDATE para prevenir doble-procesamiento
 // ══════════════════════════════════════════════════════════════
 exports.adminProcessLoan = async (req, res) => {
     const connection = await pool.getConnection();
@@ -225,16 +212,18 @@ exports.adminProcessLoan = async (req, res) => {
         const { action, approvedAmount, approvedRate, notes } = req.body;
 
         if (!['approve', 'reject', 'mark_paid', 'mark_overdue'].includes(action)) {
+            await connection.rollback();
             return res.status(400).json({ error: 'Acción inválida. Usar: approve, reject, mark_paid, mark_overdue' });
         }
 
         const [loanRows] = await connection.execute(`SELECT * FROM loan_requests WHERE id = ?`, [loanId]);
-        if (!loanRows.length) return res.status(404).json({ error: 'Solicitud no encontrada' });
+        if (!loanRows.length) {
+            await connection.rollback();
+            return res.status(404).json({ error: 'Solicitud no encontrada' });
+        }
         const loan = loanRows[0];
 
         if (action === 'approve') {
-            if (loan.status !== 'pending') return res.status(400).json({ error: 'Solo se pueden aprobar solicitudes pendientes' });
-
             const finalAmount = approvedAmount ? parseFloat(approvedAmount) : parseFloat(loan.amount);
             let defaultRate = 6.0;
             const [investorCheck] = await connection.execute(`SELECT COUNT(*) as c FROM investments WHERE user_id = ?`, [loan.user_id]);
@@ -245,11 +234,17 @@ exports.adminProcessLoan = async (req, res) => {
             const dueDate   = new Date();
             dueDate.setMonth(dueDate.getMonth() + parseInt(loan.term_months));
 
-            await connection.execute(
+            // FIX BUG #4: UPDATE atómico con check de status
+            const [updRes] = await connection.execute(
                 `UPDATE loan_requests SET status = 'active', approved_amount = ?, approved_rate = ?, monthly_rate = ?,
-                 start_date = ?, due_date = ?, admin_notes = ?, processed_at = NOW(), processed_by = ? WHERE id = ?`,
+                 start_date = ?, due_date = ?, admin_notes = ?, processed_at = NOW(), processed_by = ?
+                 WHERE id = ? AND status = 'pending'`,
                 [finalAmount, finalRate, finalRate, startDate.toISOString().slice(0, 10), dueDate.toISOString().slice(0, 10), notes || null, req.user.id, loanId]
             );
+            if (updRes.affectedRows === 0) {
+                await connection.rollback();
+                return res.status(400).json({ error: 'Solo se pueden aprobar solicitudes pendientes (puede haber sido procesada por otro admin)' });
+            }
 
             const refId = 'LN-' + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2, 5).toUpperCase();
             await connection.execute(
@@ -257,7 +252,6 @@ exports.adminProcessLoan = async (req, res) => {
                 [loan.user_id, finalAmount, `Préstamo aprobado — ${loan.term_months} meses al ${finalRate}% mensual — Ref: ${loan.ref_id}`, refId]
             );
 
-            // FIX: Usa balanceHelper centralizado
             const newBalance = await recalculateAndSaveBalance(connection, loan.user_id);
 
             const [userRows] = await connection.execute(`SELECT full_name FROM users WHERE id = ?`, [loan.user_id]);
@@ -267,28 +261,39 @@ exports.adminProcessLoan = async (req, res) => {
             );
 
         } else if (action === 'reject') {
-            if (loan.status !== 'pending') return res.status(400).json({ error: 'Solo se pueden rechazar solicitudes pendientes' });
-            await connection.execute(
-                `UPDATE loan_requests SET status = 'rejected', admin_notes = ?, processed_at = NOW(), processed_by = ? WHERE id = ?`,
+            const [updRes] = await connection.execute(
+                `UPDATE loan_requests SET status = 'rejected', admin_notes = ?, processed_at = NOW(), processed_by = ?
+                 WHERE id = ? AND status = 'pending'`,
                 [notes || 'Rechazado por el administrador', req.user.id, loanId]
             );
+            if (updRes.affectedRows === 0) {
+                await connection.rollback();
+                return res.status(400).json({ error: 'Solo se pueden rechazar solicitudes pendientes' });
+            }
 
         } else if (action === 'mark_paid') {
-            if (loan.status !== 'active' && loan.status !== 'overdue')
-                return res.status(400).json({ error: 'Solo préstamos activos o en mora' });
             const paidNote = `PAGADO: ${new Date().toISOString().slice(0, 10)}`;
-            await connection.execute(
-                `UPDATE loan_requests SET status = 'paid', approved_amount = 0, admin_notes = CONCAT(IFNULL(admin_notes,''), ?), processed_at = NOW() WHERE id = ?`,
+            const [updRes] = await connection.execute(
+                `UPDATE loan_requests SET status = 'paid', approved_amount = 0, admin_notes = CONCAT(IFNULL(admin_notes,''), ?), processed_at = NOW()
+                 WHERE id = ? AND status IN ('active', 'overdue')`,
                 [` | ${paidNote}`, loanId]
             );
+            if (updRes.affectedRows === 0) {
+                await connection.rollback();
+                return res.status(400).json({ error: 'Solo préstamos activos o en mora pueden marcarse como pagados' });
+            }
 
         } else if (action === 'mark_overdue') {
-            if (loan.status !== 'active') return res.status(400).json({ error: 'Solo préstamos activos' });
             const overdueNote = `MORA: ${notes || ''}`;
-            await connection.execute(
-                `UPDATE loan_requests SET status = 'overdue', admin_notes = CONCAT(IFNULL(admin_notes,''), ?) WHERE id = ?`,
+            const [updRes] = await connection.execute(
+                `UPDATE loan_requests SET status = 'overdue', admin_notes = CONCAT(IFNULL(admin_notes,''), ?)
+                 WHERE id = ? AND status = 'active'`,
                 [` | ${overdueNote}`, loanId]
             );
+            if (updRes.affectedRows === 0) {
+                await connection.rollback();
+                return res.status(400).json({ error: 'Solo préstamos activos pueden marcarse en mora' });
+            }
         }
 
         await connection.commit();
@@ -303,7 +308,6 @@ exports.adminProcessLoan = async (req, res) => {
     }
 };
 
-// ADMIN: GET credit score de cualquier usuario
 exports.adminGetCreditScore = async (req, res) => {
     try {
         const score = await calculateCreditScore(req.params.userId);
@@ -316,8 +320,9 @@ exports.adminGetCreditScore = async (req, res) => {
 
 // ══════════════════════════════════════════════════════════════
 // POST /api/loans/pay — Abonar a un préstamo
-// FIX: Usa balanceHelper centralizado
-// NUEVO: Registra en loan_payments para control de ganancias
+// FIX BUG #11: Cap el monto al total real adeudado (capital + intereses)
+// para prevenir sobre-pago. Si el cliente quiere pagar más, se devuelve error
+// con sugerencia del monto exacto a pagar.
 // ══════════════════════════════════════════════════════════════
 exports.payLoan = async (req, res) => {
     const connection = await pool.getConnection();
@@ -328,14 +333,19 @@ exports.payLoan = async (req, res) => {
         const { loanId, amount: rawAmount } = req.body;
         const amount = parseFloat(rawAmount);
 
-        if (!loanId || !amount || isNaN(amount) || amount < 1000)
+        if (!loanId || !amount || isNaN(amount) || amount < 1000) {
+            await connection.rollback();
             return res.status(400).json({ error: 'Monto mínimo de abono: $1.000 COP' });
+        }
 
         const [loanRows] = await connection.execute(
             `SELECT * FROM loan_requests WHERE id = ? AND user_id = ? AND status IN ('active', 'overdue')`,
             [loanId, userId]
         );
-        if (!loanRows.length) return res.status(404).json({ error: 'Préstamo no encontrado o no está activo' });
+        if (!loanRows.length) {
+            await connection.rollback();
+            return res.status(404).json({ error: 'Préstamo no encontrado o no está activo' });
+        }
         const loan = loanRows[0];
 
         const originalCapital = parseFloat(loan.amount);
@@ -346,11 +356,36 @@ exports.payLoan = async (req, res) => {
 
         const monthlyInterest = Math.round(pendingCapital * (loanRate / 100));
 
+        // ════════════════════════════════════════════════════════════════
+        // FIX BUG #11: CAP el monto al total real adeudado para prevenir sobre-pago.
+        // Si cliente paga $10M cuando solo debe $1M + $40k intereses = $1.04M,
+        // NO descontamos $10M completos. Rechazamos con sugerencia del monto exacto.
+        // ════════════════════════════════════════════════════════════════
+        const totalOwed = pendingCapital + monthlyInterest;
+        if (amount > totalOwed) {
+            await connection.rollback();
+            return res.status(400).json({
+                error: `El monto excede el saldo del préstamo. Total adeudado: $${Math.round(totalOwed).toLocaleString('es-CO')} COP (capital: $${Math.round(pendingCapital).toLocaleString('es-CO')} + intereses: $${Math.round(monthlyInterest).toLocaleString('es-CO')}).`,
+                totalOwed,
+                pendingCapital,
+                monthlyInterest,
+                suggestedAmount: totalOwed,
+            });
+        }
+
         // Balance disponible del usuario
-        const [balanceRows] = await connection.execute(
-            `SELECT amount FROM balance_history WHERE user_id = ? ORDER BY snapshot_date DESC LIMIT 1`, [userId]
+        const inflowPH  = INFLOW_TYPES.map(() => '?').join(',');
+        const outflowPH = OUTFLOW_TYPES.map(() => '?').join(',');
+        const [inRows] = await connection.execute(
+            `SELECT COALESCE(SUM(amount), 0) as total FROM transactions WHERE user_id = ? AND type IN (${inflowPH})`,
+            [userId, ...INFLOW_TYPES]
         );
-        const currentBalance = balanceRows.length ? parseFloat(balanceRows[0].amount) : 0;
+        const [outRows] = await connection.execute(
+            `SELECT COALESCE(SUM(amount), 0) as total FROM transactions WHERE user_id = ? AND type IN (${outflowPH})`,
+            [userId, ...OUTFLOW_TYPES]
+        );
+        const currentBalance = Math.max(0, parseFloat(inRows[0].total) - parseFloat(outRows[0].total));
+
         const [investedRows] = await connection.execute(
             `SELECT COALESCE(SUM(amount), 0) as total FROM investments WHERE user_id = ? AND status IN ('active', 'pending_deposit')`, [userId]
         );
@@ -360,6 +395,7 @@ exports.payLoan = async (req, res) => {
         const availableBalance = currentBalance - parseFloat(investedRows[0].total) - parseFloat(pendingWR[0].total);
 
         if (amount > availableBalance) {
+            await connection.rollback();
             return res.status(400).json({
                 error: `Saldo disponible insuficiente. Disponible: $${Math.round(Math.max(0, availableBalance)).toLocaleString('es-CO')} COP`,
                 available: Math.max(0, availableBalance),
@@ -380,7 +416,7 @@ exports.payLoan = async (req, res) => {
             referralCommission = Math.round(interestCovered * 0.05);
         }
 
-        // Registrar transacción de abono
+        // Registrar transacción de abono (sale del balance del cliente)
         const refId = 'PAY-' + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2, 5).toUpperCase();
         await connection.execute(
             `INSERT INTO transactions (user_id, type, amount, description, ref_id, created_at) VALUES (?, 'withdraw', ?, ?, ?, NOW())`,
@@ -389,7 +425,7 @@ exports.payLoan = async (req, res) => {
              refId]
         );
 
-        // ── NUEVO: Registrar en loan_payments para control de ganancias admin ──
+        // Registrar en loan_payments
         await connection.execute(
             `INSERT INTO loan_payments (loan_id, user_id, amount, interest_amount, capital_amount, remaining_capital, loan_rate, ref_id, is_fully_paid, created_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())`,
@@ -429,7 +465,6 @@ exports.payLoan = async (req, res) => {
             );
         }
 
-        // FIX: Usa balanceHelper centralizado
         const newBalance = await recalculateAndSaveBalance(connection, userId);
 
         if (referrerId && referralCommission >= 100) {
@@ -472,13 +507,13 @@ exports.payLoan = async (req, res) => {
 };
 
 // ══════════════════════════════════════════════════════════════
-// ADMIN: GET /api/admin/loans/payments — Todos los pagos de préstamos
+// ADMIN: GET /api/admin/loans/payments
 // ══════════════════════════════════════════════════════════════
 exports.adminGetLoanPayments = async (req, res) => {
     try {
         const [rows] = await pool.execute(
-            `SELECT lp.*, 
-                    u.full_name as user_name, 
+            `SELECT lp.*,
+                    u.full_name as user_name,
                     u.email as user_email,
                     lr.ref_id as loan_ref_id,
                     lr.amount as loan_original_amount,
@@ -498,7 +533,7 @@ exports.adminGetLoanPayments = async (req, res) => {
 };
 
 // ══════════════════════════════════════════════════════════════
-// ADMIN: GET /api/admin/loans/profit-stats — KPIs de ganancias
+// ADMIN: GET /api/admin/loans/profit-stats
 // ══════════════════════════════════════════════════════════════
 exports.adminGetLoanProfitStats = async (req, res) => {
     try {

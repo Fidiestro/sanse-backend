@@ -1,6 +1,8 @@
 // ══════════════════════════════════════════════════════════════
 // controllers/referralController.js — Sanse Capital
-// FIX: processReferralCommission ahora usa balanceHelper centralizado
+// v3 — FIXES:
+//  1. BUG #16: Prevenir auto-referido (ya estaba parcial — refuerzo)
+//  2. Mantiene: usa balanceHelper centralizado en processReferralCommission
 // ══════════════════════════════════════════════════════════════
 const { pool }   = require('../config/database');
 const bcrypt     = require('bcryptjs');
@@ -24,13 +26,27 @@ exports.publicRegister = async (req, res) => {
         if (!fullName || !email || !password) return res.status(400).json({ error: 'Nombre, email y contraseña son requeridos' });
         if (password.length < 8) return res.status(400).json({ error: 'La contraseña debe tener al menos 8 caracteres' });
 
-        const [existing] = await pool.execute('SELECT id FROM users WHERE email = ?', [email.toLowerCase().trim()]);
+        const emailNorm = email.toLowerCase().trim();
+        const [existing] = await pool.execute('SELECT id FROM users WHERE email = ?', [emailNorm]);
         if (existing.length) return res.status(400).json({ error: 'Este correo ya está registrado' });
 
         let referredBy = null;
         if (referralCode && referralCode.trim()) {
-            const [refUser] = await pool.execute('SELECT id FROM users WHERE referral_code = ?', [referralCode.trim().toUpperCase()]);
+            const codeNorm = referralCode.trim().toUpperCase();
+            const [refUser] = await pool.execute(
+                'SELECT id, email FROM users WHERE referral_code = ?',
+                [codeNorm]
+            );
             if (!refUser.length) return res.status(400).json({ error: 'Código de referido inválido' });
+
+            // FIX BUG #16: prevenir auto-referencia.
+            // Si alguien intenta registrarse con su propio email como referidor.
+            // (No es posible en registro nuevo porque el user todavía no existe,
+            //  pero protege contra emails ya registrados que intentan re-registrarse).
+            if (refUser[0].email === emailNorm) {
+                return res.status(400).json({ error: 'No puedes usar tu propio código de referido' });
+            }
+
             referredBy = refUser[0].id;
         }
 
@@ -40,10 +56,17 @@ exports.publicRegister = async (req, res) => {
         const [result] = await pool.execute(
             `INSERT INTO users (full_name, email, password_hash, phone, document_number, role, referral_code, referred_by, status, created_at) 
              VALUES (?, ?, ?, ?, ?, 'client', ?, ?, 'active', NOW())`,
-            [fullName.trim(), email.toLowerCase().trim(), hashedPassword, phone || null, documentNumber || null, userReferralCode, referredBy]
+            [fullName.trim(), emailNorm, hashedPassword, phone || null, documentNumber || null, userReferralCode, referredBy]
         );
 
         const userId = result.insertId;
+
+        // FIX BUG #16 (extra): verificar post-insert que el user no quedó refiriéndose a sí mismo
+        // (por ejemplo si un código duplicado por race genera el mismo userReferralCode = referralCode).
+        if (referredBy === userId) {
+            await pool.execute(`UPDATE users SET referred_by = NULL WHERE id = ?`, [userId]);
+            console.warn(`[publicRegister] Auto-referencia detectada y removida en userId=${userId}`);
+        }
 
         await pool.execute(`INSERT INTO registration_requests (user_id, status) VALUES (?, 'pending')`, [userId]);
 
@@ -147,14 +170,14 @@ exports.getMyReferrals = async (req, res) => {
         const userId = req.user.id;
 
         const [referrals] = await pool.execute(
-            `SELECT id, full_name, created_at, 
+            `SELECT id, full_name, created_at,
                     (SELECT MAX(created_at) FROM transactions WHERE user_id = u.id) as last_activity
              FROM users u WHERE referred_by = ? ORDER BY created_at DESC`,
             [userId]
         );
 
         const [commissions] = await pool.execute(
-            `SELECT COALESCE(SUM(commission_amount), 0) as total, COUNT(*) as count 
+            `SELECT COALESCE(SUM(commission_amount), 0) as total, COUNT(*) as count
              FROM referral_commissions WHERE referrer_id = ? AND status = 'paid'`,
             [userId]
         );
@@ -193,7 +216,7 @@ exports.getMyReferrals = async (req, res) => {
 
 // ══════════════════════════════════════════════════════════════
 // Utilidad interna: processReferralCommission
-// FIX: Usa balanceHelper centralizado en vez de recálculo inline
+// FIX BUG #16: refuerza prevención de auto-comisión
 // ══════════════════════════════════════════════════════════════
 async function processReferralCommission(referredUserId, sourceType, sourceId, amount, connection = null) {
     const db = connection || pool;
@@ -201,7 +224,14 @@ async function processReferralCommission(referredUserId, sourceType, sourceId, a
         const [userRows] = await db.execute('SELECT referred_by FROM users WHERE id = ?', [referredUserId]);
         if (!userRows.length || !userRows[0].referred_by) return null;
 
-        const referrerId       = userRows[0].referred_by;
+        const referrerId = userRows[0].referred_by;
+
+        // FIX BUG #16: si por error el referrerId === referredUserId, no pagar comisión
+        if (referrerId === referredUserId) {
+            console.warn(`[processReferralCommission] Auto-referencia detectada, omitiendo comisión. userId=${referredUserId}`);
+            return null;
+        }
+
         const commissionRate   = 0.05;
         const commissionAmount = Math.round(parseFloat(amount) * commissionRate);
 
@@ -210,7 +240,7 @@ async function processReferralCommission(referredUserId, sourceType, sourceId, a
         const refId = 'REF-' + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2, 5).toUpperCase();
 
         await db.execute(
-            `INSERT INTO referral_commissions (referrer_id, referred_id, source_type, source_id, source_amount, commission_rate, commission_amount, status, ref_id) 
+            `INSERT INTO referral_commissions (referrer_id, referred_id, source_type, source_id, source_amount, commission_rate, commission_amount, status, ref_id)
              VALUES (?, ?, ?, ?, ?, ?, ?, 'paid', ?)`,
             [referrerId, referredUserId, sourceType, sourceId, amount, commissionRate, commissionAmount, refId]
         );
@@ -220,7 +250,6 @@ async function processReferralCommission(referredUserId, sourceType, sourceId, a
             [referrerId, commissionAmount, `Comisión referido (5% de ${sourceType === 'investment_return' ? 'rendimiento CDTC' : 'intereses préstamo'})`, refId]
         );
 
-        // FIX: Usa balanceHelper centralizado
         await recalculateAndSaveBalance(db, referrerId);
 
         return { referrerId, commissionAmount, refId };
