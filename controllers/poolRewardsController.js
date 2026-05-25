@@ -1,61 +1,68 @@
 // ══════════════════════════════════════════════════════════════════════
 // controllers/poolRewardsController.js — Sanse Capital
+// v1.2 — FIX: period_month es columna DATE en MySQL, necesita YYYY-MM-DD
 //
 // Maneja la RECOMPENSA MASIVA del Pool de Liquidez.
-// En lugar de registrar rendimiento uno por uno (como hace
-// adminController.registerInvestmentReturn para CDTC), aplica una
-// tasa única a TODAS las inversiones Pool activas en una sola
-// transacción atómica.
+// Aplica una tasa única a TODAS las inversiones Pool activas en una
+// sola transacción atómica.
 //
-// COMPORTAMIENTO ESTILO POOL:
+// ESTILO POOL:
 //   - Suma a withdrawable_earnings de cada inversión Pool
 //   - NO crea transacción 'investment_return' (no toca balance)
 //   - El cliente reclama cuando quiera vía /investments/:id/withdraw-earnings
-//   - Esa ruta es la que descuenta 20% comisión Sanse y suma al balance
-//
-// SEGURIDAD:
-//   - Transacción atómica: si falla 1 pool, ROLLBACK de TODO
-//   - Valida que no haya rendimiento duplicado del mismo mes
-//   - Solo inversiones con status = 'active' (NO pending_deposit)
-//   - Capital base se calcula del net_capital (ya descuenta la comisión 2% entrada)
 // ══════════════════════════════════════════════════════════════════════
 
 const { pool } = require('../config/database');
 const { auditLog } = require('../utils/helpers');
 
 // ───────────────────────────────────────────────────────────────────────
+// HELPER: normalizar YYYY-MM → YYYY-MM-01 para columna DATE
+// El frontend manda "2026-04" pero la columna period_month es DATE
+// ───────────────────────────────────────────────────────────────────────
+function normalizePeriodMonth(periodMonth) {
+    if (!periodMonth) return null;
+    const str = String(periodMonth).trim();
+    // Si ya viene como YYYY-MM-DD lo dejamos
+    if (/^\d{4}-\d{2}-\d{2}$/.test(str)) return str;
+    // Si viene como YYYY-MM lo convertimos a YYYY-MM-01
+    if (/^\d{4}-\d{2}$/.test(str)) return str + '-01';
+    return null; // formato inválido
+}
+
+// ───────────────────────────────────────────────────────────────────────
 // GET /api/admin/pool/reward-preview?rate=X&periodMonth=YYYY-MM
-// Devuelve cálculo en vivo SIN aplicar nada. Para el preview del admin.
 // ───────────────────────────────────────────────────────────────────────
 exports.previewBulkReward = async (req, res) => {
     try {
         const rate = parseFloat(req.query.rate);
-        const periodMonth = req.query.periodMonth; // YYYY-MM
+        const periodMonthRaw = req.query.periodMonth;
+        const periodMonth = normalizePeriodMonth(periodMonthRaw);
 
         if (!rate || isNaN(rate) || rate <= 0 || rate > 100) {
             return res.status(400).json({ error: 'Tasa inválida (0-100)' });
         }
 
         // Pools activos
-        const [pools] = await pool.execute(
+        const [pools] = await pool.query(
             `SELECT id, user_id, amount, net_capital, withdrawable_earnings
              FROM investments
              WHERE LOWER(type) = 'pool' AND status = 'active'
              ORDER BY id ASC`
         );
 
-        // Si periodMonth viene, identificar cuáles YA tienen rendimiento ese mes
+        // Si hay periodMonth válido, verificar duplicados
         let alreadyPaid = [];
-        if (periodMonth) {
+        if (periodMonth && pools.length > 0) {
             const ids = pools.map(p => p.id);
-            if (ids.length > 0) {
-                const placeholders = ids.map(() => '?').join(',');
-                const [paidRows] = await pool.execute(
+            try {
+                const [paidRows] = await pool.query(
                     `SELECT investment_id FROM investment_returns
-                     WHERE period_month = ? AND investment_id IN (${placeholders})`,
-                    [periodMonth, ...ids]
+                     WHERE period_month = ? AND investment_id IN (?)`,
+                    [periodMonth, ids]
                 );
                 alreadyPaid = paidRows.map(r => r.investment_id);
+            } catch (e) {
+                console.warn('[previewBulkReward] no se pudo verificar already paid:', e.message);
             }
         }
 
@@ -65,7 +72,6 @@ exports.previewBulkReward = async (req, res) => {
         let totalGross = 0;
 
         const breakdown = eligible.map(p => {
-            // Usar net_capital si está, si no usar amount
             const capital = parseFloat(p.net_capital || p.amount) || 0;
             const earned = Math.round(capital * (rate / 100));
             totalCapital += capital;
@@ -78,56 +84,59 @@ exports.previewBulkReward = async (req, res) => {
             };
         });
 
-        // Comisión Sanse 20% (solo se aplica cuando el cliente RECLAMA, no ahora)
-        // La mostramos en el preview como referencia informativa.
         const referenceCommission = Math.round(totalGross * 0.20);
         const referenceNet = totalGross - referenceCommission;
 
         res.json({
             rate,
-            periodMonth: periodMonth || null,
+            periodMonth: periodMonthRaw || null,  // devolver tal cual lo mandó el cliente
             eligibleCount: eligible.length,
             skippedCount: alreadyPaid.length,
             skippedIds: alreadyPaid,
             totalCapital,
             totalGross,
-            referenceCommission,  // info: lo que Sanse cobrará cuando todos reclamen
-            referenceNet,         // info: neto total a usuarios
+            referenceCommission,
+            referenceNet,
             breakdown,
         });
     } catch (e) {
-        console.error('[previewBulkReward]', e);
-        res.status(500).json({ error: 'Error interno del servidor' });
+        console.error('[previewBulkReward] ERROR:', e.message);
+        console.error('[previewBulkReward] STACK:', e.stack);
+        res.status(500).json({ error: 'Error interno del servidor', details: e.message });
     }
 };
 
 // ───────────────────────────────────────────────────────────────────────
 // POST /api/admin/pool/pay-returns-bulk
 // Body: { rate, periodMonth, notes? }
-// Aplica la tasa a todos los pools activos. Atómico.
 // ───────────────────────────────────────────────────────────────────────
 exports.applyBulkReward = async (req, res) => {
-    const { rate, periodMonth, notes } = req.body;
+    const { rate, periodMonth: periodMonthRaw, notes } = req.body;
 
     // Validaciones
     const r = parseFloat(rate);
     if (!r || isNaN(r) || r <= 0 || r > 100) {
         return res.status(400).json({ error: 'Tasa inválida (0-100)' });
     }
-    if (!periodMonth || !/^\d{4}-\d{2}$/.test(periodMonth)) {
-        return res.status(400).json({ error: 'periodMonth debe ser formato YYYY-MM' });
+    if (!periodMonthRaw || !/^\d{4}-\d{2}(-\d{2})?$/.test(periodMonthRaw)) {
+        return res.status(400).json({ error: 'periodMonth debe ser formato YYYY-MM o YYYY-MM-DD' });
+    }
+
+    const periodMonth = normalizePeriodMonth(periodMonthRaw);
+    if (!periodMonth) {
+        return res.status(400).json({ error: 'periodMonth con formato inválido' });
     }
 
     const connection = await pool.getConnection();
     try {
         await connection.beginTransaction();
 
-        // 1. Obtener todos los pools activos
-        const [pools] = await connection.execute(
+        // 1. Pools activos (con lock)
+        const [pools] = await connection.query(
             `SELECT id, user_id, amount, net_capital
              FROM investments
              WHERE LOWER(type) = 'pool' AND status = 'active'
-             FOR UPDATE`  // Lock para evitar race conditions
+             FOR UPDATE`
         );
 
         if (!pools.length) {
@@ -135,13 +144,12 @@ exports.applyBulkReward = async (req, res) => {
             return res.status(400).json({ error: 'No hay inversiones Pool activas' });
         }
 
-        // 2. Verificar cuáles ya tienen rendimiento este mes
+        // 2. Verificar duplicados (usando query para IN(?))
         const ids = pools.map(p => p.id);
-        const placeholders = ids.map(() => '?').join(',');
-        const [paidRows] = await connection.execute(
+        const [paidRows] = await connection.query(
             `SELECT investment_id FROM investment_returns
-             WHERE period_month = ? AND investment_id IN (${placeholders})`,
-            [periodMonth, ...ids]
+             WHERE period_month = ? AND investment_id IN (?)`,
+            [periodMonth, ids]
         );
         const alreadyPaidIds = new Set(paidRows.map(p => p.investment_id));
 
@@ -150,7 +158,7 @@ exports.applyBulkReward = async (req, res) => {
         if (!eligible.length) {
             await connection.rollback();
             return res.status(400).json({
-                error: `Todas las inversiones Pool ya tienen rendimiento registrado para ${periodMonth}`,
+                error: `Todas las inversiones Pool ya tienen rendimiento registrado para ${periodMonthRaw}`,
                 skipped: pools.length,
             });
         }
@@ -163,9 +171,9 @@ exports.applyBulkReward = async (req, res) => {
             const capital = parseFloat(p.net_capital || p.amount) || 0;
             const earned = Math.round(capital * (r / 100));
 
-            if (earned <= 0) continue; // Skip si el cálculo da 0 (capital 0)
+            if (earned <= 0) continue;
 
-            // 3a. Registrar en investment_returns
+            // 3a. INSERT en investment_returns (period_month en formato YYYY-MM-DD)
             const [returnRes] = await connection.execute(
                 `INSERT INTO investment_returns
                  (investment_id, user_id, period_month, rate_applied, amount_earned, status, notes)
@@ -173,16 +181,16 @@ exports.applyBulkReward = async (req, res) => {
                 [
                     p.id,
                     p.user_id,
-                    periodMonth,
+                    periodMonth,  // ← ya normalizado a YYYY-MM-01
                     r,
                     earned,
                     notes
                         ? `${notes} (bulk Pool ${r}%)`
-                        : `Recompensa Pool ${r}% — ${periodMonth} — bulk`,
+                        : `Recompensa Pool ${r}% — ${periodMonthRaw} — bulk`,
                 ]
             );
 
-            // 3b. Sumar a withdrawable_earnings (estilo Pool, no toca balance)
+            // 3b. Sumar a withdrawable_earnings (no toca balance)
             await connection.execute(
                 `UPDATE investments
                  SET withdrawable_earnings = COALESCE(withdrawable_earnings, 0) + ?
@@ -200,7 +208,7 @@ exports.applyBulkReward = async (req, res) => {
             });
         }
 
-        // 4. Audit log
+        // 4. Audit log (no bloquea si falla)
         try {
             await auditLog({
                 userId: req.user.id,
@@ -209,7 +217,7 @@ exports.applyBulkReward = async (req, res) => {
                 entityId: null,
                 details: {
                     rate: r,
-                    periodMonth,
+                    periodMonth: periodMonthRaw,
                     notes: notes || null,
                     pools: results.length,
                     skipped: alreadyPaidIds.size,
@@ -218,7 +226,6 @@ exports.applyBulkReward = async (req, res) => {
                 ipAddress: req.ip,
             });
         } catch (e) {
-            // No bloqueamos el flujo principal por un fallo de audit
             console.error('[auditLog bulk reward]', e.message);
         }
 
@@ -228,20 +235,20 @@ exports.applyBulkReward = async (req, res) => {
             success: true,
             message: `Recompensa aplicada a ${results.length} inversión${results.length === 1 ? '' : 'es'} Pool`,
             rate: r,
-            periodMonth,
+            periodMonth: periodMonthRaw,
             applied: results.length,
             skipped: alreadyPaidIds.size,
             skippedIds: Array.from(alreadyPaidIds),
             totalGross,
-            // info: comisión 20% se aplicará cuando el usuario reclame
             referenceCommissionWhenClaimed: Math.round(totalGross * 0.20),
             referenceNetWhenClaimed: totalGross - Math.round(totalGross * 0.20),
             details: results,
         });
     } catch (e) {
         await connection.rollback();
-        console.error('[applyBulkReward]', e);
-        res.status(500).json({ error: 'Error interno del servidor' });
+        console.error('[applyBulkReward] ERROR:', e.message);
+        console.error('[applyBulkReward] STACK:', e.stack);
+        res.status(500).json({ error: 'Error interno del servidor', details: e.message });
     } finally {
         connection.release();
     }
