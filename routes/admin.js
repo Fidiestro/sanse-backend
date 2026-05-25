@@ -1,8 +1,10 @@
 // ══════════════════════════════════════════════════════════════
 // routes/admin.js — Sanse Capital
 // Cambios vs versión anterior:
-//   + POST /pool/config        → actualizar configuración del pool (incluye strategies)
-//   + GET  /pool/config-full   → leer config completa del pool (con strategies)
+//   + POST /pool/config              → actualizar config del pool (con strategies)
+//   + GET  /pool/config-full         → leer config completa del pool
+//   + GET  /pool/reward-preview      → preview de recompensa masiva (sin aplicar)
+//   + POST /pool/pay-returns-bulk    → aplicar recompensa masiva a todos los pools
 // ══════════════════════════════════════════════════════════════
 
 const express = require('express');
@@ -11,7 +13,8 @@ const adminController = require('../controllers/adminController');
 const withdrawalController = require('../controllers/withdrawalController');
 const loanController = require('../controllers/loanController');
 const depositController = require('../controllers/depositController');
-const poolConfigController = require('../controllers/poolConfigController'); // ← NUEVO
+const poolConfigController = require('../controllers/poolConfigController');
+const poolRewardsController = require('../controllers/poolRewardsController');
 const { authenticate, requireAdmin } = require('../middleware/auth');
 
 // Middleware: admin O p2p pueden acceder
@@ -76,10 +79,16 @@ router.get('/deposits', depositController.adminGetDeposits);
 router.post('/deposits/:id/process', depositController.adminProcessDeposit);
 
 // ═══════════════════════════════════════════════════════════════════════
-// === POOL CONFIG (NUEVO) — APY, distribución, mínimo, capital, strategies
+// === POOL CONFIG — APY, distribución, mínimo, capital, strategies
 // ═══════════════════════════════════════════════════════════════════════
 router.get('/pool/config-full', poolConfigController.adminGetPoolConfig);
 router.post('/pool/config', poolConfigController.adminUpdatePoolConfig);
+
+// ═══════════════════════════════════════════════════════════════════════
+// === POOL BULK REWARD — Aplicar recompensa a TODOS los pools activos
+// ═══════════════════════════════════════════════════════════════════════
+router.get('/pool/reward-preview', poolRewardsController.previewBulkReward);
+router.post('/pool/pay-returns-bulk', poolRewardsController.applyBulkReward);
 
 // === REGISTRO CONTABLE POOL — comisiones 20% ===
 router.get('/pool/withdrawals', async (req, res) => {
@@ -95,7 +104,7 @@ router.get('/pool/withdrawals', async (req, res) => {
         res.json(rows);
     } catch (e) {
         console.error('[admin/pool/withdrawals]', e);
-        res.json([]); // Si la tabla no existe aún, devolver vacío
+        res.json([]);
     }
 });
 
