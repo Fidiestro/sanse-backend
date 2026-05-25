@@ -881,29 +881,37 @@ exports.confirmInvestment = async (req, res) => {
         const userId = req.user.id;
         const investmentId = req.params.id;
 
-        const [invRows] = await connection.execute(
-            `SELECT * FROM investments WHERE id = ? AND user_id = ?`,
+        // FIX BUG #4: atomic UPDATE para prevenir race condition de doble-click.
+        // En vez de SELECT → check status → UPDATE (3 pasos no-atómicos), hacemos
+        // el UPDATE con WHERE status='pending_deposit'. Si otro request ya cambió
+        // el status, affectedRows = 0 y abortamos.
+        const [updResult] = await connection.execute(
+            `UPDATE investments
+             SET status = 'active', start_date = NOW()
+             WHERE id = ? AND user_id = ? AND status = 'pending_deposit'`,
             [investmentId, userId]
         );
-        if (!invRows.length) {
+
+        if (updResult.affectedRows === 0) {
             await connection.rollback();
-            return res.status(404).json({ error: 'Inversión no encontrada' });
+            // Verificar si existe pero no es pending
+            const [check] = await connection.execute(
+                `SELECT status FROM investments WHERE id = ? AND user_id = ?`,
+                [investmentId, userId]
+            );
+            if (!check.length) {
+                return res.status(404).json({ error: 'Inversión no encontrada' });
+            }
+            return res.status(400).json({
+                error: `Esta inversión ya fue procesada anteriormente (estado actual: ${check[0].status})`
+            });
         }
 
-        const inv = invRows[0];
-        if (inv.status !== 'pending_deposit') {
-            await connection.rollback();
-            return res.status(400).json({ error: 'Solo se pueden confirmar inversiones pendientes' });
-        }
-
-        // FIX: actualizar start_date al momento de confirmación.
-        // Antes el start_date era cuando el cliente CREÓ la inversión, no cuando confirmó.
-        // Esto sesga el cálculo de ganancia en tiempo real ("¿cuánto debería haber generado?").
-        // Al actualizar start_date al confirmar, los rendimientos cuentan desde el día real.
-        await connection.execute(
-            `UPDATE investments SET status = 'active', start_date = NOW() WHERE id = ?`,
-            [investmentId]
+        // Recuperar la inversión actualizada para el audit log
+        const [invRows] = await connection.execute(
+            `SELECT * FROM investments WHERE id = ?`, [investmentId]
         );
+        const inv = invRows[0];
 
         await auditLog({
             userId,
