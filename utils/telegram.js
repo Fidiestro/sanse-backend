@@ -47,4 +47,5 @@ function sendTelegram(message) {
   });
 }
 
-module.exports = { sendTelegram };
+// notify es alias de sendTelegram (compatibilidad con referralController y loanController)
+module.exports = { sendTelegram, notify: sendTelegram };
