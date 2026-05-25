@@ -1,20 +1,9 @@
-// ══════════════════════════════════════════════════════════════
-// routes/admin.js — Sanse Capital
-// Cambios vs versión anterior:
-//   + POST /pool/config              → actualizar config del pool (con strategies)
-//   + GET  /pool/config-full         → leer config completa del pool
-//   + GET  /pool/reward-preview      → preview de recompensa masiva (sin aplicar)
-//   + POST /pool/pay-returns-bulk    → aplicar recompensa masiva a todos los pools
-// ══════════════════════════════════════════════════════════════
-
 const express = require('express');
 const router = express.Router();
 const adminController = require('../controllers/adminController');
 const withdrawalController = require('../controllers/withdrawalController');
 const loanController = require('../controllers/loanController');
 const depositController = require('../controllers/depositController');
-const poolConfigController = require('../controllers/poolConfigController');
-const poolRewardsController = require('../controllers/poolRewardsController');
 const { authenticate, requireAdmin } = require('../middleware/auth');
 
 // Middleware: admin O p2p pueden acceder
@@ -27,6 +16,86 @@ const requireAdminOrP2P = (req, res, next) => {
 
 // Todas las rutas requieren autenticación + admin
 router.use(authenticate, requireAdminOrP2P);
+
+// ══════════════════════════════════════════════════════════════
+// GET /api/admin/users — Lista todos los usuarios (panel admin)
+// Devuelve: id, full_name, email, phone, status, balance, totalInvested
+// ══════════════════════════════════════════════════════════════
+router.get('/users', async (req, res) => {
+    const { pool: db } = require('../config/database');
+    try {
+        const [rows] = await db.execute(`
+            SELECT
+                u.id,
+                u.full_name,
+                u.email,
+                u.phone,
+                u.document_number,
+                u.role,
+                u.status,
+                u.is_active,
+                u.referral_code,
+                u.referred_by,
+                u.created_at,
+                COALESCE(b.balance, 0) AS balance,
+                COALESCE((
+                    SELECT SUM(i.amount)
+                    FROM investments i
+                    WHERE i.user_id = u.id AND i.status = 'active'
+                ), 0) AS totalInvested
+            FROM users u
+            LEFT JOIN (
+                SELECT user_id, balance
+                FROM user_balances
+            ) b ON b.user_id = u.id
+            WHERE u.role = 'client'
+            ORDER BY u.created_at DESC
+        `);
+        res.json(rows);
+    } catch (e) {
+        console.error('[admin/users] Error:', e.message);
+        // Fallback: si user_balances no existe, calcular balance desde transactions
+        try {
+            const [rows] = await db.execute(`
+                SELECT
+                    u.id,
+                    u.full_name,
+                    u.email,
+                    u.phone,
+                    u.document_number,
+                    u.role,
+                    u.status,
+                    u.is_active,
+                    u.referral_code,
+                    u.referred_by,
+                    u.created_at,
+                    COALESCE((
+                        SELECT SUM(
+                            CASE
+                                WHEN t.type IN ('deposit','payment','profit','investment_return') THEN t.amount
+                                WHEN t.type IN ('withdrawal','investment') THEN -t.amount
+                                ELSE 0
+                            END
+                        )
+                        FROM transactions t
+                        WHERE t.user_id = u.id
+                    ), 0) AS balance,
+                    COALESCE((
+                        SELECT SUM(i.amount)
+                        FROM investments i
+                        WHERE i.user_id = u.id AND i.status = 'active'
+                    ), 0) AS totalInvested
+                FROM users u
+                WHERE u.role = 'client'
+                ORDER BY u.created_at DESC
+            `);
+            res.json(rows);
+        } catch (e2) {
+            console.error('[admin/users] Fallback también falló:', e2.message);
+            res.status(500).json({ error: 'Error al obtener usuarios' });
+        }
+    }
+});
 
 // Stats
 router.get('/stats', adminController.getStats);
@@ -78,18 +147,6 @@ router.get('/users/:userId/credit-score', loanController.adminGetCreditScore);
 router.get('/deposits', depositController.adminGetDeposits);
 router.post('/deposits/:id/process', depositController.adminProcessDeposit);
 
-// ═══════════════════════════════════════════════════════════════════════
-// === POOL CONFIG — APY, distribución, mínimo, capital, strategies
-// ═══════════════════════════════════════════════════════════════════════
-router.get('/pool/config-full', poolConfigController.adminGetPoolConfig);
-router.post('/pool/config', poolConfigController.adminUpdatePoolConfig);
-
-// ═══════════════════════════════════════════════════════════════════════
-// === POOL BULK REWARD — Aplicar recompensa a TODOS los pools activos
-// ═══════════════════════════════════════════════════════════════════════
-router.get('/pool/reward-preview', poolRewardsController.previewBulkReward);
-router.post('/pool/pay-returns-bulk', poolRewardsController.applyBulkReward);
-
 // === REGISTRO CONTABLE POOL — comisiones 20% ===
 router.get('/pool/withdrawals', async (req, res) => {
     const { pool: db } = require('../config/database');
@@ -104,7 +161,7 @@ router.get('/pool/withdrawals', async (req, res) => {
         res.json(rows);
     } catch (e) {
         console.error('[admin/pool/withdrawals]', e);
-        res.json([]);
+        res.json([]); // Si la tabla no existe aún, devolver vacío
     }
 });
 
