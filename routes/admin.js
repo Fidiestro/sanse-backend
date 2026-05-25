@@ -1,22 +1,17 @@
 // ══════════════════════════════════════════════════════════════
 // routes/admin.js — Sanse Capital
-// CAMBIOS RESPECTO A LA VERSIÓN ANTERIOR:
-//  1. Nueva: GET  /admin/users               → listAllUsers
-//  2. Nueva: POST /admin/users/create        → createUserByAdmin
-//  3. Nueva: POST /admin/pool/config         → savePoolConfig
-//  4. Eliminado el GET /pool/withdrawals DUPLICADO (estaba 2 veces)
-//
-//  ✱ Compatibilidad: además del endpoint correcto POST /users/:id/toggle-block,
-//    se mantiene un alias POST /users/:id/block que admin.html llamaba antes.
-//    Así el frontend sigue funcionando sin cambios bruscos.
+// Cambios vs versión anterior:
+//   + POST /pool/config        → actualizar configuración del pool (incluye strategies)
+//   + GET  /pool/config-full   → leer config completa del pool (con strategies)
 // ══════════════════════════════════════════════════════════════
+
 const express = require('express');
 const router = express.Router();
-const adminController       = require('../controllers/adminController');
-const withdrawalController  = require('../controllers/withdrawalController');
-const loanController        = require('../controllers/loanController');
-const depositController     = require('../controllers/depositController');
-const referralController    = require('../controllers/referralController');
+const adminController = require('../controllers/adminController');
+const withdrawalController = require('../controllers/withdrawalController');
+const loanController = require('../controllers/loanController');
+const depositController = require('../controllers/depositController');
+const poolConfigController = require('../controllers/poolConfigController'); // ← NUEVO
 const { authenticate, requireAdmin } = require('../middleware/auth');
 
 // Middleware: admin O p2p pueden acceder
@@ -27,66 +22,66 @@ const requireAdminOrP2P = (req, res, next) => {
     next();
 };
 
-// Todas las rutas requieren autenticación + admin/p2p
+// Todas las rutas requieren autenticación + admin
 router.use(authenticate, requireAdminOrP2P);
 
-// ── Stats ─────────────────────────────────────────────────────
+// Stats
 router.get('/stats', adminController.getStats);
 
-// ── Transacciones ─────────────────────────────────────────────
+// Transacciones
 router.get('/transactions/recent', adminController.getRecentTransactions);
-router.get('/transactions/all',    adminController.getAllTransactions);
-router.post('/transactions',       adminController.createTransaction);
+router.get('/transactions/all', adminController.getAllTransactions);
+router.post('/transactions', adminController.createTransaction);
 router.delete('/transactions/:id', adminController.deleteTransaction);
 
-// ── Inversiones (rutas específicas ANTES que las parametrizadas) ─
-router.get('/investments/active',                     adminController.getActiveInvestments);
-router.post('/investments',                           adminController.createInvestment);
-router.post('/investments/:investmentId/return',      adminController.registerInvestmentReturn);
-router.post('/investments/:id/cancel',                adminController.adminCancelInvestment);
-router.delete('/investments/:id',                     adminController.deleteInvestment);
+// Inversiones — rutas específicas ANTES que las parametrizadas
+router.get('/investments/active', adminController.getActiveInvestments);
+router.post('/investments', adminController.createInvestment);
+router.post('/investments/:investmentId/return', adminController.registerInvestmentReturn);
+router.post('/investments/:id/cancel', adminController.adminCancelInvestment);
+router.delete('/investments/:id', adminController.deleteInvestment);
 
-// ── Balance ───────────────────────────────────────────────────
-router.post('/balance',                          adminController.recordBalance);
-router.post('/recalculate-balance/:userId',      adminController.recalculateBalance);
-router.post('/recalculate-all-balances',         adminController.recalculateAllBalances);
+// Balance
+router.post('/balance', adminController.recordBalance);
+router.post('/recalculate-balance/:userId', adminController.recalculateBalance);
+router.post('/recalculate-all-balances', adminController.recalculateAllBalances);
 
-// ── USUARIOS ──────────────────────────────────────────────────
-// NUEVO: lista global de usuarios (necesario para el frontend admin)
-router.get('/users',                  adminController.listAllUsers);
-// NUEVO: crear usuario desde el admin
-router.post('/users/create',          adminController.createUserByAdmin);
-// Detalles de un usuario
-router.get('/users/:id/details',      adminController.getUserDetails);
-// Bloquear/desbloquear (endpoint canónico)
+// Detalles usuario
+router.get('/users/:id/details', adminController.getUserDetails);
+
+// Bloquear/Desbloquear usuario
 router.post('/users/:id/toggle-block', adminController.toggleBlockUser);
-// Alias retro-compatible para frontend antiguo (POST /users/:id/block)
-router.post('/users/:id/block',        adminController.toggleBlockUser);
-// Editar usuario
-router.post('/users/:id/edit',         adminController.editUser);
 
-// ── Préstamos ─────────────────────────────────────────────────
-// Específicas ANTES que /:id/process
-router.get('/loans/payments',                loanController.adminGetLoanPayments);
-router.get('/loans/profit-stats',            loanController.adminGetLoanProfitStats);
-router.post('/loans/create',                 adminController.adminCreateLoan);
-router.get('/loans',                         loanController.adminGetLoans);
-router.post('/loans/:id/process',            loanController.adminProcessLoan);
-router.get('/users/:userId/credit-score',    loanController.adminGetCreditScore);
+// Editar usuario (datos + contraseña + referido)
+router.post('/users/:id/edit', adminController.editUser);
 
-// ── Retiros ───────────────────────────────────────────────────
-router.get('/withdrawals',              withdrawalController.adminGetWithdrawals);
+// Crear préstamo directo para un usuario
+router.post('/loans/create', adminController.adminCreateLoan);
+
+// === GANANCIAS PRÉSTAMOS (ADMIN) — rutas específicas ANTES que /loans genérico ===
+router.get('/loans/payments', loanController.adminGetLoanPayments);
+router.get('/loans/profit-stats', loanController.adminGetLoanProfitStats);
+
+// === SOLICITUDES DE RETIRO (ADMIN) ===
+router.get('/withdrawals', withdrawalController.adminGetWithdrawals);
 router.post('/withdrawals/:id/process', withdrawalController.adminProcessWithdrawal);
 
-// ── Depósitos ─────────────────────────────────────────────────
-router.get('/deposits',                 depositController.adminGetDeposits);
-router.post('/deposits/:id/process',    depositController.adminProcessDeposit);
+// === SOLICITUDES DE PRÉSTAMO (ADMIN) ===
+router.get('/loans', loanController.adminGetLoans);
+router.post('/loans/:id/process', loanController.adminProcessLoan);
+router.get('/users/:userId/credit-score', loanController.adminGetCreditScore);
 
-// ── POOL ──────────────────────────────────────────────────────
-// NUEVO: guardar configuración del pool (antes vivía en archivo huérfano)
-router.post('/pool/config', adminController.savePoolConfig);
+// === SOLICITUDES DE DEPÓSITO (ADMIN + P2P) ===
+router.get('/deposits', depositController.adminGetDeposits);
+router.post('/deposits/:id/process', depositController.adminProcessDeposit);
 
-// Registro contable de retiros del pool (comisiones 20%)
+// ═══════════════════════════════════════════════════════════════════════
+// === POOL CONFIG (NUEVO) — APY, distribución, mínimo, capital, strategies
+// ═══════════════════════════════════════════════════════════════════════
+router.get('/pool/config-full', poolConfigController.adminGetPoolConfig);
+router.post('/pool/config', poolConfigController.adminUpdatePoolConfig);
+
+// === REGISTRO CONTABLE POOL — comisiones 20% ===
 router.get('/pool/withdrawals', async (req, res) => {
     const { pool: db } = require('../config/database');
     try {
@@ -100,12 +95,13 @@ router.get('/pool/withdrawals', async (req, res) => {
         res.json(rows);
     } catch (e) {
         console.error('[admin/pool/withdrawals]', e);
-        res.json([]); // Si la tabla aún no existe, devolver vacío en lugar de 500
+        res.json([]); // Si la tabla no existe aún, devolver vacío
     }
 });
 
-// ── Solicitudes de Registro ───────────────────────────────────
-router.get('/registrations',                 referralController.adminGetRegistrations);
-router.post('/registrations/:id/process',    referralController.adminProcessRegistration);
+// === SOLICITUDES DE REGISTRO (ADMIN) ===
+const referralController = require('../controllers/referralController');
+router.get('/registrations', referralController.adminGetRegistrations);
+router.post('/registrations/:id/process', referralController.adminProcessRegistration);
 
 module.exports = router;
