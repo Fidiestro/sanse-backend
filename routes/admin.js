@@ -205,6 +205,86 @@ router.get('/registrations', referralController.adminGetRegistrations);
 router.post('/registrations/:id/process', referralController.adminProcessRegistration);
 
 // ══════════════════════════════════════════════════════════════
+// GET /api/admin/pool/strategies — Leer estrategias del pool
+// POST /api/admin/pool/strategies — Guardar/actualizar estrategias
+//
+// Reemplaza el almacenamiento previo en localStorage del admin para
+// que todos los admins compartan la misma vista y el usuario también
+// pueda consultarlas vía /api/investments/pool-strategies.
+// ══════════════════════════════════════════════════════════════
+router.get('/pool/strategies', async (req, res) => {
+    const { pool: db } = require('../config/database');
+    try {
+        const [rows] = await db.execute(
+            `SELECT strategies FROM pool_config ORDER BY id ASC LIMIT 1`
+        );
+        if (!rows.length || rows[0].strategies === null) {
+            return res.json([]);
+        }
+        // MySQL/MariaDB devuelve JSON ya parseado en algunas versiones, string en otras
+        let strats = rows[0].strategies;
+        if (typeof strats === 'string') {
+            try { strats = JSON.parse(strats); } catch { strats = []; }
+        }
+        res.json(Array.isArray(strats) ? strats : []);
+    } catch (e) {
+        if (e && e.code === 'ER_BAD_FIELD_ERROR') {
+            console.warn('[admin/pool/strategies] columna strategies no existe; correr 002_add_pool_strategies.sql');
+            return res.json([]);
+        }
+        console.error('[admin/pool/strategies] GET error:', e.message);
+        res.status(500).json({ error: 'Error al obtener estrategias' });
+    }
+});
+
+router.post('/pool/strategies', async (req, res) => {
+    if (req.user.role !== 'admin') {
+        return res.status(403).json({ error: 'Solo administradores' });
+    }
+    const { pool: db } = require('../config/database');
+    try {
+        const { strategies } = req.body;
+        if (!Array.isArray(strategies)) {
+            return res.status(400).json({ error: 'strategies debe ser un array' });
+        }
+        const total = strategies.reduce((s, x) => s + (parseFloat(x.pct) || 0), 0);
+        if (total !== 100) {
+            return res.status(400).json({ error: `La suma de porcentajes debe ser 100% (actual: ${total}%)` });
+        }
+        for (const s of strategies) {
+            if (!s.name || typeof s.name !== 'string') {
+                return res.status(400).json({ error: 'Cada estrategia requiere un name' });
+            }
+            if (typeof s.pct !== 'number' || s.pct < 0 || s.pct > 100) {
+                return res.status(400).json({ error: `pct inválido para "${s.name}"` });
+            }
+        }
+
+        const [existing] = await db.execute(`SELECT id FROM pool_config ORDER BY id ASC LIMIT 1`);
+        if (existing.length) {
+            await db.execute(
+                `UPDATE pool_config SET strategies = ? WHERE id = ?`,
+                [JSON.stringify(strategies), existing[0].id]
+            );
+        } else {
+            await db.execute(
+                `INSERT INTO pool_config (strategies) VALUES (?)`,
+                [JSON.stringify(strategies)]
+            );
+        }
+        res.json({ message: 'Estrategias guardadas', strategies });
+    } catch (e) {
+        if (e && e.code === 'ER_BAD_FIELD_ERROR') {
+            return res.status(503).json({
+                error: 'La columna strategies no existe en pool_config. Correr migración 002_add_pool_strategies.sql primero.'
+            });
+        }
+        console.error('[admin/pool/strategies] POST error:', e.message);
+        res.status(500).json({ error: 'Error al guardar estrategias' });
+    }
+});
+
+// ══════════════════════════════════════════════════════════════
 // POST /api/admin/cleanup/admin-transactions
 // Borra TODAS las transacciones cuyos user_id sean usuarios con role='admin'.
 // Requiere body { confirm: true } para ejecutar; sin confirm hace dry-run.
