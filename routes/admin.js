@@ -19,11 +19,17 @@ router.use(authenticate, requireAdminOrP2P);
 
 // ══════════════════════════════════════════════════════════════
 // GET /api/admin/users — Lista todos los usuarios (panel admin)
-// Devuelve: id, full_name, email, phone, status, balance, totalInvested
+// FIX: Balance calculado FRESCO desde transactions usando los mismos
+// INFLOW_TYPES / OUTFLOW_TYPES de balanceHelper (fuente única de verdad).
+// Esto evita inconsistencias con user_balances/balance_history desactualizados.
 // ══════════════════════════════════════════════════════════════
 router.get('/users', async (req, res) => {
     const { pool: db } = require('../config/database');
+    const { INFLOW_TYPES, OUTFLOW_TYPES } = require('../utils/balanceHelper');
     try {
+        const inflowList  = INFLOW_TYPES.map(t => `'${t}'`).join(',');
+        const outflowList = OUTFLOW_TYPES.map(t => `'${t}'`).join(',');
+
         const [rows] = await db.execute(`
             SELECT
                 u.id,
@@ -37,63 +43,29 @@ router.get('/users', async (req, res) => {
                 u.referral_code,
                 u.referred_by,
                 u.created_at,
-                COALESCE(b.balance, 0) AS balance,
+                GREATEST(0,
+                    COALESCE((SELECT SUM(amount) FROM transactions
+                              WHERE user_id = u.id AND type IN (${inflowList})), 0)
+                    -
+                    COALESCE((SELECT SUM(amount) FROM transactions
+                              WHERE user_id = u.id AND type IN (${outflowList})), 0)
+                ) AS balance,
                 COALESCE((
-                    SELECT SUM(i.amount)
-                    FROM investments i
+                    SELECT SUM(i.amount) FROM investments i
                     WHERE i.user_id = u.id AND i.status = 'active'
-                ), 0) AS totalInvested
+                ), 0) AS totalInvested,
+                COALESCE((
+                    SELECT COUNT(*) FROM loan_requests lr
+                    WHERE lr.user_id = u.id AND lr.status IN ('active','overdue')
+                ), 0) AS activeLoansCount
             FROM users u
-            LEFT JOIN (
-                SELECT user_id, balance
-                FROM user_balances
-            ) b ON b.user_id = u.id
             WHERE u.role = 'client'
             ORDER BY u.created_at DESC
         `);
         res.json(rows);
     } catch (e) {
         console.error('[admin/users] Error:', e.message);
-        // Fallback: si user_balances no existe, calcular balance desde transactions
-        try {
-            const [rows] = await db.execute(`
-                SELECT
-                    u.id,
-                    u.full_name,
-                    u.email,
-                    u.phone,
-                    u.document_number,
-                    u.role,
-                    u.status,
-                    u.is_active,
-                    u.referral_code,
-                    u.referred_by,
-                    u.created_at,
-                    COALESCE((
-                        SELECT SUM(
-                            CASE
-                                WHEN t.type IN ('deposit','payment','profit','investment_return') THEN t.amount
-                                WHEN t.type IN ('withdrawal','investment') THEN -t.amount
-                                ELSE 0
-                            END
-                        )
-                        FROM transactions t
-                        WHERE t.user_id = u.id
-                    ), 0) AS balance,
-                    COALESCE((
-                        SELECT SUM(i.amount)
-                        FROM investments i
-                        WHERE i.user_id = u.id AND i.status = 'active'
-                    ), 0) AS totalInvested
-                FROM users u
-                WHERE u.role = 'client'
-                ORDER BY u.created_at DESC
-            `);
-            res.json(rows);
-        } catch (e2) {
-            console.error('[admin/users] Fallback también falló:', e2.message);
-            res.status(500).json({ error: 'Error al obtener usuarios' });
-        }
+        res.status(500).json({ error: 'Error al obtener usuarios' });
     }
 });
 
@@ -118,8 +90,70 @@ router.post('/balance', adminController.recordBalance);
 router.post('/recalculate-balance/:userId', adminController.recalculateBalance);
 router.post('/recalculate-all-balances', adminController.recalculateAllBalances);
 
-// Detalles usuario
-router.get('/users/:id/details', adminController.getUserDetails);
+// Detalles usuario — FIX: ahora incluye préstamos activos + balance fresco
+router.get('/users/:id/details', async (req, res) => {
+    const { pool: db } = require('../config/database');
+    const { INFLOW_TYPES, OUTFLOW_TYPES } = require('../utils/balanceHelper');
+    try {
+        const userId = req.params.id;
+
+        const [userRows] = await db.execute(
+            `SELECT id, email, full_name, phone, document_number, role, status, is_active,
+                    referral_code, referred_by, monthly_goal, created_at
+             FROM users WHERE id = ?`, [userId]
+        );
+        if (!userRows.length) return res.status(404).json({ error: 'Usuario no encontrado' });
+
+        const [investments]  = await db.execute(
+            `SELECT * FROM investments WHERE user_id = ? ORDER BY start_date DESC`, [userId]
+        );
+        const [transactions] = await db.execute(
+            `SELECT * FROM transactions WHERE user_id = ? ORDER BY created_at DESC`, [userId]
+        );
+        const [balanceHistory] = await db.execute(
+            `SELECT amount, snapshot_date FROM balance_history
+             WHERE user_id = ? ORDER BY snapshot_date ASC`, [userId]
+        );
+
+        // Préstamos del usuario (todos los estados)
+        let loans = [];
+        try {
+            const [loanRows] = await db.execute(
+                `SELECT id, ref_id, amount, approved_amount, monthly_rate, term_months,
+                        start_date, due_date, status, admin_notes, created_at
+                 FROM loan_requests WHERE user_id = ? ORDER BY created_at DESC`, [userId]
+            );
+            loans = loanRows;
+        } catch (e) {
+            console.warn('[users/:id/details] loan_requests no disponible:', e.message);
+        }
+
+        // Balance fresco calculado igual que /admin/users
+        const inflowPH  = INFLOW_TYPES.map(() => '?').join(',');
+        const outflowPH = OUTFLOW_TYPES.map(() => '?').join(',');
+        const [inRows]  = await db.execute(
+            `SELECT COALESCE(SUM(amount),0) AS total FROM transactions
+             WHERE user_id = ? AND type IN (${inflowPH})`, [userId, ...INFLOW_TYPES]
+        );
+        const [outRows] = await db.execute(
+            `SELECT COALESCE(SUM(amount),0) AS total FROM transactions
+             WHERE user_id = ? AND type IN (${outflowPH})`, [userId, ...OUTFLOW_TYPES]
+        );
+        const freshBalance = Math.max(0, parseFloat(inRows[0].total) - parseFloat(outRows[0].total));
+
+        res.json({
+            user: userRows[0],
+            investments,
+            transactions,
+            balanceHistory,
+            loans,
+            freshBalance,
+        });
+    } catch (error) {
+        console.error('[users/:id/details]', error);
+        res.status(500).json({ error: 'Error interno del servidor' });
+    }
+});
 
 // Bloquear/Desbloquear usuario
 router.post('/users/:id/toggle-block', adminController.toggleBlockUser);
@@ -169,5 +203,101 @@ router.get('/pool/withdrawals', async (req, res) => {
 const referralController = require('../controllers/referralController');
 router.get('/registrations', referralController.adminGetRegistrations);
 router.post('/registrations/:id/process', referralController.adminProcessRegistration);
+
+// ══════════════════════════════════════════════════════════════
+// POST /api/admin/cleanup/admin-transactions
+// Borra TODAS las transacciones cuyos user_id sean usuarios con role='admin'.
+// Requiere body { confirm: true } para ejecutar; sin confirm hace dry-run.
+// Solo el admin que llame puede ejecutar (req.user.role === 'admin').
+// ══════════════════════════════════════════════════════════════
+router.post('/cleanup/admin-transactions', async (req, res) => {
+    if (req.user.role !== 'admin') {
+        return res.status(403).json({ error: 'Solo administradores pueden ejecutar esta acción' });
+    }
+
+    const { pool: db } = require('../config/database');
+    const { recalculateAndSaveBalance } = require('../utils/balanceHelper');
+    const confirm = req.body && req.body.confirm === true;
+
+    const connection = await db.getConnection();
+    try {
+        // 1. Identificar admins
+        const [admins] = await connection.execute(
+            `SELECT id, email, full_name FROM users WHERE role = 'admin'`
+        );
+        if (!admins.length) {
+            connection.release();
+            return res.json({ dryRun: !confirm, message: 'No hay usuarios con role=admin', adminIds: [], txCount: 0 });
+        }
+        const adminIds = admins.map(a => a.id);
+        const placeholders = adminIds.map(() => '?').join(',');
+
+        // 2. Contar y listar transacciones afectadas (siempre, para reporte)
+        const [txRows] = await connection.execute(
+            `SELECT id, user_id, type, amount, description, ref_id, investment_id, loan_id, created_at
+             FROM transactions
+             WHERE user_id IN (${placeholders})
+             ORDER BY created_at DESC`,
+            adminIds
+        );
+
+        const summary = {
+            adminIds,
+            adminEmails: admins.map(a => a.email),
+            txCount: txRows.length,
+            totalAmount: txRows.reduce((s, t) => s + parseFloat(t.amount || 0), 0),
+            byType: txRows.reduce((acc, t) => { acc[t.type] = (acc[t.type] || 0) + 1; return acc; }, {}),
+            withInvestmentLink: txRows.filter(t => t.investment_id).length,
+            withLoanLink: txRows.filter(t => t.loan_id).length,
+        };
+
+        // 3. DRY-RUN: sin confirm, devolver reporte y NO borrar nada
+        if (!confirm) {
+            connection.release();
+            return res.json({
+                dryRun: true,
+                message: '⚠️  DRY-RUN. Nada fue borrado. Llama de nuevo con { "confirm": true } para ejecutar.',
+                summary,
+                sampleTransactions: txRows.slice(0, 20), // primeras 20 para inspección
+            });
+        }
+
+        // 4. EJECUTAR borrado
+        await connection.beginTransaction();
+        const [delResult] = await connection.execute(
+            `DELETE FROM transactions WHERE user_id IN (${placeholders})`,
+            adminIds
+        );
+
+        // 5. Recalcular balance de cada admin (deja en 0 o coherente)
+        const recalcResults = [];
+        for (const adminId of adminIds) {
+            try {
+                const newBal = await recalculateAndSaveBalance(connection, adminId);
+                recalcResults.push({ adminId, newBalance: newBal });
+            } catch (e) {
+                recalcResults.push({ adminId, error: e.message });
+            }
+        }
+
+        await connection.commit();
+        connection.release();
+
+        console.log(`[cleanup/admin-transactions] Admin ${req.user.id} borró ${delResult.affectedRows} transacciones de admins`);
+
+        return res.json({
+            dryRun: false,
+            message: `✅ Borradas ${delResult.affectedRows} transacciones de ${adminIds.length} admin(s)`,
+            deletedCount: delResult.affectedRows,
+            summary,
+            recalcResults,
+        });
+    } catch (error) {
+        try { await connection.rollback(); } catch (_) {}
+        connection.release();
+        console.error('[cleanup/admin-transactions] Error:', error);
+        res.status(500).json({ error: 'Error interno: ' + error.message });
+    }
+});
 
 module.exports = router;
