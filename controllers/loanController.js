@@ -281,8 +281,8 @@ exports.adminProcessLoan = async (req, res) => {
         const loanId = req.params.id;
         const { action, approvedAmount, approvedRate, notes } = req.body;
 
-        if (!['approve', 'reject', 'mark_paid', 'mark_overdue'].includes(action)) {
-            return res.status(400).json({ error: 'Acción inválida. Usar: approve, reject, mark_paid, mark_overdue' });
+        if (!['approve', 'reject', 'mark_paid', 'mark_overdue', 'cancel'].includes(action)) {
+            return res.status(400).json({ error: 'Acción inválida. Usar: approve, reject, mark_paid, mark_overdue, cancel' });
         }
 
         const [loanRows] = await connection.execute(`SELECT * FROM loan_requests WHERE id = ?`, [loanId]);
@@ -345,10 +345,45 @@ exports.adminProcessLoan = async (req, res) => {
                 `UPDATE loan_requests SET status = 'overdue', admin_notes = CONCAT(IFNULL(admin_notes,''), ?) WHERE id = ?`,
                 [` | ${overdueNote}`, loanId]
             );
+
+        } else if (action === 'cancel') {
+            // ★ NUEVO: Cancelación SUAVE de un préstamo activo o en mora
+            // - Marca status = 'cancelled'
+            // - NO toca el balance del usuario (el dinero ya se gastó / no se cobra lo pendiente)
+            // - El historial de abonos y transacciones queda intacto
+            if (loan.status !== 'active' && loan.status !== 'overdue') {
+                return res.status(400).json({ error: 'Solo se pueden cancelar préstamos activos o en mora' });
+            }
+            const cancelNote = `CANCELADO: ${new Date().toISOString().slice(0, 10)}${notes ? ' — ' + notes : ''}`;
+            await connection.execute(
+                `UPDATE loan_requests SET status = 'cancelled',
+                 admin_notes = CONCAT(IFNULL(admin_notes,''), ?), processed_at = NOW(), processed_by = ?
+                 WHERE id = ?`,
+                [` | ${cancelNote}`, req.user.id, loanId]
+            );
+
+            // Notificación a Telegram
+            try {
+                const [userRows] = await connection.execute(`SELECT full_name FROM users WHERE id = ?`, [loan.user_id]);
+                await notify(
+                    `🚫 *PRÉSTAMO CANCELADO*\n\n` +
+                    `👤 ${userRows[0]?.full_name || 'Usuario'}\n` +
+                    `💰 Capital pendiente: $${Math.round(parseFloat(loan.approved_amount || loan.amount)).toLocaleString('es-CO')}\n` +
+                    `📌 El balance del usuario NO se modificó\n` +
+                    `🔖 ${loan.ref_id}` +
+                    `${notes ? '\n📝 ' + notes : ''}`
+                );
+            } catch (e) { /* notify es best-effort */ }
         }
 
         await connection.commit();
-        const statusLabels = { approve: 'aprobada', reject: 'rechazada', mark_paid: 'marcada como pagada', mark_overdue: 'marcada en mora' };
+        const statusLabels = {
+            approve: 'aprobada',
+            reject: 'rechazada',
+            mark_paid: 'marcada como pagada',
+            mark_overdue: 'marcada en mora',
+            cancel: 'cancelada'
+        };
         res.json({ message: `Solicitud ${statusLabels[action]}` });
     } catch (error) {
         await connection.rollback();
