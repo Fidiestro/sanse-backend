@@ -64,7 +64,7 @@ try { app.use('/api/withdrawals', require('./routes/withdrawals')); console.log(
 try { app.use('/api/loans', require('./routes/loans')); console.log('🏦 Loan routes loaded'); } catch(e) { console.error('❌ Loan routes error:', e.message); }
 try { app.use('/api/deposits', require('./routes/deposits')); console.log('📥 Deposit routes loaded'); } catch(e) { console.error('❌ Deposit routes error:', e.message); }
 try { app.use('/api/user', require('./routes/user')); console.log('👤 User routes loaded'); } catch(e) { console.error('❌ User routes error:', e.message); }
-
+try { app.use('/api/support', require('./routes/support')); console.log('💬 Support routes loaded'); } catch(e) { console.error('❌ Support routes error:', e.message); }
 // ═══ 404 y ERROR HANDLER ═══
 app.use((req, res) => {
     console.log('🔍 404:', req.method, req.originalUrl);

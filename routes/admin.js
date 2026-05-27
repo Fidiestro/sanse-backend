@@ -5,6 +5,7 @@ const withdrawalController = require('../controllers/withdrawalController');
 const loanController = require('../controllers/loanController');
 const depositController = require('../controllers/depositController');
 const { authenticate, requireAdmin } = require('../middleware/auth');
+const supportController = require('../controllers/supportController');
 
 // Middleware: admin O p2p pueden acceder
 const requireAdminOrP2P = (req, res, next) => {
