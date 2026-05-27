@@ -107,19 +107,71 @@ exports.getMyLoans = async (req, res) => {
 
         let loanRequests = [];
         try {
-            const [rows] = await pool.execute(`SELECT * FROM loan_requests WHERE user_id = ? ORDER BY created_at DESC`, [userId]);
+            // FIX: Trae last_payment_at por subquery para que el frontend pueda
+            //      calcular el interés en vivo desde el último abono (no desde el inicio)
+            const [rows] = await pool.execute(
+                `SELECT lr.*,
+                        (SELECT MAX(created_at) FROM loan_payments WHERE loan_id = lr.id) AS last_payment_at
+                 FROM loan_requests lr
+                 WHERE lr.user_id = ?
+                 ORDER BY lr.created_at DESC`,
+                [userId]
+            );
+
+            // NUEVO: Trae historial de pagos solo de préstamos activos/en mora
+            const activeIds = rows
+                .filter(l => ['active', 'overdue'].includes(l.status))
+                .map(l => l.id);
+
+            let paymentsByLoan = {};
+            if (activeIds.length) {
+                const placeholders = activeIds.map(() => '?').join(',');
+                const [payments] = await pool.execute(
+                    `SELECT id, loan_id, amount, interest_amount, capital_amount, remaining_capital,
+                            ref_id, is_fully_paid, created_at
+                     FROM loan_payments
+                     WHERE loan_id IN (${placeholders})
+                     ORDER BY created_at DESC`,
+                    activeIds
+                );
+                paymentsByLoan = payments.reduce((acc, p) => {
+                    if (!acc[p.loan_id]) acc[p.loan_id] = [];
+                    acc[p.loan_id].push({
+                        id: p.id,
+                        amount: parseFloat(p.amount),
+                        interestAmount: parseFloat(p.interest_amount),
+                        capitalAmount: parseFloat(p.capital_amount),
+                        remainingCapital: parseFloat(p.remaining_capital),
+                        refId: p.ref_id,
+                        isFullyPaid: !!p.is_fully_paid,
+                        createdAt: p.created_at,
+                    });
+                    return acc;
+                }, {});
+            }
+
             loanRequests = rows.map(l => ({
-                id: l.id, source: 'request', amount: parseFloat(l.amount),
-                monthlyRate: parseFloat(l.monthly_rate || 0), term: l.term_months,
-                purpose: l.purpose, status: l.status, adminNotes: l.admin_notes,
+                id: l.id,
+                source: 'request',
+                amount: parseFloat(l.amount),
+                monthlyRate: parseFloat(l.monthly_rate || 0),
+                term: l.term_months,                            // puede ser null = indefinido
+                indefinite: l.term_months === null,             // NUEVO: flag explícito
+                purpose: l.purpose,
+                status: l.status,
+                adminNotes: l.admin_notes,
                 approvedAmount: l.approved_amount !== null && l.approved_amount !== undefined
                     ? parseFloat(l.approved_amount)
                     : null,
                 approvedRate: l.approved_rate ? parseFloat(l.approved_rate) : null,
-                startDate: l.start_date, dueDate: l.due_date,
-                createdAt: l.created_at, processedAt: l.processed_at,
+                startDate: l.start_date,
+                dueDate: l.due_date,                            // puede ser null = sin vencimiento
+                lastPaymentAt: l.last_payment_at,               // NUEVO: para tick en vivo
+                payments: paymentsByLoan[l.id] || [],           // NUEVO: historial de abonos
+                createdAt: l.created_at,
+                processedAt: l.processed_at,
             }));
-        } catch (e) {}
+        } catch (e) { console.error('Error en getMyLoans loanRequests:', e); }
 
         res.json({ legacyLoans, loanRequests });
     } catch (error) {

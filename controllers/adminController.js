@@ -542,6 +542,7 @@ exports.toggleBlockUser = async (req, res) => {
 
 // POST /api/admin/loans/create — Crear préstamo directo
 // FIX: Usa balanceHelper centralizado
+// FIX: Soporta préstamos SIN plazo definido (termMonths = 0 / null / 'indefinido')
 exports.adminCreateLoan = async (req, res) => {
     const connection = await pool.getConnection();
     try {
@@ -549,25 +550,46 @@ exports.adminCreateLoan = async (req, res) => {
 
         const { userId, amount, termMonths, monthlyRate, purpose, notes, startDate } = req.body;
 
-        if (!userId || !amount || !termMonths || !monthlyRate)
-            return res.status(400).json({ error: 'userId, amount, termMonths y monthlyRate son requeridos' });
+        if (!userId || !amount || !monthlyRate)
+            return res.status(400).json({ error: 'userId, amount y monthlyRate son requeridos' });
 
         const parsedAmount = parseFloat(amount);
         const parsedRate   = parseFloat(monthlyRate);
-        const parsedTerm   = parseInt(termMonths);
+
+        // ── NUEVO: Detectar préstamo sin plazo definido ──
+        const isIndefinite = !termMonths
+                          || termMonths === 0
+                          || termMonths === '0'
+                          || termMonths === 'indefinido'
+                          || termMonths === 'indefinite';
+        const parsedTerm = isIndefinite ? null : parseInt(termMonths);
 
         if (parsedAmount < 100000) return res.status(400).json({ error: 'Monto mínimo: $100.000 COP' });
         if (parsedRate < 1 || parsedRate > 20) return res.status(400).json({ error: 'Tasa entre 1% y 20%' });
+        if (!isIndefinite && (isNaN(parsedTerm) || parsedTerm < 1 || parsedTerm > 60)) {
+            return res.status(400).json({ error: 'Plazo debe ser entre 1 y 60 meses, o "indefinido"' });
+        }
 
         const [userRows] = await connection.execute(`SELECT id, full_name FROM users WHERE id = ?`, [userId]);
         if (!userRows.length) return res.status(404).json({ error: 'Usuario no encontrado' });
 
         const loanStart = startDate ? new Date(startDate) : new Date();
-        const dueDate   = new Date(loanStart);
-        dueDate.setMonth(dueDate.getMonth() + parsedTerm);
-        const fmt = d => d.toISOString().slice(0, 10);
+        let dueDate = null;
+        if (!isIndefinite) {
+            dueDate = new Date(loanStart);
+            dueDate.setMonth(dueDate.getMonth() + parsedTerm);
+        }
+        const fmt = d => d ? d.toISOString().slice(0, 10) : null;
 
         const refId = 'LADM-' + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2, 5).toUpperCase();
+
+        const purposeText = purpose || (isIndefinite
+            ? `Préstamo sin plazo definido — Admin`
+            : `Préstamo ${parsedTerm} mes${parsedTerm > 1 ? 'es' : ''} — Admin`);
+
+        const txDesc = isIndefinite
+            ? `Préstamo SANSE — Sin plazo definido al ${parsedRate}% mensual`
+            : `Préstamo SANSE — ${parsedTerm} mes${parsedTerm > 1 ? 'es' : ''} al ${parsedRate}% mensual`;
 
         const [result] = await connection.execute(
             `INSERT INTO loan_requests
@@ -575,7 +597,7 @@ exports.adminCreateLoan = async (req, res) => {
               approved_amount, approved_rate, monthly_rate, start_date, due_date, admin_notes, processed_at, processed_by)
              VALUES (?, ?, ?, ?, 999, 'active', ?, ?, ?, ?, ?, ?, ?, NOW(), ?)`,
             [userId, parsedAmount, parsedTerm,
-             purpose || `Préstamo ${parsedTerm} mes${parsedTerm > 1 ? 'es' : ''} — Admin`,
+             purposeText,
              refId, parsedAmount, parsedRate, parsedRate,
              fmt(loanStart), fmt(dueDate),
              notes || 'Creado directamente por administrador',
@@ -584,9 +606,7 @@ exports.adminCreateLoan = async (req, res) => {
 
         await connection.execute(
             `INSERT INTO transactions (user_id, type, amount, description, ref_id, created_at) VALUES (?, 'loan', ?, ?, ?, ?)`,
-            [userId, parsedAmount,
-             purpose || `Préstamo SANSE — ${parsedTerm} mes${parsedTerm > 1 ? 'es' : ''} al ${parsedRate}% mensual`,
-             refId, fmt(loanStart)]
+            [userId, parsedAmount, txDesc, refId, fmt(loanStart)]
         );
 
         // FIX: Usa balanceHelper centralizado
@@ -596,7 +616,16 @@ exports.adminCreateLoan = async (req, res) => {
 
         res.status(201).json({
             message: `Préstamo de $${parsedAmount.toLocaleString('es-CO')} COP creado para ${userRows[0].full_name}`,
-            loan: { id: result.insertId, refId, amount: parsedAmount, termMonths: parsedTerm, monthlyRate: parsedRate, dueDate: fmt(dueDate), newBalance }
+            loan: {
+                id: result.insertId,
+                refId,
+                amount: parsedAmount,
+                termMonths: parsedTerm,
+                indefinite: isIndefinite,
+                monthlyRate: parsedRate,
+                dueDate: fmt(dueDate),
+                newBalance
+            }
         });
     } catch (error) {
         await connection.rollback();
