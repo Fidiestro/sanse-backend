@@ -308,6 +308,19 @@ router.post('/support/chats/:id/message',   supportController.adminSendMessage);
 router.post('/support/chats/:id/close',     supportController.adminCloseChat);
 
 // ══════════════════════════════════════════════════════════════
+// CADENAS DE AHORRO — Admin
+// ══════════════════════════════════════════════════════════════
+const cadenasController = require('../controllers/cadenasController');
+router.get( '/cadenas',                    cadenasController.adminList);
+router.post('/cadenas',                    cadenasController.adminCreate);
+router.get( '/cadenas/:id',                cadenasController.adminGet);
+router.post('/cadenas/:id/start',          cadenasController.adminStart);
+router.post('/cadenas/:id/mark-paid',      cadenasController.adminMarkPaid);
+router.post('/cadenas/:id/deliver',        cadenasController.adminDeliverPayout);
+router.post('/cadenas/:id/cancel',         cadenasController.adminCancel);
+router.post('/cadenas/:id/remove-member',  cadenasController.adminRemoveMember);
+
+// ══════════════════════════════════════════════════════════════
 // POST /api/admin/cleanup/admin-transactions
 // Borra TODAS las transacciones cuyos user_id sean usuarios con role='admin'.
 // Requiere body { confirm: true } para ejecutar; sin confirm hace dry-run.

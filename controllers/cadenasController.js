@@ -21,7 +21,7 @@
 // AJUSTA ESTA LÍNEA: usa EXACTAMENTE el mismo require del pool que usan
 // tus otros controllers (mira controllers/adminController.js arriba).
 // Ejemplos comunes:  require('../config/db')  ·  require('../db')  ·  require('../config/database')
-const pool = require('../config/database');
+const { pool } = require('../config/database');
 // ────────────────────────────────────────────────────────────────────────
 
 // Configuración de elegibilidad — cambia aquí si quieres otros mínimos.
