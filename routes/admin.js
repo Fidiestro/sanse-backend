@@ -286,6 +286,28 @@ router.post('/pool/strategies', async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════════════
+// SOPORTE (CHAT DE AYUDA) — ADMIN
+// ★ FIX: Las rutas estaban faltando. El supportController ya existía
+// pero nunca se exponían sus métodos admin, devolviendo 404 cada 3-5s.
+//
+// Frontend admin.html llama:
+//   GET  /api/admin/support/unread-count              (badge de no leídos)
+//   GET  /api/admin/support/chats?status=open|closed  (lista chats)
+//   GET  /api/admin/support/chats/:id/messages?since=N (polling de mensajes)
+//   POST /api/admin/support/chats/:id/message         (responder)
+//   POST /api/admin/support/chats/:id/close           (cerrar chat)
+//
+// NOTA: /support/unread-count va PRIMERO para que no entre por el
+// matcher de /support/chats/:id/... (aunque Express no los confunde
+// porque tienen prefijos distintos, mantener orden por convención).
+// ══════════════════════════════════════════════════════════════
+router.get( '/support/unread-count',        supportController.adminUnreadCount);
+router.get( '/support/chats',               supportController.adminListChats);
+router.get( '/support/chats/:id/messages',  supportController.adminGetMessages);
+router.post('/support/chats/:id/message',   supportController.adminSendMessage);
+router.post('/support/chats/:id/close',     supportController.adminCloseChat);
+
+// ══════════════════════════════════════════════════════════════
 // POST /api/admin/cleanup/admin-transactions
 // Borra TODAS las transacciones cuyos user_id sean usuarios con role='admin'.
 // Requiere body { confirm: true } para ejecutar; sin confirm hace dry-run.
