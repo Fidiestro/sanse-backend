@@ -474,63 +474,23 @@ exports.getMyInvestments = async (req, res) => {
                 const depositDeadlineMatch = inv.notes?.match(/Período de depósito hasta: ([\d-: ]+)/);
                 const depositDeadline = depositDeadlineMatch ? new Date(depositDeadlineMatch[1].replace(' ', 'T')) : null;
 
-                // ─── CDTC: cálculo en tiempo real de ganancia acumulada ───
-                // bruto acumulado = capital × 2% × (días desde start / 30)
-                // claimable = bruto - lo ya reclamado vía claims previos (en transactions)
-                // canClaimNow: pasó el cooldown de 24h desde el último claim
+                // ─── LP COP: acumulado real pendiente de reclamo ───
+                // El rendimiento se devenga el día 1 de cada mes (2% mensual) y se guarda
+                // en investment_returns con status='accrued'. Aquí solo SUMAMOS lo pendiente.
+                // (Ya no se calcula "en vivo por segundos" — eso causaba sobrepagos.)
                 const invType = (inv.type || '').toLowerCase();
                 const isPool  = invType === 'pool';
                 const isCdtcActive = !isPool && inv.status === 'active';
 
-                let liveAccrued = 0;
-                let liveClaimable = 0;
-                let canClaimNow = false;
-                let nextClaimAt = null;
-
+                let accruedPending = 0;
                 if (isCdtcActive) {
-                    // FIX: usar SEGUNDOS (no días) y NO redondear, para que coincida con el
-                    // cálculo del frontend que también opera al segundo. Antes con Math.floor
-                    // y días enteros, una inversión recién confirmada devolvía liveAccrued = 0
-                    // hasta que pasaran 24h, dando la sensación de que "no funciona".
-                    const startTs = new Date(inv.start_date).getTime();
-                    const secondsElapsed = Math.max(0, (now.getTime() - startTs) / 1000);
-                    const SECONDS_PER_MONTH = 30 * 24 * 60 * 60; // 2.592.000
-                    const capital = parseFloat(inv.amount);
-                    liveAccrued = capital * 0.02 * (secondsElapsed / SECONDS_PER_MONTH);
-
-                    // "Ya retirado" = suma de claims previos en transactions (tipo investment_return).
-                    // Los claims se guardan en NETO. Si el usuario tiene referido, neto = bruto * 0.95
-                    // → para comparar contra el bruto acumulado, hay que dividir entre 0.95.
-                    const [claimRows] = await pool.execute(
-                        `SELECT COALESCE(SUM(amount), 0) as total, MAX(created_at) as last_claim
-                         FROM transactions
-                         WHERE investment_id = ? AND user_id = ? AND type = 'investment_return'`,
-                        [inv.id, userId]
+                    const [accRows] = await pool.execute(
+                        `SELECT COALESCE(SUM(amount_earned), 0) as total
+                         FROM investment_returns
+                         WHERE investment_id = ? AND status = 'accrued'`,
+                        [inv.id]
                     );
-                    const netAlreadyPaid = parseFloat(claimRows[0].total) || 0;
-
-                    const [refCheck] = await pool.execute(
-                        'SELECT referred_by FROM users WHERE id = ?', [userId]
-                    );
-                    const hasReferrer = refCheck.length && refCheck[0].referred_by;
-                    const grossAlreadyPaid = hasReferrer
-                        ? (netAlreadyPaid / 0.95)
-                        : netAlreadyPaid;
-
-                    liveClaimable = Math.max(0, liveAccrued - grossAlreadyPaid);
-
-                    // Cooldown 24h desde el último claim
-                    const lastClaim = claimRows[0].last_claim ? new Date(claimRows[0].last_claim) : null;
-                    if (lastClaim) {
-                        const cooldownMs = 24 * 60 * 60 * 1000;
-                        const msSince = now.getTime() - lastClaim.getTime();
-                        canClaimNow = msSince >= cooldownMs && liveClaimable >= 10;
-                        if (!canClaimNow && msSince < cooldownMs) {
-                            nextClaimAt = new Date(lastClaim.getTime() + cooldownMs).toISOString();
-                        }
-                    } else {
-                        canClaimNow = liveClaimable >= 10;
-                    }
+                    accruedPending = parseFloat(accRows[0].total) || 0;
                 }
 
                 return {
@@ -552,11 +512,8 @@ exports.getMyInvestments = async (req, res) => {
                     totalEarned: returns.reduce((sum, r) => sum + parseFloat(r.amount_earned), 0),
                     canCancel: inv.status === 'pending_deposit' && depositDeadline && now < depositDeadline,
                     depositDeadline: inv.status === 'pending_deposit' && depositDeadline ? depositDeadline.toISOString() : null,
-                    // CDTC live accrual data
-                    liveAccrued,
-                    liveClaimable,
-                    canClaimNow,
-                    nextClaimAt,
+                    // LP COP: acumulado real pendiente de reclamo (devengado el día 1)
+                    accruedPending,
                     returns: returns.map((r) => ({
                         month: r.period_month,
                         rate: parseFloat(r.rate_applied),
@@ -605,43 +562,20 @@ exports.getInvestmentDetail = async (req, res) => {
             [investmentId]
         );
 
-        // FIX: calcular acumulado en tiempo real para CDTC activos (mismo cálculo que getMyInvestments).
-        // Antes el detalle no devolvía liveAccrued/liveClaimable/canClaimNow, así que el frontend
-        // mostraba $0 y el banner de claim no funcionaba.
+        // LP COP: acumulado real pendiente de reclamo (devengado el día 1, no "en vivo").
         const invType = (inv.type || '').toLowerCase();
         const isPool  = invType === 'pool';
         const isCdtcActive = !isPool && inv.status === 'active';
-        let liveAccrued = 0, liveClaimable = 0, canClaimNow = false, nextClaimAt = null;
+        let accruedPending = 0;
 
         if (isCdtcActive) {
-            const startTs = new Date(inv.start_date).getTime();
-            const secondsElapsed = Math.max(0, (now.getTime() - startTs) / 1000);
-            const SECONDS_PER_MONTH = 30 * 24 * 60 * 60;
-            const capital = parseFloat(inv.amount);
-            liveAccrued = capital * 0.02 * (secondsElapsed / SECONDS_PER_MONTH);
-
-            const [claimRows] = await pool.execute(
-                `SELECT COALESCE(SUM(amount), 0) as total, MAX(created_at) as last_claim
-                 FROM transactions WHERE investment_id = ? AND user_id = ? AND type = 'investment_return'`,
-                [investmentId, userId]
+            const [accRows] = await pool.execute(
+                `SELECT COALESCE(SUM(amount_earned), 0) as total
+                 FROM investment_returns
+                 WHERE investment_id = ? AND status = 'accrued'`,
+                [investmentId]
             );
-            const netAlreadyPaid = parseFloat(claimRows[0].total) || 0;
-            const [refCheck] = await pool.execute('SELECT referred_by FROM users WHERE id = ?', [userId]);
-            const hasReferrer = refCheck.length && refCheck[0].referred_by;
-            const grossAlreadyPaid = hasReferrer ? (netAlreadyPaid / 0.95) : netAlreadyPaid;
-            liveClaimable = Math.max(0, liveAccrued - grossAlreadyPaid);
-
-            const lastClaim = claimRows[0].last_claim ? new Date(claimRows[0].last_claim) : null;
-            if (lastClaim) {
-                const cooldownMs = 24 * 60 * 60 * 1000;
-                const msSince = now.getTime() - lastClaim.getTime();
-                canClaimNow = msSince >= cooldownMs && liveClaimable >= 10;
-                if (!canClaimNow && msSince < cooldownMs) {
-                    nextClaimAt = new Date(lastClaim.getTime() + cooldownMs).toISOString();
-                }
-            } else {
-                canClaimNow = liveClaimable >= 10;
-            }
+            accruedPending = parseFloat(accRows[0].total) || 0;
         }
 
         res.json({
@@ -662,11 +596,8 @@ exports.getInvestmentDetail = async (req, res) => {
                 notes: inv.notes,
                 createdAt: inv.created_at,
                 isMatured,
-                // CDTC live accrual data
-                liveAccrued,
-                liveClaimable,
-                canClaimNow,
-                nextClaimAt,
+                // LP COP: acumulado real pendiente de reclamo
+                accruedPending,
             },
             returns: returns.map((r) => ({
                 month: r.period_month,
@@ -979,31 +910,21 @@ exports.withdrawInvestment = async (req, res) => {
         // FIX: si hay ganancias pendientes, forzar claim primero para que no se pierdan
         // al marcar la inversión como completed.
         //   - Pool: lee withdrawable_earnings
-        //   - CDTC: recalcula en tiempo real (capital × 2% × días/30 - lo ya retirado bruto)
+        //   - LP COP: lee el acumulado real (investment_returns con status='accrued')
         const invType = (inv.type || '').toLowerCase();
         const isPool = invType === 'pool';
         let pendingEarnings = 0;
         if (isPool) {
             pendingEarnings = parseFloat(inv.withdrawable_earnings) || 0;
         } else {
-            // FIX: cálculo basado en segundos (sincronizado con frontend y getMyInvestments)
-            const capital = parseFloat(inv.amount) || 0;
-            const startDate = new Date(inv.start_date);
-            const secondsElapsed = Math.max(0, (now - startDate) / 1000);
-            const SECONDS_PER_MONTH = 30 * 24 * 60 * 60;
-            const grossAccrued = capital * 0.02 * (secondsElapsed / SECONDS_PER_MONTH);
-            const [paidRows] = await connection.execute(
-                `SELECT COALESCE(SUM(amount), 0) as total FROM transactions
-                 WHERE investment_id = ? AND user_id = ? AND type = 'investment_return'`,
-                [investmentId, userId]
+            // LP COP: rendimiento devengado el día 1, pendiente de reclamo.
+            const [accRows] = await connection.execute(
+                `SELECT COALESCE(SUM(amount_earned), 0) as total
+                 FROM investment_returns
+                 WHERE investment_id = ? AND status = 'accrued'`,
+                [investmentId]
             );
-            const netAlreadyPaid = parseFloat(paidRows[0].total) || 0;
-            const [refCheck] = await connection.execute(
-                'SELECT referred_by FROM users WHERE id = ?', [userId]
-            );
-            const hasReferrer = refCheck.length && refCheck[0].referred_by;
-            const grossAlreadyPaid = hasReferrer ? Math.round(netAlreadyPaid / 0.95) : netAlreadyPaid;
-            pendingEarnings = Math.max(0, grossAccrued - grossAlreadyPaid);
+            pendingEarnings = parseFloat(accRows[0].total) || 0;
         }
 
         if (pendingEarnings >= 10) {
@@ -1144,64 +1065,28 @@ exports.withdrawPoolEarnings = async (req, res) => {
         const hasReferrer = !!referrerId;
 
         // ════════════════════════════════════════════════════════════════
-        // CÁLCULO DE GANANCIA RECLAMABLE
-        // ────────────────────────────────────────────────────────────────
-        // Pool: lee withdrawable_earnings (el admin acumula manualmente).
-        // CDTC: calcula en tiempo real (2% mensual fijo), descontando lo ya retirado.
+        // Este endpoint es SOLO para el Pool de Liquidez.
+        // LP COP (CDTC) usa /api/investments/lp/claim, que reclama el rendimiento
+        // ya devengado (status='accrued') en investment_returns.
+        // Antes este branch calculaba CDTC "en vivo por segundos", lo que causó
+        // un sobrepago grave. Por eso ahora rechaza cualquier inversión que no sea Pool.
         // ════════════════════════════════════════════════════════════════
-        let grossEarnings = 0;
-        if (isPool) {
-            grossEarnings = parseFloat(inv.withdrawable_earnings) || 0;
-        } else {
-            // CDTC: tasa fija 2% mensual desde start_date (que es la fecha de confirmación)
-            // FIX: usar segundos exactos (no días) para que el claim funcione incluso
-            // si la inversión tiene menos de 24 horas activas.
-            const capital = parseFloat(inv.amount) || 0;
-            const startDate = new Date(inv.start_date);
-            const now = new Date();
-            const secondsElapsed = Math.max(0, (now - startDate) / 1000);
-            const SECONDS_PER_MONTH = 30 * 24 * 60 * 60;
-            const grossAccrued = capital * 0.02 * (secondsElapsed / SECONDS_PER_MONTH);
-
-            // Cuánto ya retiró históricamente (suma de claims previos para esta inversión).
-            // Los claims se guardan en NETO: si hay referido, neto = bruto * 0.95.
-            const [paidRows] = await connection.execute(
-                `SELECT COALESCE(SUM(amount), 0) as total FROM transactions
-                 WHERE investment_id = ? AND user_id = ? AND type = 'investment_return'`,
-                [id, userId]
-            );
-            const netAlreadyPaid = parseFloat(paidRows[0].total) || 0;
-            const grossAlreadyPaid = hasReferrer
-                ? (netAlreadyPaid / 0.95)
-                : netAlreadyPaid;
-
-            grossEarnings = Math.max(0, grossAccrued - grossAlreadyPaid);
+        if (!isPool) {
+            await connection.rollback();
+            return res.status(400).json({
+                error: 'Para LP COP usa el reclamo de rendimientos mensuales (/lp/claim).',
+                redirect: '/investments/lp/claim',
+            });
         }
+
+        let grossEarnings = parseFloat(inv.withdrawable_earnings) || 0;
 
         if (grossEarnings <= 0) {
             await connection.rollback();
             return res.status(400).json({ error: 'No hay ganancias disponibles para retirar' });
         }
 
-        // ── Límite 1 claim por día (solo CDTC, Pool no necesita porque depende del admin) ──
-        if (!isPool) {
-            const [recentClaims] = await connection.execute(
-                `SELECT COUNT(*) as c FROM transactions
-                 WHERE investment_id = ? AND user_id = ? AND type = 'investment_return'
-                   AND created_at > DATE_SUB(NOW(), INTERVAL 24 HOUR)`,
-                [id, userId]
-            );
-            if (parseInt(recentClaims[0].c) > 0) {
-                await connection.rollback();
-                return res.status(429).json({
-                    error: 'Solo puedes reclamar ganancias CDTC una vez cada 24 horas. Intenta de nuevo más tarde.',
-                    nextClaimIn: '24h desde el último claim',
-                });
-            }
-        }
-
-        // ── Cálculos de comisiones según tipo ──
-        // Pool: 20% Sanse + 5% referido. CDTC: 0% Sanse + 5% referido.
+        // ── Cálculos de comisiones (Pool: 20% Sanse + 5% referido) ──
         const sanseCommission = isPool ? Math.round(grossEarnings * 0.20) : 0;
         const referralCommission = hasReferrer ? Math.round(grossEarnings * 0.05) : 0;
         const netAmount = grossEarnings - sanseCommission - referralCommission;
