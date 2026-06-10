@@ -76,6 +76,32 @@ app.use((err, req, res, next) => {
     res.status(500).json({ error: 'Error interno del servidor' });
 });
 
+// ═══ CRON — Devengo automático LP COP ═══
+// Corre TODOS los días a las 00:10 (hora Colombia). El devengo es
+// idempotente (usa last_accrual_period + guard en investment_returns),
+// así que solo inserta algo cuando hay meses cerrados pendientes:
+// en la práctica actúa el día 1, y los demás días no hace nada.
+// Ventaja de correrlo a diario: si el server estaba caído o
+// redeployando justo el día 1, se auto-corrige al día siguiente.
+try {
+    const cron = require('node-cron');
+    cron.schedule('10 0 * * *', async () => {
+        try {
+            const { pool } = require('./config/database');
+            const { runMonthlyAccrual } = require('./utils/lpAccrual');
+            const r = await runMonthlyAccrual(pool, new Date());
+            if (r.totalReturns > 0 || r.errors.length > 0) {
+                console.log('🕐 [cron LP] Devengo ejecutado:', JSON.stringify(r));
+            }
+        } catch (e) {
+            console.error('🕐 [cron LP] Error en devengo:', e.message);
+        }
+    }, { timezone: 'America/Bogota' });
+    console.log('🕐 Cron de devengo LP COP programado (diario 00:10 Bogotá)');
+} catch (e) {
+    console.error('❌ node-cron no disponible (npm install node-cron):', e.message);
+}
+
 // ═══ START ═══
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`🚀 Sanse Capital API corriendo en puerto ${PORT}`);
