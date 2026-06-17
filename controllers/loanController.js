@@ -617,6 +617,184 @@ exports.payLoan = async (req, res) => {
 };
 
 // ══════════════════════════════════════════════════════════════
+// ADMIN: POST /api/admin/loans/:id/payment
+// Registra un ABONO EXTERNO (el cliente pagó por fuera: efectivo,
+// transferencia, etc.). NO toca el balance del cliente en la plataforma.
+// Misma lógica prorrateada que payLoan: cubre interés primero, lo que
+// sobra baja capital, y si no alcanza, capitaliza. Reinicia el reloj.
+// Body: { amount, notes? }
+// ══════════════════════════════════════════════════════════════
+exports.adminLoanPayment = async (req, res) => {
+    const connection = await pool.getConnection();
+    try {
+        await connection.beginTransaction();
+
+        const loanId = req.params.id;
+        const { amount: rawAmount, notes } = req.body;
+        const amount = parseFloat(rawAmount);
+
+        if (!loanId || !amount || isNaN(amount) || amount < 1000) {
+            await connection.rollback();
+            return res.status(400).json({ error: 'Monto mínimo de abono: $1.000 COP' });
+        }
+
+        const [loanRows] = await connection.execute(
+            `SELECT * FROM loan_requests WHERE id = ? AND status IN ('active', 'overdue')`,
+            [loanId]
+        );
+        if (!loanRows.length) {
+            await connection.rollback();
+            return res.status(404).json({ error: 'Préstamo no encontrado o no está activo' });
+        }
+        const loan = loanRows[0];
+        const userId = loan.user_id;
+
+        const originalCapital = parseFloat(loan.amount);
+        const pendingCapital  = (loan.approved_amount !== null && loan.approved_amount !== undefined)
+            ? parseFloat(loan.approved_amount)
+            : originalCapital;
+        const loanRate = parseFloat(loan.approved_rate || loan.monthly_rate || 4);
+
+        // ─── Fecha de corte (último pago O inicio del préstamo) ───
+        let cutoffDate = loan.start_date ? new Date(loan.start_date) : new Date(loan.created_at);
+        try {
+            const [lastPay] = await connection.execute(
+                `SELECT created_at FROM loan_payments WHERE loan_id = ? ORDER BY created_at DESC LIMIT 1`,
+                [loanId]
+            );
+            if (lastPay.length) cutoffDate = new Date(lastPay[0].created_at);
+        } catch (e) {}
+
+        const now = new Date();
+        const secondsElapsed = Math.max(0, (now - cutoffDate) / 1000);
+
+        // ─── Interés acumulado real (prorrateado) ───
+        const interestAccrued = Math.round(
+            pendingCapital * (loanRate / 100) * (secondsElapsed / SECONDS_PER_MONTH)
+        );
+
+        // ─── Cálculo del abono (interés primero, resto a capital; si no alcanza, capitaliza) ───
+        let interestCovered, capitalReduced, newPendingCapital;
+        if (amount >= interestAccrued) {
+            interestCovered   = interestAccrued;
+            capitalReduced    = Math.max(0, amount - interestCovered);
+            newPendingCapital = Math.max(0, pendingCapital - capitalReduced);
+        } else {
+            interestCovered   = amount;
+            const interestUncovered = interestAccrued - amount;
+            capitalReduced    = 0;
+            newPendingCapital = pendingCapital + interestUncovered;
+        }
+        const isFullyPaid = newPendingCapital <= 0;
+
+        // NOTA: abono EXTERNO → NO se valida ni descuenta balance del cliente,
+        // y NO se crea transacción 'withdraw'. Solo se registra el pago.
+
+        // ─── Comisión de referido (5% de intereses cubiertos) ───
+        let referralCommission = 0;
+        let referrerId = null;
+        const [refCheck] = await connection.execute('SELECT referred_by FROM users WHERE id = ?', [userId]);
+        if (refCheck.length && refCheck[0].referred_by && interestCovered > 0) {
+            referrerId         = refCheck[0].referred_by;
+            referralCommission = Math.round(interestCovered * 0.05);
+        }
+
+        const refId = 'PAY-' + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2, 5).toUpperCase();
+
+        // ─── Registrar en loan_payments ───
+        await connection.execute(
+            `INSERT INTO loan_payments (loan_id, user_id, amount, interest_amount, capital_amount, remaining_capital, loan_rate, ref_id, is_fully_paid, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())`,
+            [loanId, userId, amount, interestCovered, capitalReduced, newPendingCapital, loanRate, refId, isFullyPaid ? 1 : 0]
+        );
+
+        // ─── Comisión al referidor (sí entra a su balance) ───
+        if (referrerId && referralCommission >= 100) {
+            const referralRefId = 'REF-' + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2, 5).toUpperCase();
+            try {
+                await connection.execute(
+                    `INSERT INTO referral_commissions (referrer_id, referred_id, source_type, source_id, source_amount, commission_rate, commission_amount, status, ref_id)
+                     VALUES (?, ?, 'loan_interest', ?, ?, 0.05, ?, 'paid', ?)`,
+                    [referrerId, userId, loanId, interestCovered, referralCommission, referralRefId]
+                );
+            } catch (e) { console.error('Error registrando comisión referido (admin abono):', e.message); }
+
+            await connection.execute(
+                `INSERT INTO transactions (user_id, type, amount, description, ref_id, created_at) VALUES (?, 'profit', ?, ?, ?, NOW())`,
+                [referrerId, referralCommission, `Comisión referido — 5% intereses préstamo`, referralRefId]
+            );
+        }
+
+        // ─── Actualizar préstamo ───
+        const daysElapsed = Math.floor(secondsElapsed / 86400);
+        const capitalizedNote = (amount < interestAccrued)
+            ? ` | Capitalizado: $${Math.round(interestAccrued - amount).toLocaleString('es-CO')}`
+            : '';
+        const extraNote = notes ? ` (${String(notes).slice(0, 80)})` : '';
+        const abonoNote = ` | ABONO EXTERNO $${Math.round(amount).toLocaleString('es-CO')} ${now.toISOString().slice(0, 10)} ref:${refId} (${daysElapsed}d, interes:$${Math.round(interestCovered).toLocaleString('es-CO')} capital:$${Math.round(capitalReduced).toLocaleString('es-CO')}${capitalizedNote})${extraNote}`;
+
+        if (isFullyPaid) {
+            await connection.execute(
+                `UPDATE loan_requests SET approved_amount = 0, status = 'paid',
+                 admin_notes = CONCAT(IFNULL(admin_notes,''), ?), processed_at = NOW() WHERE id = ?`,
+                [abonoNote + ' | PAGADO COMPLETO', loanId]
+            );
+        } else {
+            await connection.execute(
+                `UPDATE loan_requests SET approved_amount = ?,
+                 admin_notes = CONCAT(IFNULL(admin_notes,''), ?) WHERE id = ?`,
+                [newPendingCapital, abonoNote, loanId]
+            );
+        }
+
+        // El balance del cliente NO cambia (abono externo). Solo recalculamos
+        // el del referidor si recibió comisión.
+        if (referrerId && referralCommission >= 100) {
+            await recalculateAndSaveBalance(connection, referrerId);
+        }
+
+        await connection.commit();
+
+        const [userRows] = await pool.execute(`SELECT full_name FROM users WHERE id = ?`, [userId]);
+        try {
+            await notify(
+                `💵 *ABONO EXTERNO A PRÉSTAMO (admin) — Sanse Capital*\n\n` +
+                `👤 *${userRows[0]?.full_name || 'Usuario'}*\n` +
+                `💰 Abono: *$${Math.round(amount).toLocaleString('es-CO')} COP*\n` +
+                `📊 Intereses (${daysElapsed}d): $${Math.round(interestAccrued).toLocaleString('es-CO')}\n` +
+                `   └ Cubiertos: $${Math.round(interestCovered).toLocaleString('es-CO')}\n` +
+                `📉 Capital reducido: $${Math.round(capitalReduced).toLocaleString('es-CO')}\n` +
+                `🏦 Capital pendiente: $${Math.round(newPendingCapital).toLocaleString('es-CO')} COP\n` +
+                `${(amount < interestAccrued) ? `⚠️ Interés capitalizado: $${Math.round(interestAccrued - amount).toLocaleString('es-CO')}\n` : ''}` +
+                `${isFullyPaid ? '✅ *PRÉSTAMO PAGADO COMPLETAMENTE*\n' : ''}` +
+                `🔖 Ref abono: ${refId}`
+            );
+        } catch (e) {}
+
+        res.json({
+            message: isFullyPaid ? '¡Préstamo pagado completamente! 🎉' : 'Abono externo registrado exitosamente',
+            payment: {
+                amount,
+                interestAccrued,
+                interestCovered,
+                interestCapitalized: Math.max(0, interestAccrued - amount),
+                capitalReduced,
+                daysElapsed,
+                refId,
+                remainingCapital: newPendingCapital,
+                isFullyPaid,
+            },
+        });
+    } catch (error) {
+        await connection.rollback();
+        console.error('Error abono externo admin:', error);
+        res.status(500).json({ error: 'Error interno del servidor' });
+    } finally {
+        connection.release();
+    }
+};
+
+// ══════════════════════════════════════════════════════════════
 // ADMIN: GET /api/admin/loans/payments — Todos los pagos de préstamos
 // ══════════════════════════════════════════════════════════════
 exports.adminGetLoanPayments = async (req, res) => {

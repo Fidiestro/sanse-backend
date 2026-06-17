@@ -89,12 +89,14 @@ router.get('/users', async (req, res) => {
             );
             const now = new Date();
             loanRows.forEach(l => {
-                let months = 0;
+                let interest = 0;
                 if (l.start_date) {
                     const start = new Date(l.start_date);
-                    if (!isNaN(start)) months = Math.floor(Math.max(0, (now - start) / (1000*60*60*24)) / 30);
+                    if (!isNaN(start)) {
+                        const days = Math.max(0, Math.floor((now - start) / (1000*60*60*24)));
+                        interest = Math.round(parseFloat(l.capital || 0) * (parseFloat(l.rate || 0) / 100) * (days / 30));
+                    }
                 }
-                const interest = Math.round(parseFloat(l.capital || 0) * (parseFloat(l.rate || 0) / 100) * months);
                 loanMap[l.user_id] = (loanMap[l.user_id] || 0) + interest;
             });
         } catch (e) {
@@ -179,12 +181,13 @@ router.get('/global-summary', async (req, res) => {
             );
             const now = new Date();
             loanRows.forEach(l => {
-                let months = 0;
                 if (l.start_date) {
                     const start = new Date(l.start_date);
-                    if (!isNaN(start)) months = Math.floor(Math.max(0, (now - start) / (1000*60*60*24)) / 30);
+                    if (!isNaN(start)) {
+                        const days = Math.max(0, Math.floor((now - start) / (1000*60*60*24)));
+                        totalIntereses += Math.round(parseFloat(l.capital || 0) * (parseFloat(l.rate || 0) / 100) * (days / 30));
+                    }
                 }
-                totalIntereses += Math.round(parseFloat(l.capital || 0) * (parseFloat(l.rate || 0) / 100) * months);
             });
         } catch (e) {
             console.warn('[global-summary] intereses:', e.message);
@@ -297,24 +300,26 @@ router.get('/users/:id/details', async (req, res) => {
             console.warn('[users/:id/details] loan_requests no disponible:', e.message);
         }
 
-        // Intereses acumulados por préstamo = interés mensual × meses transcurridos desde start_date
+        // Intereses acumulados por préstamo = interés mensual × (días transcurridos / 30)
+        // Cálculo PROPORCIONAL por días reales desde start_date (no espera meses completos).
         const _now = new Date();
         loans = loans.map(l => {
             const capital = (l.approved_amount !== null && l.approved_amount !== undefined)
                 ? parseFloat(l.approved_amount)
                 : parseFloat(l.amount || 0);
             const rate = parseFloat(l.approved_rate || l.monthly_rate || 0);
+            let daysElapsed = 0;
             let monthsElapsed = 0;
             let accruedInterest = 0;
             if ((l.status === 'active' || l.status === 'overdue') && l.start_date) {
                 const start = new Date(l.start_date);
                 if (!isNaN(start)) {
-                    const days = Math.max(0, (_now - start) / (1000 * 60 * 60 * 24));
-                    monthsElapsed = Math.floor(days / 30);
-                    accruedInterest = Math.round(capital * (rate / 100) * monthsElapsed);
+                    daysElapsed = Math.max(0, Math.floor((_now - start) / (1000 * 60 * 60 * 24)));
+                    monthsElapsed = Math.floor(daysElapsed / 30);
+                    accruedInterest = Math.round(capital * (rate / 100) * (daysElapsed / 30));
                 }
             }
-            return { ...l, monthsElapsed, accruedInterest };
+            return { ...l, daysElapsed, monthsElapsed, accruedInterest };
         });
 
         // Depósitos con comprobante (deposit_requests)
@@ -445,6 +450,7 @@ router.post('/withdrawals/:id/process', withdrawalController.adminProcessWithdra
 // === SOLICITUDES DE PRÉSTAMO (ADMIN) ===
 router.get('/loans', loanController.adminGetLoans);
 router.post('/loans/:id/process', loanController.adminProcessLoan);
+router.post('/loans/:id/payment', loanController.adminLoanPayment);
 router.get('/users/:userId/credit-score', loanController.adminGetCreditScore);
 
 // === SOLICITUDES DE DEPÓSITO (ADMIN + P2P) ===
