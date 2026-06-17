@@ -58,15 +58,160 @@ router.get('/users', async (req, res) => {
                 COALESCE((
                     SELECT COUNT(*) FROM loan_requests lr
                     WHERE lr.user_id = u.id AND lr.status IN ('active','overdue')
-                ), 0) AS activeLoansCount
+                ), 0) AS activeLoansCount,
+                -- Ahorros = depósitos
+                COALESCE((SELECT SUM(amount) FROM transactions
+                          WHERE user_id = u.id AND type = 'deposit'), 0) AS ahorros,
+                -- Retirado = retiros
+                COALESCE((SELECT SUM(ABS(amount)) FROM transactions
+                          WHERE user_id = u.id AND type = 'withdraw'), 0) AS totalWithdrawn,
+                -- Préstamos = capital pendiente de préstamos activos/mora
+                COALESCE((SELECT SUM(COALESCE(lr.approved_amount, lr.amount))
+                          FROM loan_requests lr
+                          WHERE lr.user_id = u.id AND lr.status IN ('active','overdue')), 0) AS prestamos,
+                -- Ganancias = rendimientos/ganancias pagadas al usuario
+                COALESCE((SELECT SUM(amount) FROM transactions
+                          WHERE user_id = u.id AND type IN ('profit','interest','investment_return')), 0) AS ganancias
             FROM users u
             WHERE u.role = 'client'
             ORDER BY u.created_at DESC
         `);
-        res.json(rows);
+
+        // Intereses cobrados (acumulado teórico) por préstamos activos:
+        // interés mensual × meses transcurridos desde start_date.
+        let loanMap = {};
+        try {
+            const [loanRows] = await db.execute(
+                `SELECT user_id, COALESCE(approved_amount, amount) AS capital,
+                        COALESCE(approved_rate, monthly_rate, 0) AS rate, start_date, status
+                 FROM loan_requests WHERE status IN ('active','overdue')`
+            );
+            const now = new Date();
+            loanRows.forEach(l => {
+                let months = 0;
+                if (l.start_date) {
+                    const start = new Date(l.start_date);
+                    if (!isNaN(start)) months = Math.floor(Math.max(0, (now - start) / (1000*60*60*24)) / 30);
+                }
+                const interest = Math.round(parseFloat(l.capital || 0) * (parseFloat(l.rate || 0) / 100) * months);
+                loanMap[l.user_id] = (loanMap[l.user_id] || 0) + interest;
+            });
+        } catch (e) {
+            console.warn('[admin/users] intereses préstamos:', e.message);
+        }
+
+        const out = rows.map(u => {
+            const balance   = parseFloat(u.balance || 0);
+            const prestamos = parseFloat(u.prestamos || 0);
+            const intereses = loanMap[u.id] || 0;
+            // Estado: Activo si tiene préstamo activo o saldo positivo; Inactivo si no
+            const estado = (prestamos > 0 || balance > 0) ? 'active' : 'inactive';
+            return {
+                ...u,
+                balance,
+                ahorros: parseFloat(u.ahorros || 0),
+                totalWithdrawn: parseFloat(u.totalWithdrawn || 0),
+                prestamos,
+                ganancias: parseFloat(u.ganancias || 0),
+                intereses,
+                estado,
+            };
+        });
+
+        res.json(out);
     } catch (e) {
         console.error('[admin/users] Error:', e.message);
         res.status(500).json({ error: 'Error al obtener usuarios' });
+    }
+});
+
+// ══════════════════════════════════════════════════════════════
+// GET /api/admin/global-summary — Resumen tipo "caja" (tu hoja)
+// Total Ahorros, Total Préstamos, Total Intereses Cobrados,
+// Total Ganancias Pagadas, Total Retiros, Balance en CAJA,
+// Dinero fondo recolectado.
+// ══════════════════════════════════════════════════════════════
+router.get('/global-summary', async (req, res) => {
+    const { pool: db } = require('../config/database');
+    try {
+        const sum1 = async (sql, params = []) => {
+            const [r] = await db.execute(sql, params);
+            return parseFloat(r[0].t || 0);
+        };
+
+        // Solo clientes (no admin/p2p)
+        const totalAhorros = await sum1(
+            `SELECT COALESCE(SUM(t.amount),0) AS t FROM transactions t
+             JOIN users u ON u.id = t.user_id
+             WHERE u.role = 'client' AND t.type = 'deposit'`
+        );
+        const totalPrestamos = await sum1(
+            `SELECT COALESCE(SUM(COALESCE(lr.approved_amount, lr.amount)),0) AS t
+             FROM loan_requests lr JOIN users u ON u.id = lr.user_id
+             WHERE u.role = 'client' AND lr.status IN ('active','overdue')`
+        );
+        const totalGanancias = await sum1(
+            `SELECT COALESCE(SUM(t.amount),0) AS t FROM transactions t
+             JOIN users u ON u.id = t.user_id
+             WHERE u.role = 'client' AND t.type IN ('profit','interest','investment_return')`
+        );
+        const totalRetiros = await sum1(
+            `SELECT COALESCE(SUM(ABS(t.amount)),0) AS t FROM transactions t
+             JOIN users u ON u.id = t.user_id
+             WHERE u.role = 'client' AND t.type = 'withdraw'`
+        );
+        // Pagos recibidos (abonos a préstamos)
+        const totalAbonos = await sum1(
+            `SELECT COALESCE(SUM(t.amount),0) AS t FROM transactions t
+             JOIN users u ON u.id = t.user_id
+             WHERE u.role = 'client' AND t.type = 'payment'`
+        );
+
+        // Total Intereses Cobrados = acumulado teórico de préstamos activos
+        let totalIntereses = 0;
+        try {
+            const [loanRows] = await db.execute(
+                `SELECT COALESCE(lr.approved_amount, lr.amount) AS capital,
+                        COALESCE(lr.approved_rate, lr.monthly_rate, 0) AS rate, lr.start_date
+                 FROM loan_requests lr JOIN users u ON u.id = lr.user_id
+                 WHERE u.role = 'client' AND lr.status IN ('active','overdue')`
+            );
+            const now = new Date();
+            loanRows.forEach(l => {
+                let months = 0;
+                if (l.start_date) {
+                    const start = new Date(l.start_date);
+                    if (!isNaN(start)) months = Math.floor(Math.max(0, (now - start) / (1000*60*60*24)) / 30);
+                }
+                totalIntereses += Math.round(parseFloat(l.capital || 0) * (parseFloat(l.rate || 0) / 100) * months);
+            });
+        } catch (e) {
+            console.warn('[global-summary] intereses:', e.message);
+        }
+
+        // Dinero fondo recolectado = capital activo en Fondo DGP (Pool)
+        const dineroFondo = await sum1(
+            `SELECT COALESCE(SUM(i.amount),0) AS t FROM investments i
+             JOIN users u ON u.id = i.user_id
+             WHERE u.role = 'client' AND LOWER(i.type) LIKE '%pool%' AND i.status = 'active'`
+        );
+
+        // Balance en CAJA = Ahorros − Préstamos activos (tu fila naranja)
+        const balanceCaja = totalAhorros - totalPrestamos;
+
+        res.json({
+            totalAhorros,
+            totalPrestamos,
+            totalIntereses,
+            totalGanancias,
+            totalRetiros,
+            totalAbonos,
+            balanceCaja,
+            dineroFondo,
+        });
+    } catch (e) {
+        console.error('[admin/global-summary] Error:', e.message);
+        res.status(500).json({ error: 'Error al calcular el resumen global' });
     }
 });
 
