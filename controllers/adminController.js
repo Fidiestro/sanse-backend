@@ -262,16 +262,11 @@ exports.registerInvestmentReturn = async (req, res) => {
         const investment = invRows[0];
         if (investment.status !== 'active') { await connection.rollback(); return res.status(400).json({ error: 'La inversión no está activa' }); }
 
-        // FIX: CDTC ya no se registra manualmente — su rendimiento es automático
-        // (2% mensual fijo, cliente hace claim desde el dashboard cada 24h).
-        // Este endpoint queda solo para Pool, cuya tasa es variable.
-        const adminInvType = (investment.type || '').toLowerCase();
-        if (adminInvType !== 'pool') {
-            await connection.rollback();
-            return res.status(400).json({
-                error: 'Las inversiones CDTC ya no requieren registro manual. Generan 2% mensual automático y el cliente reclama desde su dashboard.',
-            });
-        }
+        // Tipo de inversión: Pool (Fondo DGP) vs LP COP (CDTC).
+        // AMBOS se registran manualmente con la tasa que escribe el admin.
+        const invType = (investment.type || '').toLowerCase();
+        const isPool  = invType === 'pool';
+        const label   = isPool ? 'Fondo DGP' : 'LP COP';
 
         const [existingReturn] = await connection.execute(
             `SELECT id FROM investment_returns WHERE investment_id = ? AND period_month = ?`, [investmentId, periodMonthDB]
@@ -281,29 +276,38 @@ exports.registerInvestmentReturn = async (req, res) => {
         const capitalBase       = parseFloat(investment.amount);
         const grossAmountEarned = Math.round(capitalBase * (rate / 100));
 
-        // FIX UNIFICADO (Pool + CDTC):
-        // Ambos tipos acumulan el rendimiento BRUTO en withdrawable_earnings.
-        // El cliente decide cuándo hacer claim, y allí se aplican los descuentos:
-        //   - Pool: 20% Sanse + 5% referido (si aplica)
-        //   - CDTC: solo 5% referido (si aplica)
+        // ── Inserción según el tipo, para NO romper el claim de cada producto ──
         // El admin NO acredita al balance al registrar, NO procesa referidos.
-        const invType = (investment.type || '').toLowerCase();
-        const isPool = invType === 'pool';
-        const label  = isPool ? 'Pool' : 'CDTC';
-
-        const [returnResult] = await connection.execute(
-            `INSERT INTO investment_returns (investment_id, user_id, period_month, rate_applied, amount_earned, status, notes)
-             VALUES (?, ?, ?, ?, ?, 'paid', ?)`,
-            [investmentId, investment.user_id, periodMonthDB, rate, grossAmountEarned,
-             notes || `Rendimiento ${label} ${rate}% mes ${periodMonth} — Acumulado para claim`]
-        );
-
-        await connection.execute(
-            `UPDATE investments
-             SET withdrawable_earnings = COALESCE(withdrawable_earnings, 0) + ?
-             WHERE id = ?`,
-            [grossAmountEarned, investmentId]
-        );
+        // Los descuentos (Pool 20% + 5% referido; LP COP 5% referido) se aplican
+        // cuando el CLIENTE hace claim desde su dashboard.
+        //
+        //   • Pool (DGP): el claim lee investments.withdrawable_earnings.
+        //     → status='paid' + acumula en withdrawable_earnings.
+        //   • LP COP: el claim lee investment_returns con status='accrued'.
+        //     → status='accrued', SIN tocar withdrawable_earnings.
+        let returnResult;
+        if (isPool) {
+            [returnResult] = await connection.execute(
+                `INSERT INTO investment_returns (investment_id, user_id, period_month, rate_applied, amount_earned, status, notes)
+                 VALUES (?, ?, ?, ?, ?, 'paid', ?)`,
+                [investmentId, investment.user_id, periodMonthDB, rate, grossAmountEarned,
+                 notes || `Rendimiento ${label} ${rate}% mes ${periodMonth} — Acumulado para claim`]
+            );
+            await connection.execute(
+                `UPDATE investments
+                 SET withdrawable_earnings = COALESCE(withdrawable_earnings, 0) + ?
+                 WHERE id = ?`,
+                [grossAmountEarned, investmentId]
+            );
+        } else {
+            // LP COP — mismo formato que el devengo manual (status='accrued').
+            [returnResult] = await connection.execute(
+                `INSERT INTO investment_returns (investment_id, user_id, period_month, rate_applied, amount_earned, status, notes)
+                 VALUES (?, ?, ?, ?, ?, 'accrued', ?)`,
+                [investmentId, investment.user_id, periodMonthDB, rate, grossAmountEarned,
+                 notes || `Rendimiento ${label} ${rate}% mes ${periodMonth} — Acumulado para claim`]
+            );
+        }
 
         await connection.commit();
         return res.status(201).json({
@@ -533,6 +537,7 @@ exports.editTransaction = async (req, res) => {
     }
 };
 
+
 // POST /api/admin/investments/:id/cancel
 exports.adminCancelInvestment = async (req, res) => {
     const connection = await pool.getConnection();
@@ -566,6 +571,88 @@ exports.adminCancelInvestment = async (req, res) => {
         await connection.rollback();
         console.error('Error admin cancel investment:', error);
         res.status(500).json({ error: 'Error interno' });
+    } finally {
+        connection.release();
+    }
+};
+
+// POST /api/admin/investments/:id/revoke
+// Revoca una inversión (LP COP o Pool). Marca 'cancelled', limpia los
+// rendimientos acumulados y, si refundCapital=true, devuelve el capital
+// al balance del usuario (eliminando la transacción 'investment' que lo
+// había descontado). Si refundCapital=false, el capital NO se devuelve.
+exports.adminRevokeInvestment = async (req, res) => {
+    const connection = await pool.getConnection();
+    try {
+        await connection.beginTransaction();
+
+        const invId = req.params.id;
+        const refundCapital = req.body.refundCapital === true || req.body.refundCapital === 'true';
+        const notes = (req.body.notes ? String(req.body.notes).slice(0, 120) : '').trim();
+
+        const [invRows] = await connection.execute(
+            `SELECT * FROM investments WHERE id = ? AND status IN ('active', 'pending_deposit')`, [invId]
+        );
+        if (!invRows.length) {
+            await connection.rollback();
+            return res.status(404).json({ error: 'Inversión no encontrada o ya cancelada/completada' });
+        }
+        const inv = invRows[0];
+
+        // 1. Marcar la inversión como cancelada
+        const note = ` | ADMIN REVOKE${refundCapital ? ' (capital devuelto)' : ' (sin devolver capital)'}: ${notes || 'sin motivo'} — ${new Date().toISOString().slice(0, 16)}`;
+        await connection.execute(
+            `UPDATE investments SET status = 'cancelled', notes = CONCAT(IFNULL(notes,''), ?) WHERE id = ?`,
+            [note, invId]
+        );
+
+        // 2. Limpiar rendimientos acumulados de esta inversión (evita rendimientos fantasma reclamables).
+        //    Solo se borran los que aún NO han sido reclamados (accrued); los ya pagados quedan como histórico.
+        try {
+            await connection.execute(
+                `DELETE FROM investment_returns WHERE investment_id = ? AND status = 'accrued'`, [invId]
+            );
+        } catch (e) { console.warn('[revoke] no se pudieron limpiar investment_returns:', e.message); }
+
+        // 3. Devolver capital si corresponde:
+        //    La transacción tipo 'investment' fue la que descontó el capital del balance.
+        //    Borrarla hace que, al recalcular, el capital vuelva a estar disponible.
+        if (refundCapital) {
+            await connection.execute(
+                `DELETE FROM transactions WHERE investment_id = ? AND type = 'investment'`, [invId]
+            );
+        }
+
+        // 4. Recalcular balance (refleja la devolución si la hubo)
+        const newBalance = await recalculateAndSaveBalance(connection, inv.user_id);
+
+        // 5. Audit log (no bloquea)
+        try {
+            await auditLog({
+                userId: req.user?.id,
+                action: 'investment_revoke',
+                entityType: 'investments',
+                entityId: invId,
+                details: { refundCapital, notes: notes || null, amount: parseFloat(inv.amount), type: inv.type },
+                ipAddress: req.ip,
+            });
+        } catch (e) { console.error('[auditLog revoke]', e.message); }
+
+        await connection.commit();
+
+        res.json({
+            message: refundCapital
+                ? 'Inversión revocada. Capital devuelto al balance del usuario.'
+                : 'Inversión revocada sin devolver capital.',
+            userId: inv.user_id,
+            amount: parseFloat(inv.amount),
+            refundCapital,
+            newBalance,
+        });
+    } catch (error) {
+        await connection.rollback();
+        console.error('Error admin revoke investment:', error);
+        res.status(500).json({ error: 'Error interno del servidor' });
     } finally {
         connection.release();
     }

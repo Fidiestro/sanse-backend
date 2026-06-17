@@ -234,6 +234,7 @@ router.get('/investments/active', adminController.getActiveInvestments);
 router.post('/investments', adminController.createInvestment);
 router.post('/investments/:investmentId/return', adminController.registerInvestmentReturn);
 router.post('/investments/:id/cancel', adminController.adminCancelInvestment);
+router.post('/investments/:id/revoke', adminController.adminRevokeInvestment);
 router.delete('/investments/:id', adminController.deleteInvestment);
 
 // Balance
