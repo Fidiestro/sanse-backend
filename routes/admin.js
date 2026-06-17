@@ -78,6 +78,7 @@ router.get('/transactions/recent', adminController.getRecentTransactions);
 router.get('/transactions/all', adminController.getAllTransactions);
 router.post('/transactions', adminController.createTransaction);
 router.delete('/transactions/:id', adminController.deleteTransaction);
+router.put('/transactions/:id', adminController.editTransaction);
 
 // Inversiones — rutas específicas ANTES que las parametrizadas
 router.get('/investments/active', adminController.getActiveInvestments);
@@ -120,13 +121,45 @@ router.get('/users/:id/details', async (req, res) => {
         let loans = [];
         try {
             const [loanRows] = await db.execute(
-                `SELECT id, ref_id, amount, approved_amount, monthly_rate, term_months,
+                `SELECT id, ref_id, amount, approved_amount, monthly_rate, approved_rate, term_months,
                         start_date, due_date, status, admin_notes, created_at
                  FROM loan_requests WHERE user_id = ? ORDER BY created_at DESC`, [userId]
             );
             loans = loanRows;
         } catch (e) {
             console.warn('[users/:id/details] loan_requests no disponible:', e.message);
+        }
+
+        // Intereses acumulados por préstamo = interés mensual × meses transcurridos desde start_date
+        const _now = new Date();
+        loans = loans.map(l => {
+            const capital = (l.approved_amount !== null && l.approved_amount !== undefined)
+                ? parseFloat(l.approved_amount)
+                : parseFloat(l.amount || 0);
+            const rate = parseFloat(l.approved_rate || l.monthly_rate || 0);
+            let monthsElapsed = 0;
+            let accruedInterest = 0;
+            if ((l.status === 'active' || l.status === 'overdue') && l.start_date) {
+                const start = new Date(l.start_date);
+                if (!isNaN(start)) {
+                    const days = Math.max(0, (_now - start) / (1000 * 60 * 60 * 24));
+                    monthsElapsed = Math.floor(days / 30);
+                    accruedInterest = Math.round(capital * (rate / 100) * monthsElapsed);
+                }
+            }
+            return { ...l, monthsElapsed, accruedInterest };
+        });
+
+        // Depósitos con comprobante (deposit_requests)
+        let deposits = [];
+        try {
+            const [depRows] = await db.execute(
+                `SELECT id, amount, note, status, ref_id, proof_image, created_at
+                 FROM deposit_requests WHERE user_id = ? ORDER BY created_at DESC`, [userId]
+            );
+            deposits = depRows;
+        } catch (e) {
+            console.warn('[users/:id/details] deposit_requests no disponible:', e.message);
         }
 
         // Balance fresco calculado igual que /admin/users
@@ -142,13 +175,82 @@ router.get('/users/:id/details', async (req, res) => {
         );
         const freshBalance = Math.max(0, parseFloat(inRows[0].total) - parseFloat(outRows[0].total));
 
+        // ── RESUMEN FINANCIERO (mapea la hoja de Excel) ──
+        const sumType = async (types) => {
+            const ph = types.map(() => '?').join(',');
+            const [r] = await db.execute(
+                `SELECT COALESCE(SUM(ABS(amount)),0) AS t FROM transactions
+                 WHERE user_id = ? AND type IN (${ph})`, [userId, ...types]
+            );
+            return parseFloat(r[0].t);
+        };
+        // Total Ahorros = depósitos
+        const totalDeposited = await sumType(['deposit']);
+        // Retiros Entregados = retiros
+        const totalWithdrawn = await sumType(['withdraw']);
+        // Total Préstamos Otorgados = transacciones tipo loan
+        const totalLoansGiven = await sumType(['loan']);
+        // Pagos recibidos (abonos a préstamos)
+        const totalLoanPayments = await sumType(['payment']);
+        // Ganancias Realizadas = rendimientos/intereses/ganancias pagadas al usuario
+        const totalEarningsPaid = await sumType(['profit', 'interest', 'investment_return']);
+
+        // Préstamos Activos = capital pendiente de préstamos activos/mora
+        const activeLoans = loans.filter(l => l.status === 'active' || l.status === 'overdue');
+        const activeLoanCapital = activeLoans.reduce(
+            (s, l) => s + parseFloat(l.approved_amount != null ? l.approved_amount : (l.amount || 0)), 0
+        );
+        // Intereses cobrados acumulados (teórico) de préstamos activos
+        const totalLoanInterestAccrued = activeLoans.reduce((s, l) => s + parseFloat(l.accruedInterest || 0), 0);
+
+        // ¿Cliente en inversión? (tasa 4% si tiene inversión activa, 6% si no — como en tu hoja)
+        const hasActiveInvestment = investments.some(i => i.status === 'active');
+
+        // Ganancias SIN retirar — LP COP (CDTC) acumuladas no reclamadas
+        let unclaimedLP = 0;
+        try {
+            const [lp] = await db.execute(
+                `SELECT COALESCE(SUM(ir.amount_earned),0) AS t
+                 FROM investment_returns ir
+                 JOIN investments i ON ir.investment_id = i.id
+                 WHERE i.user_id = ? AND ir.status = 'accrued'
+                   AND (i.type IS NULL OR LOWER(i.type) NOT LIKE '%pool%')`, [userId]
+            );
+            unclaimedLP = parseFloat(lp[0].t);
+        } catch (e) { console.warn('[users/:id/details] unclaimedLP:', e.message); }
+
+        // Ganancias SIN retirar — Fondo DGP (Pool) retirable
+        let unclaimedPool = 0;
+        try {
+            const [pl] = await db.execute(
+                `SELECT COALESCE(SUM(withdrawable_earnings),0) AS t
+                 FROM investments
+                 WHERE user_id = ? AND LOWER(type) LIKE '%pool%' AND status = 'active'`, [userId]
+            );
+            unclaimedPool = parseFloat(pl[0].t);
+        } catch (e) { console.warn('[users/:id/details] unclaimedPool:', e.message); }
+
         res.json({
             user: userRows[0],
             investments,
             transactions,
             balanceHistory,
             loans,
+            deposits,
             freshBalance,
+            summary: {
+                hasActiveInvestment,
+                interestRate: hasActiveInvestment ? 4.0 : 6.0,
+                totalDeposited,
+                totalWithdrawn,
+                totalLoansGiven,
+                totalLoanPayments,
+                totalEarningsPaid,
+                activeLoanCapital,
+                totalLoanInterestAccrued,
+                unclaimedLP,
+                unclaimedPool,
+            },
         });
     } catch (error) {
         console.error('[users/:id/details]', error);

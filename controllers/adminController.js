@@ -472,6 +472,67 @@ exports.deleteTransaction = async (req, res) => {
     }
 };
 
+// PUT /api/admin/transactions/:id
+// Edita una transacción (type, amount, description, date) y recalcula el balance.
+// Solo actualiza los campos enviados (aditivo / no destructivo).
+exports.editTransaction = async (req, res) => {
+    const connection = await pool.getConnection();
+    try {
+        await connection.beginTransaction();
+
+        const txId = req.params.id;
+        const { type, amount, description, date } = req.body;
+
+        const [rows] = await connection.execute('SELECT user_id FROM transactions WHERE id = ?', [txId]);
+        if (!rows.length) {
+            await connection.rollback();
+            return res.status(404).json({ error: 'Transacción no encontrada' });
+        }
+        const ownerId = rows[0].user_id;
+
+        if (type !== undefined && !isValidTransactionType(type)) {
+            await connection.rollback();
+            return res.status(400).json({
+                error: `Tipo de transacción inválido: "${type}". Tipos válidos: deposit, payment, interest, profit, investment_return, investment_withdrawal, loan, withdraw, investment, fee`,
+            });
+        }
+        if (amount !== undefined && isNaN(Number(amount))) {
+            await connection.rollback();
+            return res.status(400).json({ error: 'Monto inválido' });
+        }
+
+        const sets = [];
+        const params = [];
+        if (type !== undefined)        { sets.push('type = ?');        params.push(type); }
+        if (amount !== undefined)      { sets.push('amount = ?');      params.push(Number(amount)); }
+        if (description !== undefined) { sets.push('description = ?'); params.push(description || null); }
+        if (date !== undefined && date) {
+            const createdAt = new Date(date).toISOString().slice(0, 19).replace('T', ' ');
+            sets.push('created_at = ?');
+            params.push(createdAt);
+        }
+
+        if (!sets.length) {
+            await connection.rollback();
+            return res.status(400).json({ error: 'No hay cambios para aplicar' });
+        }
+
+        params.push(txId);
+        await connection.execute(`UPDATE transactions SET ${sets.join(', ')} WHERE id = ?`, params);
+
+        const newBalance = await recalculateAndSaveBalance(connection, ownerId);
+
+        await connection.commit();
+        res.json({ message: 'Transacción actualizada y balance recalculado', userId: ownerId, newBalance });
+    } catch (error) {
+        await connection.rollback();
+        console.error('Error editando transacción:', error);
+        res.status(500).json({ error: 'Error interno del servidor' });
+    } finally {
+        connection.release();
+    }
+};
+
 // POST /api/admin/investments/:id/cancel
 exports.adminCancelInvestment = async (req, res) => {
     const connection = await pool.getConnection();
