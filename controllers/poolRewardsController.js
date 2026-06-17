@@ -253,3 +253,187 @@ exports.applyBulkReward = async (req, res) => {
         connection.release();
     }
 };
+
+// ══════════════════════════════════════════════════════════════════════
+// RECOMPENSA MASIVA — LP COP (CDTC)
+// ──────────────────────────────────────────────────────────────────────
+// A diferencia del Pool, LP COP acumula en investment_returns con
+// status='accrued' (NO toca withdrawable_earnings). El cliente reclama
+// vía /investments/lp/claim. Así NO se mezclan los mecanismos de claim.
+// ══════════════════════════════════════════════════════════════════════
+
+// GET /api/admin/lp/reward-preview?rate=X&periodMonth=YYYY-MM
+exports.previewBulkRewardLP = async (req, res) => {
+    try {
+        const rate = parseFloat(req.query.rate);
+        const periodMonthRaw = req.query.periodMonth;
+        const periodMonth = normalizePeriodMonth(periodMonthRaw);
+
+        if (!rate || isNaN(rate) || rate <= 0 || rate > 100) {
+            return res.status(400).json({ error: 'Tasa inválida (0-100)' });
+        }
+
+        // LP COP activos (todo lo que NO sea pool)
+        const [invs] = await pool.query(
+            `SELECT id, user_id, amount, net_capital
+             FROM investments
+             WHERE (type IS NULL OR LOWER(type) <> 'pool') AND status = 'active'
+             ORDER BY id ASC`
+        );
+
+        let alreadyPaid = [];
+        if (periodMonth && invs.length > 0) {
+            const ids = invs.map(p => p.id);
+            try {
+                const [paidRows] = await pool.query(
+                    `SELECT investment_id FROM investment_returns
+                     WHERE period_month = ? AND investment_id IN (?)`,
+                    [periodMonth, ids]
+                );
+                alreadyPaid = paidRows.map(r => r.investment_id);
+            } catch (e) {
+                console.warn('[previewBulkRewardLP] no se pudo verificar already paid:', e.message);
+            }
+        }
+
+        const eligible = invs.filter(p => !alreadyPaid.includes(p.id));
+
+        let totalCapital = 0;
+        let totalGross = 0;
+        const breakdown = eligible.map(p => {
+            const capital = parseFloat(p.amount || p.net_capital) || 0;
+            const earned = Math.round(capital * (rate / 100));
+            totalCapital += capital;
+            totalGross += earned;
+            return { investmentId: p.id, userId: p.user_id, capital, earnedGross: earned };
+        });
+
+        // LP COP solo descuenta 5% de referido al claim (no 20%)
+        const referenceCommission = Math.round(totalGross * 0.05);
+        const referenceNet = totalGross - referenceCommission;
+
+        res.json({
+            rate,
+            periodMonth: periodMonthRaw || null,
+            eligibleCount: eligible.length,
+            skippedCount: alreadyPaid.length,
+            skippedIds: alreadyPaid,
+            totalCapital,
+            totalGross,
+            referenceCommission,
+            referenceNet,
+            breakdown,
+        });
+    } catch (e) {
+        console.error('[previewBulkRewardLP] ERROR:', e.message);
+        res.status(500).json({ error: 'Error interno del servidor', details: e.message });
+    }
+};
+
+// POST /api/admin/lp/pay-returns-bulk
+// Body: { rate, periodMonth, notes? }
+exports.applyBulkRewardLP = async (req, res) => {
+    const { rate, periodMonth: periodMonthRaw, notes } = req.body;
+
+    const r = parseFloat(rate);
+    if (!r || isNaN(r) || r <= 0 || r > 100) {
+        return res.status(400).json({ error: 'Tasa inválida (0-100)' });
+    }
+    if (!periodMonthRaw || !/^\d{4}-\d{2}(-\d{2})?$/.test(periodMonthRaw)) {
+        return res.status(400).json({ error: 'periodMonth debe ser formato YYYY-MM o YYYY-MM-DD' });
+    }
+    const periodMonth = normalizePeriodMonth(periodMonthRaw);
+    if (!periodMonth) {
+        return res.status(400).json({ error: 'periodMonth con formato inválido' });
+    }
+
+    const connection = await pool.getConnection();
+    try {
+        await connection.beginTransaction();
+
+        const [invs] = await connection.query(
+            `SELECT id, user_id, amount, net_capital
+             FROM investments
+             WHERE (type IS NULL OR LOWER(type) <> 'pool') AND status = 'active'
+             FOR UPDATE`
+        );
+
+        if (!invs.length) {
+            await connection.rollback();
+            return res.status(400).json({ error: 'No hay inversiones LP COP activas' });
+        }
+
+        const ids = invs.map(p => p.id);
+        const [paidRows] = await connection.query(
+            `SELECT investment_id FROM investment_returns
+             WHERE period_month = ? AND investment_id IN (?)`,
+            [periodMonth, ids]
+        );
+        const alreadyPaidIds = new Set(paidRows.map(p => p.investment_id));
+        const eligible = invs.filter(p => !alreadyPaidIds.has(p.id));
+
+        if (!eligible.length) {
+            await connection.rollback();
+            return res.status(400).json({
+                error: `Todas las inversiones LP COP ya tienen rendimiento registrado para ${periodMonthRaw}`,
+                skipped: invs.length,
+            });
+        }
+
+        const results = [];
+        let totalGross = 0;
+
+        for (const p of eligible) {
+            const capital = parseFloat(p.amount || p.net_capital) || 0;
+            const earned = Math.round(capital * (r / 100));
+            if (earned <= 0) continue;
+
+            // LP COP → status='accrued' (NO toca withdrawable_earnings)
+            const [returnRes] = await connection.execute(
+                `INSERT INTO investment_returns
+                 (investment_id, user_id, period_month, rate_applied, amount_earned, status, notes)
+                 VALUES (?, ?, ?, ?, ?, 'accrued', ?)`,
+                [
+                    p.id, p.user_id, periodMonth, r, earned,
+                    notes ? `${notes} (bulk LP COP ${r}%)` : `Recompensa LP COP ${r}% — ${periodMonthRaw} — bulk`,
+                ]
+            );
+
+            totalGross += earned;
+            results.push({ investmentId: p.id, userId: p.user_id, capital, earned, returnId: returnRes.insertId });
+        }
+
+        try {
+            await auditLog({
+                userId: req.user.id,
+                action: 'lp_bulk_reward',
+                entityType: 'investment_returns',
+                entityId: null,
+                details: { rate: r, periodMonth: periodMonthRaw, notes: notes || null, count: results.length, skipped: alreadyPaidIds.size, totalGross },
+                ipAddress: req.ip,
+            });
+        } catch (e) {
+            console.error('[auditLog lp bulk reward]', e.message);
+        }
+
+        await connection.commit();
+
+        res.json({
+            success: true,
+            message: `Recompensa aplicada a ${results.length} inversión${results.length === 1 ? '' : 'es'} LP COP`,
+            rate: r,
+            periodMonth: periodMonthRaw,
+            applied: results.length,
+            skipped: alreadyPaidIds.size,
+            skippedIds: Array.from(alreadyPaidIds),
+            totalGross,
+            details: results,
+        });
+    } catch (e) {
+        await connection.rollback();
+        console.error('[applyBulkRewardLP] ERROR:', e.message);
+        res.status(500).json({ error: 'Error interno del servidor', details: e.message });
+    } finally {
+        connection.release();
+    }
+};

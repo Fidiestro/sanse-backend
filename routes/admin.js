@@ -6,6 +6,7 @@ const loanController = require('../controllers/loanController');
 const depositController = require('../controllers/depositController');
 const { authenticate, requireAdmin } = require('../middleware/auth');
 const supportController = require('../controllers/supportController');
+const poolRewardsController = require('../controllers/poolRewardsController');
 
 // Middleware: admin O p2p pueden acceder
 const requireAdminOrP2P = (req, res, next) => {
@@ -472,6 +473,14 @@ router.get('/pool/withdrawals', async (req, res) => {
 const referralController = require('../controllers/referralController');
 router.get('/registrations', referralController.adminGetRegistrations);
 router.post('/registrations/:id/process', referralController.adminProcessRegistration);
+
+// ══════════════════════════════════════════════════════════════
+// RECOMPENSA MASIVA — LP COP (nuevas) y Pool (respaldo)
+// LP COP: acumula en investment_returns con status='accrued'
+// Pool: acumula en withdrawable_earnings (mecanismo existente)
+// ══════════════════════════════════════════════════════════════
+router.get('/lp/reward-preview', poolRewardsController.previewBulkRewardLP);
+router.post('/lp/pay-returns-bulk', poolRewardsController.applyBulkRewardLP);
 
 // ══════════════════════════════════════════════════════════════
 // GET /api/admin/pool/strategies — Leer estrategias del pool
