@@ -76,13 +76,14 @@ app.use((err, req, res, next) => {
     res.status(500).json({ error: 'Error interno del servidor' });
 });
 
-// ═══ CRON — Devengo automático LP COP ═══
-// Corre TODOS los días a las 00:10 (hora Colombia). El devengo es
-// idempotente (usa last_accrual_period + guard en investment_returns),
-// así que solo inserta algo cuando hay meses cerrados pendientes:
-// en la práctica actúa el día 1, y los demás días no hace nada.
-// Ventaja de correrlo a diario: si el server estaba caído o
-// redeployando justo el día 1, se auto-corrige al día siguiente.
+// ═══ CRON — Devengo automático LP COP (DESACTIVADO) ═══
+// El devengo automático fue desactivado a petición. Ahora el devengo de
+// LP COP se ejecuta SOLO manualmente desde el panel de admin (botón que
+// llama a adminRunAccrual → runMonthlyAccrual). El Claim del usuario y la
+// lógica de devengo (utils/lpAccrual.js) quedan intactos.
+//
+// Para reactivar el devengo automático, descomenta el bloque de abajo.
+/*
 try {
     const cron = require('node-cron');
     cron.schedule('10 0 * * *', async () => {
@@ -101,6 +102,8 @@ try {
 } catch (e) {
     console.error('❌ node-cron no disponible (npm install node-cron):', e.message);
 }
+*/
+console.log('⏸️  Devengo automático LP COP DESACTIVADO — solo devengo manual desde admin');
 
 // ═══ START ═══
 app.listen(PORT, '0.0.0.0', () => {
