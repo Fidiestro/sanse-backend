@@ -106,9 +106,30 @@ router.get('/users/:id/details', async (req, res) => {
         );
         if (!userRows.length) return res.status(404).json({ error: 'Usuario no encontrado' });
 
-        const [investments]  = await db.execute(
+        let [investments]  = await db.execute(
             `SELECT * FROM investments WHERE user_id = ? ORDER BY start_date DESC`, [userId]
         );
+
+        // Acumulado SIN reclamar por inversión (investment_returns.status = 'accrued')
+        // Una sola query agrupada por investment_id para no consultar N veces.
+        try {
+            const [accRows] = await db.execute(
+                `SELECT ir.investment_id, COALESCE(SUM(ir.amount_earned),0) AS pending
+                 FROM investment_returns ir
+                 JOIN investments i ON i.id = ir.investment_id
+                 WHERE i.user_id = ? AND ir.status = 'accrued'
+                 GROUP BY ir.investment_id`, [userId]
+            );
+            const accMap = {};
+            accRows.forEach(a => { accMap[a.investment_id] = parseFloat(a.pending || 0); });
+            investments = investments.map(inv => ({
+                ...inv,
+                accruedPending: accMap[inv.id] || 0,
+            }));
+        } catch (e) {
+            console.warn('[users/:id/details] accruedPending por inversión:', e.message);
+        }
+
         const [transactions] = await db.execute(
             `SELECT * FROM transactions WHERE user_id = ? ORDER BY created_at DESC`, [userId]
         );
