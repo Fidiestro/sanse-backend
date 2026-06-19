@@ -104,7 +104,8 @@ exports.adminGetDeposits = async (req, res) => {
         dr.admin_notes, dr.proof_image, dr.processed_at, dr.created_at,
         u.id      AS user_id,
         u.full_name AS user_name,
-        u.email   AS user_email
+        u.email   AS user_email,
+        u.phone   AS user_phone
       FROM deposit_requests dr
       JOIN users u ON dr.user_id = u.id
     `;
