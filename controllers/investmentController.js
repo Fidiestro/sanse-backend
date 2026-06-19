@@ -1214,3 +1214,194 @@ exports.withdrawPoolEarnings = async (req, res) => {
         connection.release();
     }
 };
+
+// ═══════════════════════════════════════════════════════════════════════
+// POST /api/admin/investments/create — ADMIN crea inversión a un usuario
+// Body: { userId, type: 'cdtc'|'pool', amount, durationMonths: 6|12, startDate?, notes? }
+//
+// Replica la lógica de createUserInvestment pero:
+//   - El admin la ejecuta sobre el userId del body (no req.user.id)
+//   - Permite startDate personalizado (registrar inversiones que empezaron antes)
+//   - SÍ descuenta del saldo del usuario y valida saldo disponible
+//   - Pool aplica comisión de entrada 2% (igual que el usuario)
+//   - Respeta separación LP COP (CDTC, investment_returns) vs Pool (withdrawable_earnings)
+// ═══════════════════════════════════════════════════════════════════════
+exports.adminCreateInvestment = async (req, res) => {
+    const connection = await pool.getConnection();
+    try {
+        await connection.beginTransaction();
+
+        const { userId, type, durationMonths, notes } = req.body;
+        const amount = parseFloat(req.body.amount);
+        const rawStart = (req.body.startDate || '').toString().trim();
+
+        // ── Validaciones base ──
+        if (!userId) return res.status(400).json({ error: 'userId es requerido' });
+        if (!['cdtc', 'pool'].includes(type)) {
+            return res.status(400).json({ error: "type inválido. Usa: 'cdtc' o 'pool'" });
+        }
+        if (!amount || isNaN(amount) || amount < 50000) {
+            return res.status(400).json({ error: 'Monto mínimo $50.000 COP' });
+        }
+        const months = parseInt(durationMonths);
+        if (![3, 6, 12].includes(months)) {
+            return res.status(400).json({ error: 'Bloqueo inválido. Usa 3, 6 o 12 meses' });
+        }
+
+        // ── Verificar que el usuario exista ──
+        const [userRows] = await connection.execute('SELECT id, full_name FROM users WHERE id = ?', [userId]);
+        if (!userRows.length) {
+            await connection.rollback();
+            return res.status(404).json({ error: 'Usuario no encontrado' });
+        }
+
+        // ── Fecha de inicio (personalizable) y de bloqueo ──
+        const formatDate = (d) => d.toISOString().slice(0, 10);
+        let startDate;
+        if (rawStart) {
+            if (!/^\d{4}-\d{2}-\d{2}$/.test(rawStart)) {
+                await connection.rollback();
+                return res.status(400).json({ error: 'Fecha de inicio inválida (YYYY-MM-DD)' });
+            }
+            startDate = new Date(rawStart + 'T00:00:00');
+            if (isNaN(startDate.getTime())) {
+                await connection.rollback();
+                return res.status(400).json({ error: 'Fecha de inicio inválida' });
+            }
+        } else {
+            startDate = new Date();
+        }
+        const lockEndDate = new Date(startDate);
+        lockEndDate.setMonth(lockEndDate.getMonth() + months);
+
+        // ── Verificar saldo disponible del usuario (igual que createUserInvestment) ──
+        const inflowPH = INFLOW_TYPES.map(() => '?').join(',');
+        const outflowPH = OUTFLOW_TYPES.map(() => '?').join(',');
+        const [inRows] = await connection.execute(
+            `SELECT COALESCE(SUM(amount), 0) as total FROM transactions WHERE user_id = ? AND type IN (${inflowPH})`,
+            [userId, ...INFLOW_TYPES]
+        );
+        const [outRows] = await connection.execute(
+            `SELECT COALESCE(SUM(amount), 0) as total FROM transactions WHERE user_id = ? AND type IN (${outflowPH})`,
+            [userId, ...OUTFLOW_TYPES]
+        );
+        const totalBalance = parseFloat(inRows[0].total) - parseFloat(outRows[0].total);
+
+        const [investedRows] = await connection.execute(
+            `SELECT COALESCE(SUM(amount), 0) as total FROM investments WHERE user_id = ? AND status IN ('active', 'pending_deposit')`,
+            [userId]
+        );
+        const totalInvested = parseFloat(investedRows[0].total);
+
+        const [pendingWr] = await connection.execute(
+            `SELECT COALESCE(SUM(amount), 0) as total FROM withdrawal_requests WHERE user_id = ? AND status IN ('pending', 'approved')`,
+            [userId]
+        );
+        const pendingWithdrawalAmount = parseFloat(pendingWr[0].total);
+
+        const availableBalance = Math.max(0, totalBalance - totalInvested - pendingWithdrawalAmount);
+        if (amount > availableBalance) {
+            await connection.rollback();
+            return res.status(400).json({
+                error: `Saldo insuficiente del usuario. Disponible: $${Math.round(availableBalance).toLocaleString('es-CO')} COP`,
+                available: availableBalance,
+            });
+        }
+
+        let investmentId;
+
+        // ════════════ FONDO DGP (POOL) ════════════
+        if (type === 'pool') {
+            const entryFee = Math.round(amount * 0.02);
+            const netCapital = amount - entryFee;
+
+            const [result] = await connection.execute(
+                `INSERT INTO investments 
+                 (user_id, type, amount, net_capital, entry_fee, duration_months, 
+                  start_date, lock_end_date, invested_from_balance, status, notes, withdrawable_earnings) 
+                 VALUES (?, 'pool', ?, ?, ?, ?, ?, ?, 1, 'active', ?, 0)`,
+                [
+                    userId, amount, netCapital, entryFee, months,
+                    formatDate(startDate), formatDate(lockEndDate),
+                    `[ADMIN] Fondo DGP — Capital neto: $${netCapital.toLocaleString('es-CO')} (Comisión entrada 2%: $${entryFee.toLocaleString('es-CO')}). Bloqueo: ${formatDate(lockEndDate)}.${notes ? ' | ' + notes : ''}`,
+                ]
+            );
+            investmentId = result.insertId;
+
+            const baseRef = Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2, 5).toUpperCase();
+            // 1) Capital neto al pool
+            await connection.execute(
+                `INSERT INTO transactions (user_id, investment_id, type, amount, description, ref_id, created_at) 
+                 VALUES (?, ?, 'investment', ?, ?, ?, NOW())`,
+                [userId, investmentId, -netCapital, `Inversión Pool #${investmentId} — Capital neto al pool (admin)`, 'POOL-' + baseRef]
+            );
+            // 2) Comisión de entrada 2%
+            await connection.execute(
+                `INSERT INTO transactions (user_id, investment_id, type, amount, description, ref_id, created_at) 
+                 VALUES (?, ?, 'fee', ?, ?, ?, NOW())`,
+                [userId, investmentId, entryFee, `Comisión de entrada Pool #${investmentId} — 2% de $${amount.toLocaleString('es-CO')}`, 'FEE-' + baseRef]
+            );
+
+        // ════════════ LP COP (CDTC) ════════════
+        } else {
+            // LP COP: status 'active' directo (es registro admin), usa investment_returns para rendimientos.
+            // annual_rate = 0 y se maneja por devengo mensual 2% como el resto de LP COP.
+            const [result] = await connection.execute(
+                `INSERT INTO investments 
+                 (user_id, type, amount, annual_rate, duration_months, 
+                  start_date, lock_end_date, invested_from_balance, status, notes) 
+                 VALUES (?, 'CDTC', ?, 0, ?, ?, ?, 1, 'active', ?)`,
+                [
+                    userId, amount, months,
+                    formatDate(startDate), formatDate(lockEndDate),
+                    `[ADMIN] LP COP ${months}m — 2% mensual fijo. Inicio: ${formatDate(startDate)}, desbloqueo: ${formatDate(lockEndDate)}.${notes ? ' | ' + notes : ''}`,
+                ]
+            );
+            investmentId = result.insertId;
+
+            const refId = 'INV-' + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2, 5).toUpperCase();
+            await connection.execute(
+                `INSERT INTO transactions (user_id, investment_id, type, amount, description, ref_id, created_at) 
+                 VALUES (?, ?, 'investment', ?, ?, ?, NOW())`,
+                [userId, investmentId, -amount, `Inversión LP COP a ${months} meses (admin) — Desbloqueo: ${formatDate(lockEndDate)}`, refId]
+            );
+        }
+
+        // ── Recalcular balance del usuario ──
+        const newBalance = await recalculateAndSaveBalance(connection, userId);
+
+        // ── Audit log ──
+        try {
+            await auditLog({
+                userId: req.user.id,
+                action: 'admin_create_investment',
+                entityType: 'investment',
+                entityId: investmentId,
+                details: { targetUserId: userId, type, amount, durationMonths: months, startDate: formatDate(startDate) },
+                ipAddress: req.ip,
+            });
+        } catch (e) { /* audit best-effort */ }
+
+        await connection.commit();
+
+        return res.status(201).json({
+            message: `Inversión ${type === 'pool' ? 'Fondo DGP' : 'LP COP'} creada exitosamente`,
+            investment: {
+                id: investmentId,
+                userId,
+                type: type === 'pool' ? 'pool' : 'CDTC',
+                amount,
+                durationMonths: months,
+                startDate: formatDate(startDate),
+                lockEndDate: formatDate(lockEndDate),
+                newBalance,
+            },
+        });
+    } catch (error) {
+        await connection.rollback();
+        console.error('Error adminCreateInvestment:', error);
+        res.status(500).json({ error: 'Error interno del servidor' });
+    } finally {
+        connection.release();
+    }
+};

@@ -4,6 +4,7 @@ const adminController = require('../controllers/adminController');
 const withdrawalController = require('../controllers/withdrawalController');
 const loanController = require('../controllers/loanController');
 const depositController = require('../controllers/depositController');
+const investmentController = require('../controllers/investmentController');
 const { authenticate, requireAdmin } = require('../middleware/auth');
 const supportController = require('../controllers/supportController');
 const poolRewardsController = require('../controllers/poolRewardsController');
@@ -231,6 +232,7 @@ router.put('/transactions/:id', adminController.editTransaction);
 
 // Inversiones — rutas específicas ANTES que las parametrizadas
 router.get('/investments/active', adminController.getActiveInvestments);
+router.post('/investments/create', investmentController.adminCreateInvestment);
 router.post('/investments', adminController.createInvestment);
 router.post('/investments/:investmentId/return', adminController.registerInvestmentReturn);
 router.post('/investments/:id/cancel', adminController.adminCancelInvestment);
