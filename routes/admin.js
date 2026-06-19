@@ -5,6 +5,7 @@ const withdrawalController = require('../controllers/withdrawalController');
 const loanController = require('../controllers/loanController');
 const depositController = require('../controllers/depositController');
 const investmentController = require('../controllers/investmentController');
+const companyInvestmentController = require('../controllers/companyInvestmentController');
 const { authenticate, requireAdmin } = require('../middleware/auth');
 const supportController = require('../controllers/supportController');
 const poolRewardsController = require('../controllers/poolRewardsController');
@@ -238,6 +239,15 @@ router.post('/investments/:investmentId/return', adminController.registerInvestm
 router.post('/investments/:id/cancel', adminController.adminCancelInvestment);
 router.post('/investments/:id/revoke', adminController.adminRevokeInvestment);
 router.delete('/investments/:id', adminController.deleteInvestment);
+
+// === INVERSIONES DE EMPRESA (tesorería interna) — rutas específicas ANTES que :param ===
+router.get('/company-investments', companyInvestmentController.list);
+router.post('/company-investments', companyInvestmentController.create);
+router.get('/company-investments/:id/returns', companyInvestmentController.getReturns);
+router.post('/company-investments/:id/returns', companyInvestmentController.addReturn);
+router.delete('/company-investments/:id/returns/:returnId', companyInvestmentController.deleteReturn);
+router.post('/company-investments/:id/close', companyInvestmentController.close);
+router.post('/company-investments/:id/reopen', companyInvestmentController.reopen);
 
 // Balance
 router.post('/balance', adminController.recordBalance);
