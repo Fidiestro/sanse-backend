@@ -281,8 +281,8 @@ exports.adminProcessLoan = async (req, res) => {
         const loanId = req.params.id;
         const { action, approvedAmount, approvedRate, notes } = req.body;
 
-        if (!['approve', 'reject', 'mark_paid', 'mark_overdue', 'cancel', 'edit_term'].includes(action)) {
-            return res.status(400).json({ error: 'Acción inválida. Usar: approve, reject, mark_paid, mark_overdue, cancel, edit_term' });
+        if (!['approve', 'reject', 'mark_paid', 'mark_overdue', 'cancel', 'edit_term', 'edit_start'].includes(action)) {
+            return res.status(400).json({ error: 'Acción inválida. Usar: approve, reject, mark_paid, mark_overdue, cancel, edit_term, edit_start' });
         }
 
         const [loanRows] = await connection.execute(`SELECT * FROM loan_requests WHERE id = ?`, [loanId]);
@@ -416,6 +416,53 @@ exports.adminProcessLoan = async (req, res) => {
                     (newDueDate ? `\n📌 Nuevo vencimiento: ${newDueDate}` : '')
                 );
             } catch (e) { /* notify es best-effort */ }
+        } else if (action === 'edit_start') {
+            // ★ NUEVO: Editar la fecha de inicio de un préstamo activo / en mora
+            // - Cambia start_date y recalcula due_date (si tiene plazo definido)
+            // - NO toca capital, abonos, tasa ni status
+            if (loan.status !== 'active' && loan.status !== 'overdue') {
+                return res.status(400).json({ error: 'Solo se puede editar la fecha de inicio de préstamos activos o en mora' });
+            }
+            const rawStart = (req.body.newStartDate || '').toString().trim();
+            // Validar formato YYYY-MM-DD
+            if (!/^\d{4}-\d{2}-\d{2}$/.test(rawStart)) {
+                return res.status(400).json({ error: 'Fecha inválida. Formato esperado: YYYY-MM-DD' });
+            }
+            const parsedStart = new Date(rawStart + 'T00:00:00');
+            if (isNaN(parsedStart.getTime())) {
+                return res.status(400).json({ error: 'Fecha inválida' });
+            }
+            const newStartStr = parsedStart.toISOString().slice(0, 10);
+
+            // Recalcular due_date solo si el préstamo tiene plazo definido (term_months > 0)
+            let newDueDate = null;
+            const term = loan.term_months != null ? parseInt(loan.term_months) : null;
+            if (term && term > 0) {
+                const due = new Date(parsedStart);
+                due.setMonth(due.getMonth() + term);
+                newDueDate = due.toISOString().slice(0, 10);
+            }
+
+            const prevStart = loan.start_date ? new Date(loan.start_date).toISOString().slice(0, 10) : 'sin fecha';
+            const editNote = `EDIT INICIO: ${prevStart} → ${newStartStr} (${new Date().toISOString().slice(0, 10)})`;
+            await connection.execute(
+                `UPDATE loan_requests
+                 SET start_date = ?, due_date = ?, admin_notes = CONCAT(IFNULL(admin_notes,''), ?)
+                 WHERE id = ?`,
+                [newStartStr, newDueDate, ` | ${editNote}`, loanId]
+            );
+
+            // Notificación a Telegram (best-effort)
+            try {
+                const [userRows] = await connection.execute(`SELECT full_name FROM users WHERE id = ?`, [loan.user_id]);
+                await notify(
+                    `📆 *FECHA DE INICIO EDITADA*\n\n` +
+                    `👤 ${userRows[0]?.full_name || 'Usuario'}\n` +
+                    `🔖 ${loan.ref_id}\n` +
+                    `Inicio: ${prevStart} → *${newStartStr}*` +
+                    (newDueDate ? `\n📌 Nuevo vencimiento: ${newDueDate}` : '\n📌 Sin plazo definido (sin vencimiento)')
+                );
+            } catch (e) { /* notify es best-effort */ }
         }
 
         await connection.commit();
@@ -425,7 +472,8 @@ exports.adminProcessLoan = async (req, res) => {
             mark_paid: 'marcada como pagada',
             mark_overdue: 'marcada en mora',
             cancel: 'cancelada',
-            edit_term: 'editada (plazo actualizado)'
+            edit_term: 'editada (plazo actualizado)',
+            edit_start: 'editada (fecha de inicio actualizada)'
         };
         res.json({ message: `Solicitud ${statusLabels[action]}` });
     } catch (error) {
