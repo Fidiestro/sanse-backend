@@ -281,8 +281,8 @@ exports.adminProcessLoan = async (req, res) => {
         const loanId = req.params.id;
         const { action, approvedAmount, approvedRate, notes } = req.body;
 
-        if (!['approve', 'reject', 'mark_paid', 'mark_overdue', 'cancel'].includes(action)) {
-            return res.status(400).json({ error: 'Acción inválida. Usar: approve, reject, mark_paid, mark_overdue, cancel' });
+        if (!['approve', 'reject', 'mark_paid', 'mark_overdue', 'cancel', 'edit_term'].includes(action)) {
+            return res.status(400).json({ error: 'Acción inválida. Usar: approve, reject, mark_paid, mark_overdue, cancel, edit_term' });
         }
 
         const [loanRows] = await connection.execute(`SELECT * FROM loan_requests WHERE id = ?`, [loanId]);
@@ -374,6 +374,48 @@ exports.adminProcessLoan = async (req, res) => {
                     `${notes ? '\n📝 ' + notes : ''}`
                 );
             } catch (e) { /* notify es best-effort */ }
+        } else if (action === 'edit_term') {
+            // ★ NUEVO: Editar el plazo de un préstamo activo / en mora
+            // - Solo cambia term_months y recalcula due_date
+            // - NO toca capital, abonos, tasa ni status
+            if (loan.status !== 'active' && loan.status !== 'overdue') {
+                return res.status(400).json({ error: 'Solo se puede editar el plazo de préstamos activos o en mora' });
+            }
+            const newTerm = parseInt(req.body.newTermMonths);
+            if (isNaN(newTerm) || newTerm < 0 || newTerm > 120) {
+                return res.status(400).json({ error: 'Plazo inválido (0–120 meses, 0 = sin plazo)' });
+            }
+
+            // newTerm = 0 → "sin plazo definido" (NULL en ambos campos)
+            let newDueDate = null;
+            let newTermVal = null;
+            if (newTerm > 0) {
+                newTermVal = newTerm;
+                const startDate = loan.start_date ? new Date(loan.start_date) : new Date();
+                const due = new Date(startDate);
+                due.setMonth(due.getMonth() + newTerm);
+                newDueDate = due.toISOString().slice(0, 10);
+            }
+
+            const editNote = `EDIT PLAZO: ${loan.term_months != null ? loan.term_months + 'm' : 'sin plazo'} → ${newTerm === 0 ? 'sin plazo' : newTerm + 'm'} (${new Date().toISOString().slice(0, 10)})`;
+            await connection.execute(
+                `UPDATE loan_requests
+                 SET term_months = ?, due_date = ?, admin_notes = CONCAT(IFNULL(admin_notes,''), ?)
+                 WHERE id = ?`,
+                [newTermVal, newDueDate, ` | ${editNote}`, loanId]
+            );
+
+            // Notificación a Telegram (best-effort)
+            try {
+                const [userRows] = await connection.execute(`SELECT full_name FROM users WHERE id = ?`, [loan.user_id]);
+                await notify(
+                    `📅 *PLAZO EDITADO*\n\n` +
+                    `👤 ${userRows[0]?.full_name || 'Usuario'}\n` +
+                    `🔖 ${loan.ref_id}\n` +
+                    `Plazo: ${loan.term_months != null ? loan.term_months + ' meses' : 'sin plazo'} → *${newTerm === 0 ? 'sin plazo' : newTerm + ' meses'}*` +
+                    (newDueDate ? `\n📌 Nuevo vencimiento: ${newDueDate}` : '')
+                );
+            } catch (e) { /* notify es best-effort */ }
         }
 
         await connection.commit();
@@ -382,7 +424,8 @@ exports.adminProcessLoan = async (req, res) => {
             reject: 'rechazada',
             mark_paid: 'marcada como pagada',
             mark_overdue: 'marcada en mora',
-            cancel: 'cancelada'
+            cancel: 'cancelada',
+            edit_term: 'editada (plazo actualizado)'
         };
         res.json({ message: `Solicitud ${statusLabels[action]}` });
     } catch (error) {
