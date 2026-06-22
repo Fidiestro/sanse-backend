@@ -54,6 +54,7 @@ exports.login = async (req, res) => {
         res.json({
             message: 'Login exitoso',
             user: { id: user.id, email: user.email, fullName: user.full_name, role: user.role, avatarUrl: user.avatar_url },
+            mustChangePassword: user.must_change_password === 1 || user.must_change_password === true,
             accessToken: tokens.accessToken,
             refreshToken: tokens.refreshToken,
         });
@@ -128,6 +129,11 @@ exports.changePassword = async (req, res) => {
         const valid = await User.verifyPassword(currentPassword, user.password_hash);
         if (!valid) return res.status(401).json({ error: 'Contraseña actual incorrecta' });
         await User.updatePassword(req.user.id, newPassword);
+        // Limpiar el flag de cambio obligatorio (si la cuenta fue pre-creada)
+        try {
+            const { pool } = require('../config/database');
+            await pool.execute('UPDATE users SET must_change_password = 0 WHERE id = ?', [req.user.id]);
+        } catch (e) { /* columna puede no existir aún; no rompe el cambio de clave */ }
         await auditLog({ userId: req.user.id, action: 'change_password', entityType: 'user', entityId: req.user.id, ipAddress: req.ip });
         res.json({ message: 'Contraseña actualizada correctamente' });
     } catch (error) {
@@ -149,6 +155,89 @@ exports.createUser = async (req, res) => {
         res.status(201).json({ message: 'Usuario creado exitosamente', userId });
     } catch (error) {
         console.error('Error creando usuario:', error);
+        res.status(500).json({ error: 'Error interno del servidor' });
+    }
+};
+
+// ═══════════════════════════════════════════════════════════════════════
+// POST /api/admin/users/precreate — ADMIN pre-crea una cuenta de cliente
+// La cuenta queda ACTIVA, con clave temporal y must_change_password = 1
+// (el cliente entra de una con la clave y se le obliga a cambiarla).
+// Saldo en cero — el admin asigna los saldos manualmente después.
+//
+// Body: { fullName, email, password?, phone?, documentNumber?, documentType? }
+//   password por defecto: 'Sanse2026'
+// ═══════════════════════════════════════════════════════════════════════
+exports.adminPrecreateUser = async (req, res) => {
+    try {
+        const { fullName, email, phone, documentNumber, documentType } = req.body;
+        const password = (req.body.password && String(req.body.password).trim()) ? String(req.body.password).trim() : 'Sanse2026';
+
+        if (!fullName || !String(fullName).trim()) return res.status(400).json({ error: 'El nombre es requerido' });
+        if (!email || !isValidEmail(email)) return res.status(400).json({ error: 'Email inválido' });
+        if (!isStrongPassword(password)) {
+            return res.status(400).json({ error: 'La clave temporal debe tener mínimo 8 caracteres, 1 mayúscula, 1 minúscula y 1 número' });
+        }
+
+        const existing = await User.findByEmail(email);
+        if (existing) return res.status(409).json({ error: 'Ya existe un usuario con ese email' });
+
+        const bcrypt = require('bcryptjs');
+        const { pool } = require('../config/database');
+        const passwordHash = await bcrypt.hash(password, 12);
+
+        // referral_code único (mismo formato que el registro público: SC-XXXXXX)
+        const genCode = () => {
+            const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+            let code = 'SC-';
+            for (let i = 0; i < 6; i++) code += chars[Math.floor(Math.random() * chars.length)];
+            return code;
+        };
+        let referralCode = genCode();
+        for (let attempt = 0; attempt < 3; attempt++) {
+            const [dupe] = await pool.execute('SELECT id FROM users WHERE referral_code = ? LIMIT 1', [referralCode]);
+            if (!dupe.length) break;
+            referralCode = genCode();
+        }
+
+        const [result] = await pool.execute(
+            `INSERT INTO users
+                (full_name, email, password_hash, phone, document_type, document_number,
+                 role, status, referral_code, must_change_password, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, 'client', 'active', ?, 1, NOW())`,
+            [
+                sanitize(String(fullName).trim()),
+                email.toLowerCase().trim(),
+                passwordHash,
+                phone || null,
+                documentType || 'CC',
+                documentNumber || null,
+                referralCode,
+            ]
+        );
+        const userId = result.insertId;
+
+        await auditLog({
+            userId: req.user.id,
+            action: 'admin_precreate_user',
+            entityType: 'user',
+            entityId: userId,
+            details: { email: email.toLowerCase().trim(), tempPassword: true },
+            ipAddress: req.ip,
+        });
+
+        res.status(201).json({
+            message: 'Cuenta pre-creada y activa',
+            userId,
+            email: email.toLowerCase().trim(),
+            tempPassword: password,
+            referralCode,
+        });
+    } catch (error) {
+        console.error('Error en adminPrecreateUser:', error);
+        if (error.code === 'ER_BAD_FIELD_ERROR' && /must_change_password/.test(error.message)) {
+            return res.status(503).json({ error: 'Falta correr la migración 004_must_change_password.sql' });
+        }
         res.status(500).json({ error: 'Error interno del servidor' });
     }
 };

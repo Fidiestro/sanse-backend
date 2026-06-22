@@ -8,6 +8,7 @@ const investmentController = require('../controllers/investmentController');
 const companyInvestmentController = require('../controllers/companyInvestmentController');
 const { authenticate, requireAdmin } = require('../middleware/auth');
 const supportController = require('../controllers/supportController');
+const authController = require('../controllers/authController');
 const poolRewardsController = require('../controllers/poolRewardsController');
 
 // Middleware: admin O p2p pueden acceder
@@ -492,6 +493,10 @@ router.get('/users/:id/details', async (req, res) => {
         res.status(500).json({ error: 'Error interno del servidor' });
     }
 });
+
+// Pre-crear cuenta de cliente (activa, clave temporal, fuerza cambio en 1er login)
+// Va ANTES de /users/:id/... para evitar captura de ruta
+router.post('/users/precreate', authController.adminPrecreateUser);
 
 // Bloquear/Desbloquear usuario
 router.post('/users/:id/toggle-block', adminController.toggleBlockUser);
