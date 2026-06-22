@@ -202,6 +202,55 @@ router.get('/global-summary', async (req, res) => {
              WHERE u.role = 'client' AND LOWER(i.type) LIKE '%pool%' AND i.status = 'active'`
         );
 
+        // ★ NUEVO: Dinero DISPONIBLE de usuarios (saldo libre, NO invertido)
+        // = (entradas − salidas) − invertido activo − retiros pendientes, sumado por cliente.
+        // Usa EXACTAMENTE los mismos tipos que utils/balanceHelper.js (fuente única de verdad).
+        let totalDisponibleUsuarios = 0;
+        try {
+            // Mismos arrays que balanceHelper.js
+            const INFLOW = ['deposit', 'payment', 'interest', 'profit', 'investment_return', 'investment_withdrawal', 'loan'];
+            const OUTFLOW = ['withdraw'];
+            const inPH = INFLOW.map(() => '?').join(',');
+            const outPH = OUTFLOW.map(() => '?').join(',');
+
+            // Balance neto por usuario (entradas − salidas), igual que recalculateAndSaveBalance
+            const [balRows] = await db.query(
+                `SELECT t.user_id,
+                        COALESCE(SUM(CASE WHEN t.type IN (${inPH}) THEN t.amount ELSE 0 END),0)
+                      - COALESCE(SUM(CASE WHEN t.type IN (${outPH}) THEN t.amount ELSE 0 END),0) AS balance
+                 FROM transactions t JOIN users u ON u.id = t.user_id
+                 WHERE u.role = 'client'
+                 GROUP BY t.user_id`,
+                [...INFLOW, ...OUTFLOW]
+            );
+            // Invertido activo por usuario
+            const [invRows2] = await db.execute(
+                `SELECT i.user_id, COALESCE(SUM(i.amount),0) AS invested
+                 FROM investments i JOIN users u ON u.id = i.user_id
+                 WHERE u.role = 'client' AND i.status IN ('active','pending_deposit')
+                 GROUP BY i.user_id`
+            );
+            // Retiros pendientes por usuario
+            const [wrRows2] = await db.execute(
+                `SELECT w.user_id, COALESCE(SUM(w.amount),0) AS pending
+                 FROM withdrawal_requests w JOIN users u ON u.id = w.user_id
+                 WHERE u.role = 'client' AND w.status IN ('pending','approved')
+                 GROUP BY w.user_id`
+            );
+            const investedMap = {}; invRows2.forEach(r => { investedMap[r.user_id] = parseFloat(r.invested || 0); });
+            const pendingMap = {}; wrRows2.forEach(r => { pendingMap[r.user_id] = parseFloat(r.pending || 0); });
+
+            balRows.forEach(r => {
+                const bal = Math.max(0, parseFloat(r.balance || 0)); // balance nunca negativo, igual que el sistema
+                const invested = investedMap[r.user_id] || 0;
+                const pending = pendingMap[r.user_id] || 0;
+                const disponible = Math.max(0, bal - invested - pending);
+                totalDisponibleUsuarios += disponible;
+            });
+        } catch (e) {
+            console.warn('[global-summary] disponible usuarios:', e.message);
+        }
+
         // Balance en CAJA = Ahorros − Préstamos activos (tu fila naranja)
         const balanceCaja = totalAhorros - totalPrestamos;
 
@@ -214,6 +263,7 @@ router.get('/global-summary', async (req, res) => {
             totalAbonos,
             balanceCaja,
             dineroFondo,
+            totalDisponibleUsuarios,
         });
     } catch (e) {
         console.error('[admin/global-summary] Error:', e.message);

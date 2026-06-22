@@ -957,11 +957,56 @@ exports.adminGetLoanProfitStats = async (req, res) => {
              FROM loan_payments WHERE loan_rate > 0`
         );
 
+        // ─── INTERÉS NO RECLAMADO (acumulado en préstamos activos sin cobrar) ───
+        // Para cada préstamo activo/overdue se calcula el interés corrido desde
+        // su fecha de corte (último abono O inicio) usando la MISMA fórmula que payLoan.
+        let totalInterestUnclaimed = 0;
+        try {
+            const [activeLoans] = await pool.execute(
+                `SELECT id, amount, approved_amount, approved_rate, monthly_rate,
+                        start_date, created_at,
+                        (SELECT MAX(created_at) FROM loan_payments WHERE loan_id = lr.id) AS last_payment_at,
+                        (SELECT remaining_capital FROM loan_payments WHERE loan_id = lr.id ORDER BY created_at DESC LIMIT 1) AS last_remaining
+                 FROM loan_requests lr
+                 WHERE status IN ('active', 'overdue')`
+            );
+            const now = new Date();
+            for (const l of activeLoans) {
+                // Capital pendiente: remaining_capital del último abono, o approved_amount, o amount
+                let pendingCapital;
+                if (l.last_remaining !== null && l.last_remaining !== undefined) {
+                    pendingCapital = parseFloat(l.last_remaining);
+                } else if (l.approved_amount !== null && l.approved_amount !== undefined) {
+                    pendingCapital = parseFloat(l.approved_amount);
+                } else {
+                    pendingCapital = parseFloat(l.amount);
+                }
+                if (!pendingCapital || pendingCapital <= 0) continue;
+
+                const loanRate = parseFloat(l.approved_rate || l.monthly_rate || 4);
+                // Fecha de corte: último abono, o inicio, o creación
+                let cutoffDate = l.last_payment_at
+                    ? new Date(l.last_payment_at)
+                    : (l.start_date ? new Date(l.start_date) : new Date(l.created_at));
+                const secondsElapsed = Math.max(0, (now - cutoffDate) / 1000);
+                const accrued = pendingCapital * (loanRate / 100) * (secondsElapsed / SECONDS_PER_MONTH);
+                totalInterestUnclaimed += accrued;
+            }
+        } catch (e) {
+            console.error('Error calculando interés no reclamado:', e.message);
+        }
+        totalInterestUnclaimed = Math.round(totalInterestUnclaimed);
+        const totalInterestClaimed = parseFloat(totalRows[0].totalInterestEarned);
+
         res.json({
             totalInterestEarned:   parseFloat(totalRows[0].totalInterestEarned),
             totalCapitalRecovered: parseFloat(totalRows[0].totalCapitalRecovered),
             totalPaymentsReceived: parseFloat(totalRows[0].totalPaymentsReceived),
             totalPaymentCount:     parseInt(totalRows[0].totalPaymentCount),
+            // ★ NUEVO: intereses reclamados / no reclamados / total
+            totalInterestClaimed:   totalInterestClaimed,
+            totalInterestUnclaimed: totalInterestUnclaimed,
+            totalInterestAll:       totalInterestClaimed + totalInterestUnclaimed,
             monthInterest: parseFloat(monthRows[0].monthInterest),
             monthCapital:  parseFloat(monthRows[0].monthCapital),
             monthTotal:    parseFloat(monthRows[0].monthTotal),
